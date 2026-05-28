@@ -4,6 +4,7 @@
 package entra
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -40,11 +41,64 @@ type Config struct {
 	// requested and no environment credentials are detected.
 	DefaultFlow string `json:"defaultFlow,omitempty" yaml:"defaultFlow,omitempty"`
 
+	// ClientSecret is the client secret for service principal authentication.
+	// When set under a profile, this value takes precedence over the
+	// AZURE_CLIENT_SECRET environment variable.
+	ClientSecret string `json:"clientSecret,omitempty" yaml:"clientSecret,omitempty"` //nolint:gosec // config field name, not a credential
+
+	// FederatedTokenFile is the path to the projected service account token
+	// for workload identity federation. When set under a profile, this value
+	// takes precedence over AZURE_FEDERATED_TOKEN_FILE.
+	FederatedTokenFile string `json:"federatedTokenFile,omitempty" yaml:"federatedTokenFile,omitempty"`
+
+	// FederatedToken is a raw federated token for workload identity federation.
+	// When set under a profile, this value takes precedence over
+	// AZURE_FEDERATED_TOKEN.
+	FederatedToken string `json:"federatedToken,omitempty" yaml:"federatedToken,omitempty"` //nolint:gosec // config field name, not a credential
+
 	// MinPollInterval is the minimum interval between device code poll requests.
 	MinPollInterval time.Duration `json:"-" yaml:"-"`
 
 	// SlowDownIncrement is added to poll interval when server returns slow_down.
 	SlowDownIncrement time.Duration `json:"-" yaml:"-"`
+
+	// setFields tracks which JSON keys were explicitly provided during
+	// unmarshaling so that profileOrEnv can distinguish "explicitly set to
+	// the default value" from "not set at all."
+	setFields map[string]bool `json:"-" yaml:"-"`
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling that tracks which fields
+// were explicitly present in the input. This lets profileOrEnv distinguish
+// "field set to the default value" from "field not provided."
+func (c *Config) UnmarshalJSON(data []byte) error {
+	// Detect which keys are present in the raw JSON.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	c.setFields = make(map[string]bool, len(raw))
+	for k, v := range raw {
+		// Treat explicit empty strings (e.g. "clientId":"") as unset so that
+		// profileOrEnv falls back to environment variables per Issue #8.
+		if string(v) != `""` {
+			c.setFields[k] = true
+		}
+	}
+
+	// Unmarshal into an alias to avoid infinite recursion.
+	type alias Config
+	return json.Unmarshal(data, (*alias)(c))
+}
+
+// WasSet reports whether a JSON field (by its json tag name) was explicitly
+// present in the unmarshaled config. Returns false when the config was not
+// populated from JSON at all (e.g. DefaultConfig).
+func (c *Config) WasSet(jsonField string) bool {
+	if c.setFields == nil {
+		return false
+	}
+	return c.setFields[jsonField]
 }
 
 // DefaultConfig returns the default Entra configuration.

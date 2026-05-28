@@ -675,7 +675,6 @@ func TestGenerateSessionID(t *testing.T) {
 	assert.NotEqual(t, s1, s2, "each call should produce a unique ID")
 }
 
-
 func TestTruncate(t *testing.T) {
 	assert.Equal(t, "abc", truncate("abc", 10))
 	assert.Equal(t, "ab...", truncate("abcde", 2))
@@ -895,5 +894,516 @@ func TestHostClientFallbackToContext(t *testing.T) {
 		ctx := sdkplugin.WithHostClient(context.Background(), ctxClient)
 		got := p.hostClient(ctx)
 		assert.Same(t, hostClient, got)
+	})
+}
+
+// --- Profile scoping tests (Issue #7) ---
+
+// setProfileConfig simulates JSON-unmarshaled profile config by setting
+// the given fields on the plugin's config and marking them as explicitly
+// provided (so profileOrEnv uses config values instead of env vars).
+func setProfileConfig(p *Plugin, fields map[string]string) {
+	if p.config.setFields == nil {
+		p.config.setFields = make(map[string]bool)
+	}
+	for jsonField, val := range fields {
+		switch jsonField {
+		case "clientId":
+			p.config.ClientID = val
+		case "tenantId":
+			p.config.TenantID = val
+		case "clientSecret":
+			p.config.ClientSecret = val
+		case "federatedTokenFile":
+			p.config.FederatedTokenFile = val
+		case "federatedToken":
+			p.config.FederatedToken = val
+		case "authority":
+			p.config.Authority = val
+		}
+		p.config.setFields[jsonField] = true
+	}
+}
+
+func TestSecretKey(t *testing.T) {
+	p, _ := newTestPlugin(t, nil, nil)
+
+	t.Run("no profile uses legacy key", func(t *testing.T) {
+		ctx := context.Background()
+		assert.Equal(t, "scafctl.auth.entra.refresh_token", p.secretKey(ctx, secretSuffixRefreshToken))
+		assert.Equal(t, "scafctl.auth.entra.metadata", p.secretKey(ctx, secretSuffixMetadata))
+		assert.Equal(t, "scafctl.auth.entra.token.", p.secretKey(ctx, secretSuffixTokenPrefix))
+	})
+
+	t.Run("with profile scopes key", func(t *testing.T) {
+		ctx := auth.WithProfile(context.Background(), "work")
+		assert.Equal(t, "scafctl.auth.entra.776f726b.refresh_token", p.secretKey(ctx, secretSuffixRefreshToken))
+		assert.Equal(t, "scafctl.auth.entra.776f726b.metadata", p.secretKey(ctx, secretSuffixMetadata))
+		assert.Equal(t, "scafctl.auth.entra.776f726b.token.", p.secretKey(ctx, secretSuffixTokenPrefix))
+	})
+
+	t.Run("different profiles produce different keys", func(t *testing.T) {
+		ctxA := auth.WithProfile(context.Background(), "prod")
+		ctxB := auth.WithProfile(context.Background(), "dev")
+		assert.NotEqual(t, p.secretKey(ctxA, secretSuffixRefreshToken), p.secretKey(ctxB, secretSuffixRefreshToken))
+	})
+
+	t.Run("profile with dots does not collide with key delimiter", func(t *testing.T) {
+		// "prod.token" as a profile name must not collide with the token
+		// cache prefix for profile "prod".
+		ctxDotted := auth.WithProfile(context.Background(), "prod.token")
+		ctxPlain := auth.WithProfile(context.Background(), "prod")
+		dottedKey := p.secretKey(ctxDotted, secretSuffixRefreshToken)
+		plainTokenKey := p.secretKey(ctxPlain, secretSuffixTokenPrefix)
+		assert.NotEqual(t, dottedKey, plainTokenKey)
+		// The dotted profile name should be hex-encoded to avoid ambiguity
+		assert.Contains(t, dottedKey, "70726f642e746f6b656e")
+	})
+
+	t.Run("legacy constants match no-profile keys", func(t *testing.T) {
+		ctx := context.Background()
+		assert.Equal(t, SecretKeyRefreshToken, p.secretKey(ctx, secretSuffixRefreshToken))
+		assert.Equal(t, SecretKeyMetadata, p.secretKey(ctx, secretSuffixMetadata))
+		assert.Equal(t, SecretKeyTokenPrefix, p.secretKey(ctx, secretSuffixTokenPrefix))
+	})
+}
+
+func TestProfileScopedStorage(t *testing.T) {
+	t.Run("store and retrieve with different profiles", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+
+		// Store credentials under "work" profile
+		ctxWork := auth.WithProfile(context.Background(), "work")
+		workKey := p.secretKey(ctxWork, secretSuffixRefreshToken)
+		workMetaKey := p.secretKey(ctxWork, secretSuffixMetadata)
+
+		// Store credentials under "personal" profile
+		ctxPersonal := auth.WithProfile(context.Background(), "personal")
+		personalKey := p.secretKey(ctxPersonal, secretSuffixRefreshToken)
+		personalMetaKey := p.secretKey(ctxPersonal, secretSuffixMetadata)
+
+		// Set up fake secrets for both profiles
+		fake.secrets[workKey] = "work-refresh-token"
+		fake.secrets[personalKey] = "personal-refresh-token"
+
+		workMeta := TokenMetadata{
+			Claims:                &auth.Claims{Subject: "work-user"},
+			RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
+			TenantID:              "work-tenant",
+			ClientID:              "work-client",
+		}
+		workMetaBytes, _ := json.Marshal(workMeta)
+		fake.secrets[workMetaKey] = string(workMetaBytes)
+
+		personalMeta := TokenMetadata{
+			Claims:                &auth.Claims{Subject: "personal-user"},
+			RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
+			TenantID:              "personal-tenant",
+			ClientID:              "personal-client",
+		}
+		personalMetaBytes, _ := json.Marshal(personalMeta)
+		fake.secrets[personalMetaKey] = string(personalMetaBytes)
+
+		// Verify work profile status
+		t.Setenv(EnvAzureClientID, "")
+		t.Setenv(EnvAzureClientSecret, "")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureFederatedToken, "")
+
+		workStatus, err := p.GetStatus(ctxWork, HandlerName)
+		require.NoError(t, err)
+		assert.True(t, workStatus.Authenticated)
+		assert.Equal(t, "work-user", workStatus.Claims.Subject)
+		assert.Equal(t, "work-tenant", workStatus.TenantID)
+
+		// Verify personal profile status
+		personalStatus, err := p.GetStatus(ctxPersonal, HandlerName)
+		require.NoError(t, err)
+		assert.True(t, personalStatus.Authenticated)
+		assert.Equal(t, "personal-user", personalStatus.Claims.Subject)
+		assert.Equal(t, "personal-tenant", personalStatus.TenantID)
+
+		// Default (no profile) should not see either
+		defaultStatus, err := p.GetStatus(context.Background(), HandlerName)
+		require.NoError(t, err)
+		assert.False(t, defaultStatus.Authenticated)
+	})
+
+	t.Run("logout clears only target profile", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+		t.Setenv(EnvAzureClientID, "")
+		t.Setenv(EnvAzureClientSecret, "")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureFederatedToken, "")
+
+		ctxWork := auth.WithProfile(context.Background(), "work")
+		ctxPersonal := auth.WithProfile(context.Background(), "personal")
+
+		// Populate both profiles
+		fake.secrets[p.secretKey(ctxWork, secretSuffixRefreshToken)] = "work-rt"
+		fake.secrets[p.secretKey(ctxWork, secretSuffixMetadata)] = `{"claims":{}}`
+		fake.secrets[p.secretKey(ctxPersonal, secretSuffixRefreshToken)] = "personal-rt"
+		fake.secrets[p.secretKey(ctxPersonal, secretSuffixMetadata)] = `{"claims":{}}`
+
+		// Logout work profile
+		err := p.Logout(ctxWork, HandlerName)
+		require.NoError(t, err)
+
+		// Work profile secrets should be gone
+		_, workExists := fake.secrets[p.secretKey(ctxWork, secretSuffixRefreshToken)]
+		assert.False(t, workExists, "work refresh token should be deleted")
+
+		// Personal profile secrets should remain
+		_, personalExists := fake.secrets[p.secretKey(ctxPersonal, secretSuffixRefreshToken)]
+		assert.True(t, personalExists, "personal refresh token should remain")
+	})
+}
+
+func TestProfileScopedTokenCache(t *testing.T) {
+	t.Run("cached tokens isolated by profile", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+		ctx := context.Background()
+		t.Setenv(EnvAzureClientID, "")
+		t.Setenv(EnvAzureClientSecret, "")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureFederatedToken, "")
+
+		ctxWork := auth.WithProfile(ctx, "work")
+		ctxPersonal := auth.WithProfile(ctx, "personal")
+
+		fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		scope := "https://graph.microsoft.com/.default"
+
+		// Cache token under work profile
+		workKey := p.tokenCachePrefix(ctxWork) + fp + ":" + scope
+		workEntry := tokenCacheEntry{
+			AccessToken: "work-token",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(1 * time.Hour),
+			Scope:       scope,
+			CachedAt:    time.Now(),
+		}
+		workBytes, _ := json.Marshal(workEntry)
+		fake.secrets[workKey] = string(workBytes)
+
+		// Cache token under personal profile
+		personalKey := p.tokenCachePrefix(ctxPersonal) + fp + ":" + scope
+		personalEntry := tokenCacheEntry{
+			AccessToken: "personal-token",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(1 * time.Hour),
+			Scope:       scope,
+			CachedAt:    time.Now(),
+		}
+		personalBytes, _ := json.Marshal(personalEntry)
+		fake.secrets[personalKey] = string(personalBytes)
+
+		// Also need refresh tokens for GetToken to work
+		fake.secrets[p.secretKey(ctxWork, secretSuffixRefreshToken)] = "work-rt"
+		fake.secrets[p.secretKey(ctxPersonal, secretSuffixRefreshToken)] = "personal-rt"
+
+		// GetToken for work should return work token
+		workResp, err := p.GetToken(ctxWork, HandlerName, sdkplugin.TokenRequest{Scope: scope})
+		require.NoError(t, err)
+		assert.Equal(t, "work-token", workResp.AccessToken)
+
+		// GetToken for personal should return personal token
+		personalResp, err := p.GetToken(ctxPersonal, HandlerName, sdkplugin.TokenRequest{Scope: scope})
+		require.NoError(t, err)
+		assert.Equal(t, "personal-token", personalResp.AccessToken)
+	})
+}
+
+// --- Profile config over env vars tests (Issue #8) ---
+
+func TestResolveServicePrincipalCredentials(t *testing.T) {
+	t.Run("no profile uses env vars only", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		// No profile set (default)
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureClientSecret, "env-secret")
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "env-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-secret", creds.ClientSecret)
+	})
+
+	t.Run("profile prefers config over env vars", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine"
+		setProfileConfig(p, map[string]string{
+			"clientId":     "config-client",
+			"tenantId":     "config-tenant",
+			"clientSecret": "config-secret",
+		})
+
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureClientSecret, "env-secret")
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "config-client", creds.ClientID)
+		assert.Equal(t, "config-tenant", creds.TenantID)
+		assert.Equal(t, "config-secret", creds.ClientSecret)
+	})
+
+	t.Run("profile with empty config falls back to env var", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine"
+		setProfileConfig(p, map[string]string{
+			"clientId": "config-client",
+			// tenantId and clientSecret not set → fall back to env
+		})
+
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureClientSecret, "env-secret")
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "config-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-secret", creds.ClientSecret)
+	})
+
+	t.Run("profile with no config and no env returns nil", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine"
+		p.config.ClientID = ""
+		p.config.TenantID = ""
+		p.config.ClientSecret = ""
+
+		t.Setenv(EnvAzureClientID, "")
+		t.Setenv(EnvAzureTenantID, "")
+		t.Setenv(EnvAzureClientSecret, "")
+
+		creds := p.resolveServicePrincipalCredentials()
+		assert.Nil(t, creds)
+	})
+
+	t.Run("profile with no explicit config falls back to env vars", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine"
+		// No setProfileConfig → nothing marked as set, all fall back to env
+
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureClientSecret, "env-secret")
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "env-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-secret", creds.ClientSecret)
+	})
+}
+
+func TestResolveWorkloadIdentityCredentials(t *testing.T) {
+	t.Run("no profile uses env vars only", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureFederatedToken, "env-fed-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "env-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-fed-token", creds.Token)
+	})
+
+	t.Run("profile prefers config over env vars", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine-a"
+		setProfileConfig(p, map[string]string{
+			"clientId":       "config-client",
+			"tenantId":       "config-tenant",
+			"federatedToken": "config-fed-token",
+		})
+
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureFederatedToken, "env-fed-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "config-client", creds.ClientID)
+		assert.Equal(t, "config-tenant", creds.TenantID)
+		assert.Equal(t, "config-fed-token", creds.Token)
+	})
+
+	t.Run("profile with empty config falls back to env var", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine-a"
+		setProfileConfig(p, map[string]string{
+			"clientId": "config-client",
+			// tenantId and federatedToken not set → fall back to env
+		})
+
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureFederatedToken, "env-fed-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "config-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-fed-token", creds.Token)
+	})
+
+	t.Run("profile with no token source returns nil", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine-a"
+		setProfileConfig(p, map[string]string{
+			"clientId": "config-client",
+			"tenantId": "config-tenant",
+			// no federatedToken or federatedTokenFile
+		})
+
+		t.Setenv(EnvAzureFederatedToken, "")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		assert.Nil(t, creds)
+	})
+
+	t.Run("profile with default config values falls back to env vars", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine-a"
+		// Only federatedToken was explicitly set; clientId/tenantId keep defaults
+		setProfileConfig(p, map[string]string{
+			"federatedToken": "config-fed-token",
+		})
+
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureFederatedToken, "env-fed-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "env-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "config-fed-token", creds.Token)
+	})
+
+	t.Run("profile with default authority falls back to env var", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine-a"
+		setProfileConfig(p, map[string]string{
+			"clientId":       "config-client",
+			"tenantId":       "config-tenant",
+			"federatedToken": "config-fed-token",
+			// authority not set → fall back to env
+		})
+
+		t.Setenv(EnvAzureAuthorityHost, "https://custom.authority.example.com")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "https://custom.authority.example.com", creds.Authority)
+	})
+
+	t.Run("profile with explicit authority uses config value", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine-a"
+		setProfileConfig(p, map[string]string{
+			"clientId":       "config-client",
+			"tenantId":       "config-tenant",
+			"federatedToken": "config-fed-token",
+			"authority":      "https://explicit.authority.example.com",
+		})
+
+		t.Setenv(EnvAzureAuthorityHost, "https://env.authority.example.com")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "https://explicit.authority.example.com", creds.Authority)
+	})
+}
+
+func TestConfigureAuthHandlerWithProfile(t *testing.T) {
+	t.Run("profile stored from config", func(t *testing.T) {
+		p := &Plugin{}
+		cfg := map[string]json.RawMessage{
+			HandlerName: json.RawMessage(`{"clientId":"profile-client","tenantId":"profile-tenant","clientSecret":"profile-secret"}`),
+		}
+		err := p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			Profile:  "machine",
+			Settings: cfg,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "machine", p.cfg.Profile)
+		assert.Equal(t, "profile-client", p.config.ClientID)
+		assert.Equal(t, "profile-tenant", p.config.TenantID)
+		assert.Equal(t, "profile-secret", p.config.ClientSecret)
+	})
+
+	t.Run("JSON unmarshal tracks set fields", func(t *testing.T) {
+		p := &Plugin{}
+		cfg := map[string]json.RawMessage{
+			HandlerName: json.RawMessage(`{"clientId":"my-app","clientSecret":"s3cret"}`),
+		}
+		err := p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			Profile:  "ci",
+			Settings: cfg,
+		})
+		require.NoError(t, err)
+		assert.True(t, p.config.WasSet("clientId"))
+		assert.True(t, p.config.WasSet("clientSecret"))
+		assert.False(t, p.config.WasSet("tenantId"), "tenantId was not in JSON")
+		assert.False(t, p.config.WasSet("authority"), "authority was not in JSON")
+	})
+
+	t.Run("empty JSON values treated as unset", func(t *testing.T) {
+		p := &Plugin{}
+		cfg := map[string]json.RawMessage{
+			HandlerName: json.RawMessage(`{"clientId":"","tenantId":"","clientSecret":"real-secret"}`),
+		}
+		err := p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			Profile:  "ci",
+			Settings: cfg,
+		})
+		require.NoError(t, err)
+		// Empty strings should not be marked as set
+		assert.False(t, p.config.WasSet("clientId"), "empty clientId should not be set")
+		assert.False(t, p.config.WasSet("tenantId"), "empty tenantId should not be set")
+		assert.True(t, p.config.WasSet("clientSecret"), "non-empty clientSecret should be set")
+		// Defaults should be restored for empty required fields
+		assert.Equal(t, DefaultClientID, p.config.ClientID)
+		assert.Equal(t, DefaultTenantID, p.config.TenantID)
+	})
+}
+
+func TestGetStatusWithProfileConfig(t *testing.T) {
+	t.Run("SP via profile config without env vars", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "machine"
+		setProfileConfig(p, map[string]string{
+			"clientId":     "sp-client",
+			"tenantId":     "sp-tenant",
+			"clientSecret": "sp-secret",
+		})
+
+		t.Setenv(EnvAzureClientID, "")
+		t.Setenv(EnvAzureTenantID, "")
+		t.Setenv(EnvAzureClientSecret, "")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureFederatedToken, "")
+
+		status, err := p.GetStatus(context.Background(), HandlerName)
+		require.NoError(t, err)
+		assert.True(t, status.Authenticated)
+		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
+		assert.Equal(t, "sp-client", status.ClientID)
 	})
 }

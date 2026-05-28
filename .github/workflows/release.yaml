@@ -14,10 +14,10 @@ jobs:
     name: Verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
           cache: true
@@ -28,14 +28,14 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
           cache: true
-      - uses: goreleaser/goreleaser-action@v7
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           version: "~> v2"
           args: release --clean
@@ -43,11 +43,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-catalog:
-    outputs:
-      image_ref: ${{ steps.push.outputs.image_ref }}
     name: Publish Catalog Artifact
     needs: release
     runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.push.outputs.image_ref }}
     permissions:
       contents: read
       packages: write
@@ -70,7 +70,8 @@ jobs:
       - name: Login to GitHub Container Registry
         run: |
           mkdir -p ~/.docker
-          echo '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w 0)"'"}}}' > ~/.docker/config.json
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
 
       - name: Download release archives
         env:
@@ -101,6 +102,14 @@ jobs:
             unzip -o "${archive}" -d tmp_windows_amd64
             mv "tmp_windows_amd64/${BINARY}.exe" "${BINARY}-windows-amd64.exe"
             rm -rf tmp_windows_amd64
+          fi
+
+          archive="${BINARY}_windows_arm64.zip"
+          if [ -f "${archive}" ]; then
+            mkdir -p tmp_windows_arm64
+            unzip -o "${archive}" -d tmp_windows_arm64
+            mv "tmp_windows_arm64/${BINARY}.exe" "${BINARY}-windows-arm64.exe"
+            rm -rf tmp_windows_arm64
           fi
 
       - name: Build and push catalog artifact
@@ -135,10 +144,11 @@ jobs:
 
       - name: Refresh catalog index
         run: |
-          CATALOG="ghcr.io/oakwood-commons"
           mkdir -p ~/.docker
-          echo -n '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)"'"}}}' > ~/.docker/config.json
-          scafctl catalog index push --catalog "oci://${CATALOG}"
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
+          scafctl catalog index push \
+            --catalog "oci://ghcr.io/${{ github.repository_owner }}"
 
   sign:
     name: Sign OCI Artifact

@@ -188,7 +188,7 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 	}
 
 	// Store refresh token
-	if err := hostClient.SetSecret(ctx, SecretKeyRefreshToken, tokenResp.RefreshToken); err != nil {
+	if err := hostClient.SetSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken), tokenResp.RefreshToken); err != nil {
 		return fmt.Errorf("failed to store refresh token: %w", err)
 	}
 
@@ -222,7 +222,7 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
-	if err := hostClient.SetSecret(ctx, SecretKeyMetadata, string(metadataBytes)); err != nil {
+	if err := hostClient.SetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata), string(metadataBytes)); err != nil {
 		return fmt.Errorf("failed to store metadata: %w", err)
 	}
 
@@ -231,12 +231,12 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 
 // loadRefreshToken loads the stored refresh token from the host secret store.
 func (p *Plugin) loadRefreshToken(ctx context.Context) (string, error) {
-	return p.getSecret(ctx, SecretKeyRefreshToken)
+	return p.getSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
 }
 
 // loadMetadata loads the stored token metadata from the host secret store.
 func (p *Plugin) loadMetadata(ctx context.Context) (*TokenMetadata, error) {
-	raw, err := p.getSecret(ctx, SecretKeyMetadata)
+	raw, err := p.getSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
 	if err != nil {
 		return nil, err
 	}

@@ -80,9 +80,60 @@ func GetWorkloadIdentityCredentials() *WorkloadIdentityCredentials {
 	}
 }
 
-// HasWorkloadIdentityCredentials checks if workload identity is configured and available.
+// HasWorkloadIdentityCredentials checks if workload identity is configured and available
+// via environment variables only (no profile config).
 func HasWorkloadIdentityCredentials() bool {
 	return GetWorkloadIdentityCredentials() != nil
+}
+
+// resolveWorkloadIdentityCredentials returns WIF credentials, preferring config
+// values over environment variables when a profile is active.
+func (p *Plugin) resolveWorkloadIdentityCredentials() *WorkloadIdentityCredentials {
+	if p.cfg.Profile == "" {
+		return GetWorkloadIdentityCredentials()
+	}
+
+	// Profile active: prefer explicitly configured values, fall back to env vars.
+	// Fields that still hold DefaultConfig() values were not set by the profile,
+	// so they must fall through to the environment variable.
+	clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
+	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
+	tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+	directToken := p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+	authority := p.profileOrEnv(p.config.Authority, "authority", EnvAzureAuthorityHost)
+	if authority == "" {
+		authority = DefaultAuthority
+	}
+
+	// Validate token source
+	hasDirectToken := directToken != ""
+	hasTokenFile := false
+	if tokenFile != "" {
+		if _, err := os.Stat(tokenFile); err == nil { //nolint:gosec // tokenFile is from trusted config or env var
+			hasTokenFile = true
+		}
+	}
+	if !hasDirectToken && !hasTokenFile {
+		return nil
+	}
+
+	if clientID == "" || tenantID == "" {
+		return nil
+	}
+
+	return &WorkloadIdentityCredentials{
+		ClientID:  clientID,
+		TenantID:  tenantID,
+		TokenFile: tokenFile,
+		Token:     directToken,
+		Authority: authority,
+	}
+}
+
+// hasWorkloadIdentityCredentials checks if workload identity credentials are
+// available from either config (when a profile is active) or environment variables.
+func (p *Plugin) hasWorkloadIdentityCredentials() bool {
+	return p.resolveWorkloadIdentityCredentials() != nil
 }
 
 // GetFederatedToken returns the federated token.
@@ -112,24 +163,34 @@ func (c *WorkloadIdentityCredentials) GetFederatedToken() (string, error) {
 func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	creds := GetWorkloadIdentityCredentials()
+	creds := p.resolveWorkloadIdentityCredentials()
 	if creds == nil {
-		directToken := os.Getenv(EnvAzureFederatedToken)
-		tokenFile := os.Getenv(EnvAzureFederatedTokenFile)
+		var directToken, tokenFile, clientID, tenantID string
+		if p.cfg.Profile != "" {
+			directToken = p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+			tokenFile = p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+			clientID = p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
+			tenantID = p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
+		} else {
+			directToken = os.Getenv(EnvAzureFederatedToken)
+			tokenFile = os.Getenv(EnvAzureFederatedTokenFile)
+			clientID = os.Getenv(EnvAzureClientID)
+			tenantID = os.Getenv(EnvAzureTenantID)
+		}
 
 		if directToken == "" && tokenFile == "" {
-			return nil, fmt.Errorf("workload identity not configured: set %s or %s environment variable", EnvAzureFederatedTokenFile, EnvAzureFederatedToken)
+			return nil, fmt.Errorf("workload identity not configured: set %s or %s", EnvAzureFederatedTokenFile, EnvAzureFederatedToken)
 		}
 		if tokenFile != "" {
-			if _, err := os.Stat(tokenFile); err != nil { //nolint:gosec // tokenFile is from trusted env var
+			if _, err := os.Stat(tokenFile); err != nil { //nolint:gosec // tokenFile is from trusted config or env var
 				return nil, fmt.Errorf("workload identity token file %s: %w", tokenFile, err)
 			}
 		}
-		if os.Getenv(EnvAzureClientID) == "" {
-			return nil, fmt.Errorf("workload identity not configured: %s environment variable not set", EnvAzureClientID)
+		if clientID == "" {
+			return nil, fmt.Errorf("workload identity not configured: %s not set", EnvAzureClientID)
 		}
-		if os.Getenv(EnvAzureTenantID) == "" {
-			return nil, fmt.Errorf("workload identity not configured: %s environment variable not set", EnvAzureTenantID)
+		if tenantID == "" {
+			return nil, fmt.Errorf("workload identity not configured: %s not set", EnvAzureTenantID)
 		}
 		return nil, fmt.Errorf("workload identity credentials not configured")
 	}
@@ -253,7 +314,7 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 
 	qualifiedScope := QualifyScope(req.Scope)
 
-	creds := GetWorkloadIdentityCredentials()
+	creds := p.resolveWorkloadIdentityCredentials()
 	if creds == nil {
 		return nil, fmt.Errorf("workload identity credentials not configured")
 	}
@@ -264,12 +325,13 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 	}
 
 	hostClient := p.hostClient(ctx)
+	prefix := p.tokenCachePrefix(ctx)
 	fp := fingerprintHash(creds.ClientID + ":" + creds.TenantID + ":" + creds.Authority)
-	cacheKey := fp + ":" + qualifiedScope
+	fullKey := prefix + fp + ":" + qualifiedScope
 
 	// Check cache first
 	if !req.ForceRefresh && hostClient != nil {
-		token, err := cacheGet(ctx, hostClient, cacheKey)
+		token, err := cacheGet(ctx, hostClient, fullKey)
 		if err == nil && token != nil && token.IsValidFor(minValidFor) {
 			return &sdkplugin.TokenResponse{
 				AccessToken: token.AccessToken,
@@ -292,7 +354,7 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 
 	// Cache the token
 	if hostClient != nil {
-		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token); cacheErr != nil {
+		if cacheErr := cacheSet(ctx, hostClient, fullKey, token); cacheErr != nil {
 			lgr.V(1).Info("failed to cache token", "error", cacheErr)
 		}
 	}
@@ -308,7 +370,7 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 
 // workloadIdentityStatus returns the status for workload identity authentication.
 func (p *Plugin) workloadIdentityStatus() (*auth.Status, error) {
-	creds := GetWorkloadIdentityCredentials()
+	creds := p.resolveWorkloadIdentityCredentials()
 	if creds == nil {
 		return &auth.Status{Authenticated: false}, nil
 	}

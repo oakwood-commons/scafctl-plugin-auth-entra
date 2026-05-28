@@ -40,10 +40,10 @@ func (p *Plugin) GetGroups(ctx context.Context) ([]string, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	// /me/memberOf requires a delegated (user) token
-	if HasWorkloadIdentityCredentials() {
+	if p.hasWorkloadIdentityCredentials() {
 		return nil, fmt.Errorf("group membership queries are not supported for workload identity flows")
 	}
-	if HasServicePrincipalCredentials() {
+	if p.hasServicePrincipalCredentials() {
 		return nil, fmt.Errorf("group membership queries are not supported for service principal flows")
 	}
 

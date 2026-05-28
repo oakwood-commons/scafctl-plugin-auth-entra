@@ -6,6 +6,7 @@ package entra
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -26,14 +27,26 @@ const (
 	// HandlerDisplayName is the human-readable name for the handler.
 	HandlerDisplayName = "Microsoft Entra ID"
 
-	// SecretKeyRefreshToken is the secret key for storing the refresh token.
-	SecretKeyRefreshToken = "scafctl.auth.entra.refresh_token" //nolint:gosec // key name, not a credential
+	// secretKeyBase is the base prefix for all Entra auth handler secrets.
+	secretKeyBase = "scafctl.auth.entra" //nolint:gosec // key prefix, not a credential
 
-	// SecretKeyMetadata is the secret key for storing token metadata.
-	SecretKeyMetadata = "scafctl.auth.entra.metadata" //nolint:gosec // key name, not a credential
+	// secretSuffixRefreshToken is the key suffix for the refresh token.
+	secretSuffixRefreshToken = "refresh_token" //nolint:gosec // key suffix, not a credential
 
-	// SecretKeyTokenPrefix is the prefix for cached access tokens.
-	SecretKeyTokenPrefix = "scafctl.auth.entra.token." //nolint:gosec // key prefix, not a credential
+	// secretSuffixMetadata is the key suffix for token metadata.
+	secretSuffixMetadata = "metadata" //nolint:gosec // key suffix, not a credential
+
+	// secretSuffixTokenPrefix is the key suffix for cached access tokens.
+	secretSuffixTokenPrefix = "token." //nolint:gosec // key suffix, not a credential
+
+	// SecretKeyRefreshToken is the default (no-profile) secret key for the refresh token.
+	SecretKeyRefreshToken = secretKeyBase + "." + secretSuffixRefreshToken //nolint:gosec // key name, not a credential
+
+	// SecretKeyMetadata is the default (no-profile) secret key for token metadata.
+	SecretKeyMetadata = secretKeyBase + "." + secretSuffixMetadata //nolint:gosec // key name, not a credential
+
+	// SecretKeyTokenPrefix is the default (no-profile) prefix for cached access tokens.
+	SecretKeyTokenPrefix = secretKeyBase + "." + secretSuffixTokenPrefix //nolint:gosec // key prefix, not a credential
 
 	// DefaultTimeout is the default timeout for device code flow.
 	DefaultTimeout = 5 * time.Minute
@@ -106,6 +119,18 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		}
 	}
 
+	// For profiles, restore defaults for fields that were not explicitly set
+	// (or were set to empty) so that Validate succeeds. The actual env var
+	// fallback happens later in profileOrEnv during resolve calls.
+	if cfg.Profile != "" {
+		if !p.config.WasSet("clientId") && p.config.ClientID == "" {
+			p.config.ClientID = DefaultClientID
+		}
+		if !p.config.WasSet("tenantId") && p.config.TenantID == "" {
+			p.config.TenantID = DefaultTenantID
+		}
+	}
+
 	if err := p.config.Validate(); err != nil {
 		return err
 	}
@@ -158,9 +183,9 @@ func (p *Plugin) Login(ctx context.Context, handlerName string, req sdkplugin.Lo
 	// Determine which flow to use with credential detection.
 	flow := req.Flow
 	if flow == "" {
-		if HasWorkloadIdentityCredentials() {
+		if p.hasWorkloadIdentityCredentials() {
 			flow = auth.FlowWorkloadIdentity
-		} else if HasServicePrincipalCredentials() {
+		} else if p.hasServicePrincipalCredentials() {
 			flow = auth.FlowServicePrincipal
 		} else if p.config.DefaultFlow != "" {
 			flow = auth.Flow(p.config.DefaultFlow)
@@ -202,15 +227,15 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 	}
 
 	// Clear all cached tokens
-	cacheClear(ctx, lgr, hostClient)
+	cacheClear(ctx, lgr, hostClient, p.tokenCachePrefix(ctx))
 
 	// Delete refresh token
-	if err := hostClient.DeleteSecret(ctx, SecretKeyRefreshToken); err != nil {
+	if err := hostClient.DeleteSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken)); err != nil {
 		lgr.V(1).Info("failed to delete refresh token (may not exist)", "error", err)
 	}
 
 	// Delete metadata
-	if err := hostClient.DeleteSecret(ctx, SecretKeyMetadata); err != nil {
+	if err := hostClient.DeleteSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); err != nil {
 		lgr.V(1).Info("failed to delete metadata (may not exist)", "error", err)
 	}
 
@@ -224,17 +249,17 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string) (*auth.Statu
 	}
 
 	// Check for workload identity credentials first (highest priority)
-	if HasWorkloadIdentityCredentials() {
+	if p.hasWorkloadIdentityCredentials() {
 		return p.workloadIdentityStatus()
 	}
 
 	// Check for service principal credentials
-	if HasServicePrincipalCredentials() {
+	if p.hasServicePrincipalCredentials() {
 		return p.servicePrincipalStatus()
 	}
 
 	// Check if we have stored credentials
-	if !p.secretExists(ctx, SecretKeyRefreshToken) {
+	if !p.secretExists(ctx, p.secretKey(ctx, secretSuffixRefreshToken)) {
 		return &auth.Status{Authenticated: false}, nil
 	}
 
@@ -274,12 +299,12 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	// Use workload identity flow if credentials are present (highest priority)
-	if HasWorkloadIdentityCredentials() {
+	if p.hasWorkloadIdentityCredentials() {
 		return p.getWorkloadIdentityToken(ctx, req)
 	}
 
 	// Use service principal flow if credentials are present
-	if HasServicePrincipalCredentials() {
+	if p.hasServicePrincipalCredentials() {
 		return p.getServicePrincipalToken(ctx, req)
 	}
 
@@ -304,12 +329,13 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 	)
 
 	hostClient := p.hostClient(ctx)
+	prefix := p.tokenCachePrefix(ctx)
 	fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
-	cacheKey := fp + ":" + qualifiedScope
+	fullKey := prefix + fp + ":" + qualifiedScope
 
 	// Check cache first (unless force refresh)
 	if !req.ForceRefresh && hostClient != nil {
-		token, err := cacheGet(ctx, hostClient, cacheKey)
+		token, err := cacheGet(ctx, hostClient, fullKey)
 		if err == nil && token != nil && token.IsValidFor(minValidFor) {
 			lgr.V(1).Info("using cached token",
 				"scope", qualifiedScope,
@@ -344,7 +370,7 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 
 	// Cache the token
 	if hostClient != nil {
-		if cacheErr := cacheSet(ctx, hostClient, cacheKey, token); cacheErr != nil {
+		if cacheErr := cacheSet(ctx, hostClient, fullKey, token); cacheErr != nil {
 			lgr.V(1).Info("failed to cache token", "error", cacheErr)
 		}
 	}
@@ -373,7 +399,7 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 	var results []*auth.CachedTokenInfo
 
 	// Refresh token
-	if p.secretExists(ctx, SecretKeyRefreshToken) {
+	if p.secretExists(ctx, p.secretKey(ctx, secretSuffixRefreshToken)) {
 		info := &auth.CachedTokenInfo{
 			Handler:   HandlerName,
 			TokenKind: "refresh",
@@ -391,7 +417,7 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 	}
 
 	// Minted access tokens from cache
-	entries, _ := cacheListEntries(ctx, hostClient)
+	entries, _ := cacheListEntries(ctx, hostClient, p.tokenCachePrefix(ctx))
 	results = append(results, entries...)
 
 	return results, nil
@@ -408,7 +434,7 @@ func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (in
 		return 0, fmt.Errorf("host service not available")
 	}
 
-	return cachePurgeExpired(ctx, hostClient)
+	return cachePurgeExpired(ctx, hostClient, p.tokenCachePrefix(ctx))
 }
 
 // DetectAvailableFlows reports which auth flows are available based on
@@ -420,15 +446,15 @@ func (p *Plugin) DetectAvailableFlows(_ context.Context, handlerName string) ([]
 
 	var flows []sdkplugin.FlowAvailability
 
-	// Workload identity flow -- check environment variables
-	if HasWorkloadIdentityCredentials() {
+	// Workload identity flow -- check config and environment variables
+	if p.hasWorkloadIdentityCredentials() {
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowWorkloadIdentity,
 			Available: true,
-			Reason:    fmt.Sprintf("%s or %s is set", EnvAzureFederatedTokenFile, EnvAzureFederatedToken),
+			Reason:    "workload identity credentials configured",
 		})
 	} else {
-		reason := detectWorkloadIdentityUnavailableReason()
+		reason := p.detectWorkloadIdentityUnavailableReason()
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowWorkloadIdentity,
 			Available: false,
@@ -436,27 +462,45 @@ func (p *Plugin) DetectAvailableFlows(_ context.Context, handlerName string) ([]
 		})
 	}
 
-	// Service principal flow -- check environment variables
-	if HasServicePrincipalCredentials() {
+	// Service principal flow -- check config and environment variables
+	if p.hasServicePrincipalCredentials() {
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowServicePrincipal,
 			Available: true,
-			Reason:    fmt.Sprintf("%s, %s, and %s are set", EnvAzureClientID, EnvAzureClientSecret, EnvAzureTenantID),
+			Reason:    "service principal credentials configured",
 		})
 	} else {
-		missing := []string{}
-		if os.Getenv(EnvAzureClientID) == "" {
-			missing = append(missing, EnvAzureClientID)
-		}
-		if os.Getenv(EnvAzureClientSecret) == "" {
-			missing = append(missing, EnvAzureClientSecret)
-		}
-		if os.Getenv(EnvAzureTenantID) == "" {
-			missing = append(missing, EnvAzureTenantID)
-		}
 		reason := "service principal credentials not configured"
-		if len(missing) > 0 {
-			reason = fmt.Sprintf("missing environment variables: %s", strings.Join(missing, ", "))
+		var missing []string
+		if p.cfg.Profile != "" {
+			clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
+			clientSecret := p.profileOrEnv(p.config.ClientSecret, "clientSecret", EnvAzureClientSecret)
+			tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
+			if clientID == "" {
+				missing = append(missing, EnvAzureClientID)
+			}
+			if clientSecret == "" {
+				missing = append(missing, EnvAzureClientSecret)
+			}
+			if tenantID == "" {
+				missing = append(missing, EnvAzureTenantID)
+			}
+			if len(missing) > 0 {
+				reason = fmt.Sprintf("missing %s (not in profile config or environment)", strings.Join(missing, ", "))
+			}
+		} else {
+			if os.Getenv(EnvAzureClientID) == "" {
+				missing = append(missing, EnvAzureClientID)
+			}
+			if os.Getenv(EnvAzureClientSecret) == "" {
+				missing = append(missing, EnvAzureClientSecret)
+			}
+			if os.Getenv(EnvAzureTenantID) == "" {
+				missing = append(missing, EnvAzureTenantID)
+			}
+			if len(missing) > 0 {
+				reason = fmt.Sprintf("missing environment variables: %s", strings.Join(missing, ", "))
+			}
 		}
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowServicePrincipal,
@@ -483,12 +527,21 @@ func (p *Plugin) DetectAvailableFlows(_ context.Context, handlerName string) ([]
 }
 
 // detectWorkloadIdentityUnavailableReason returns a specific reason why
-// workload identity credentials are not available.
-func detectWorkloadIdentityUnavailableReason() string {
-	tokenFile := os.Getenv(EnvAzureFederatedTokenFile)
-	directToken := os.Getenv(EnvAzureFederatedToken)
-	clientID := os.Getenv(EnvAzureClientID)
-	tenantID := os.Getenv(EnvAzureTenantID)
+// workload identity credentials are not available. When a profile is active it
+// inspects resolved (config-then-env) values; otherwise it checks env vars only.
+func (p *Plugin) detectWorkloadIdentityUnavailableReason() string {
+	var tokenFile, directToken, clientID, tenantID string
+	if p.cfg.Profile != "" {
+		tokenFile = p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+		directToken = p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+		clientID = p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
+		tenantID = p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
+	} else {
+		tokenFile = os.Getenv(EnvAzureFederatedTokenFile)
+		directToken = os.Getenv(EnvAzureFederatedToken)
+		clientID = os.Getenv(EnvAzureClientID)
+		tenantID = os.Getenv(EnvAzureTenantID)
+	}
 
 	hasTokenSource := directToken != ""
 	if tokenFile != "" {
@@ -504,7 +557,7 @@ func detectWorkloadIdentityUnavailableReason() string {
 		return fmt.Sprintf("neither %s nor %s is configured", EnvAzureFederatedTokenFile, EnvAzureFederatedToken)
 	}
 
-	// Token source exists but client/tenant env vars are missing.
+	// Token source exists but client/tenant are missing.
 	var missing []string
 	if clientID == "" {
 		missing = append(missing, EnvAzureClientID)
@@ -513,6 +566,9 @@ func detectWorkloadIdentityUnavailableReason() string {
 		missing = append(missing, EnvAzureTenantID)
 	}
 	if len(missing) > 0 {
+		if p.cfg.Profile != "" {
+			return fmt.Sprintf("federated token is available but missing %s (not in profile config or environment)", strings.Join(missing, ", "))
+		}
 		return fmt.Sprintf("federated token is available but missing required environment variables: %s", strings.Join(missing, ", "))
 	}
 
@@ -571,3 +627,36 @@ func (p *Plugin) binaryName() string {
 	return "scafctl"
 }
 
+// secretKey returns a profile-scoped secret key. It checks the context first
+// and falls back to the profile set during ConfigureAuthHandler. When no
+// profile is active, the key matches the legacy unscoped format for backward
+// compatibility. The profile name is hex-encoded to prevent dot-delimited
+// collisions (e.g. a profile named "prod.token" would otherwise overlap with
+// the token cache prefix for profile "prod").
+func (p *Plugin) secretKey(ctx context.Context, suffix string) string {
+	profile := auth.ProfileFromContext(ctx)
+	if profile == "" {
+		profile = p.cfg.Profile
+	}
+	if profile == "" {
+		return secretKeyBase + "." + suffix
+	}
+	return secretKeyBase + "." + hex.EncodeToString([]byte(profile)) + "." + suffix
+}
+
+// profileOrEnv returns the config value if its JSON field was explicitly
+// provided during unmarshaling, otherwise falls back to the environment
+// variable. This ensures that a profile intentionally setting a value equal
+// to the default (e.g. tenantId = "common") is honored rather than overridden
+// by an env var.
+func (p *Plugin) profileOrEnv(configVal, jsonField, envVar string) string {
+	if p.config.WasSet(jsonField) {
+		return configVal
+	}
+	return os.Getenv(envVar)
+}
+
+// tokenCachePrefix returns the profile-scoped prefix for cached access tokens.
+func (p *Plugin) tokenCachePrefix(ctx context.Context) string {
+	return p.secretKey(ctx, secretSuffixTokenPrefix)
+}

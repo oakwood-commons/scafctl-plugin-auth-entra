@@ -315,6 +315,33 @@ func ensureOfflineAccess(scope string) string {
 	return scope + " offline_access"
 }
 
+// requiredOIDCScopes returns the OIDC scopes that must always be present in
+// login requests. Declared as a function returning a fixed-size array to
+// prevent accidental mutation of the backing storage.
+func requiredOIDCScopes() [3]string {
+	return [3]string{"openid", "profile", "offline_access"}
+}
+
+// ensureOIDCScopes ensures that openid, profile, and offline_access scopes
+// are present in the slice. These are required so that the token response
+// includes an ID token with user identity claims (preferred_username, name).
+// The returned slice is always a new allocation; the input is never modified.
+func ensureOIDCScopes(scopes []string) []string {
+	have := make(map[string]bool, len(scopes))
+	for _, s := range scopes {
+		have[s] = true
+	}
+	required := requiredOIDCScopes()
+	result := make([]string, len(scopes), len(scopes)+len(required))
+	copy(result, scopes)
+	for _, s := range required {
+		if !have[s] {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
 // generateSessionID creates a new unique session identifier.
 func generateSessionID() string {
 	return uuid.New().String()

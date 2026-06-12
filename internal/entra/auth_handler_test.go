@@ -663,6 +663,51 @@ func TestFingerprintHash(t *testing.T) {
 	assert.Len(t, h1, 64, "SHA-256 hex should be 64 chars")
 }
 
+func TestEnsureOIDCScopes(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  []string
+		expect []string
+	}{
+		{
+			name:   "empty input adds all required scopes",
+			input:  nil,
+			expect: []string{"openid", "profile", "offline_access"},
+		},
+		{
+			name:   "already has all scopes unchanged",
+			input:  []string{"openid", "profile", "offline_access"},
+			expect: []string{"openid", "profile", "offline_access"},
+		},
+		{
+			name:   "adds missing scopes preserving existing",
+			input:  []string{"api://my-app/.default"},
+			expect: []string{"api://my-app/.default", "openid", "profile", "offline_access"},
+		},
+		{
+			name:   "no duplicates when partial overlap",
+			input:  []string{"openid", "api://app"},
+			expect: []string{"openid", "api://app", "profile", "offline_access"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ensureOIDCScopes(tc.input)
+			assert.Equal(t, tc.expect, result)
+		})
+	}
+}
+
+func TestEnsureOIDCScopes_DoesNotMutateInput(t *testing.T) {
+	original := []string{"openid"}
+	originalCopy := make([]string, len(original))
+	copy(originalCopy, original)
+
+	_ = ensureOIDCScopes(original)
+
+	assert.Equal(t, originalCopy, original, "input slice must not be modified")
+}
+
 func TestEnsureOfflineAccess(t *testing.T) {
 	assert.Equal(t, "openid offline_access", ensureOfflineAccess("openid"))
 	assert.Equal(t, "openid offline_access profile", ensureOfflineAccess("openid offline_access profile"))

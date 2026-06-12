@@ -56,6 +56,16 @@ type Config struct {
 	// AZURE_FEDERATED_TOKEN.
 	FederatedToken string `json:"federatedToken,omitempty" yaml:"federatedToken,omitempty"` //nolint:gosec // config field name, not a credential
 
+	// AdditionalScopes are always merged into the final scope set,
+	// regardless of whether the caller provided scopes or DefaultScopes
+	// were used. Duplicates are suppressed.
+	AdditionalScopes []string `json:"additionalScopes,omitempty" yaml:"additionalScopes,omitempty"`
+
+	// InjectOIDCScopes controls whether openid, profile, and offline_access
+	// scopes are automatically appended to every login request. When nil
+	// (the default), OIDC scopes are injected. Set to false to disable.
+	InjectOIDCScopes *bool `json:"injectOidcScopes,omitempty" yaml:"injectOidcScopes,omitempty"`
+
 	// MinPollInterval is the minimum interval between device code poll requests.
 	MinPollInterval time.Duration `json:"-" yaml:"-"`
 
@@ -136,6 +146,37 @@ func (c *Config) GetAuthority() string {
 // GetAuthorityWithTenant returns the full authority URL for a specific tenant.
 func (c *Config) GetAuthorityWithTenant(tenantID string) string {
 	return fmt.Sprintf("%s/%s", c.GetAuthority(), tenantID)
+}
+
+// ShouldInjectOIDCScopes reports whether OIDC scopes (openid, profile,
+// offline_access) should be automatically appended to login requests.
+// Returns true when InjectOIDCScopes is nil (unset) or explicitly true.
+func (c *Config) ShouldInjectOIDCScopes() bool {
+	if c.InjectOIDCScopes == nil {
+		return true
+	}
+	return *c.InjectOIDCScopes
+}
+
+// MergeAdditionalScopes returns a new slice containing the input scopes plus
+// any AdditionalScopes not already present. The input slice is never mutated.
+func (c *Config) MergeAdditionalScopes(scopes []string) []string {
+	if len(c.AdditionalScopes) == 0 {
+		return scopes
+	}
+	have := make(map[string]bool, len(scopes))
+	for _, s := range scopes {
+		have[s] = true
+	}
+	out := make([]string, len(scopes), len(scopes)+len(c.AdditionalScopes))
+	copy(out, scopes)
+	for _, s := range c.AdditionalScopes {
+		if !have[s] {
+			out = append(out, s)
+			have[s] = true
+		}
+	}
+	return out
 }
 
 // QualifyScope returns a fully-qualified scope string. If the input contains

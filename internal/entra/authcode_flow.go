@@ -39,17 +39,14 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 		scopes = p.config.DefaultScopes
 	}
 
-	// Ensure offline_access is included for refresh token
-	hasOfflineAccess := false
-	for _, s := range scopes {
-		if s == "offline_access" {
-			hasOfflineAccess = true
-			break
-		}
+	// Ensure OIDC scopes are included so the response contains an ID token
+	// with user claims (preferred_username, name).
+	if p.config.ShouldInjectOIDCScopes() {
+		scopes = ensureOIDCScopes(scopes)
 	}
-	if !hasOfflineAccess {
-		scopes = append(scopes, "offline_access")
-	}
+
+	// Merge any additional scopes configured in the profile.
+	scopes = p.config.MergeAdditionalScopes(scopes)
 
 	// Determine timeout
 	timeout := req.Timeout

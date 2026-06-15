@@ -245,8 +245,8 @@ github.com/oakwood-commons/httpc v0.1.0 h1:syQbjqerxGEVngGWOtyGhkwFFUnJekm+amnuK
 github.com/oakwood-commons/httpc v0.1.0/go.mod h1:vQ7KZ7NK7tF9Inqzikuo1HKozTw2Y0tHMp316PqwkEA=
 github.com/oakwood-commons/oauth-helpers v0.2.0 h1:IIu8AitRWCNp51oRvfBU0D7JGM3Tt3QXUejLwEFZk+Q=
 github.com/oakwood-commons/oauth-helpers v0.2.0/go.mod h1:+VhuszKORoPc9H0HwvS92I/U0828up8XejsUpXS7FvE=
-github.com/oakwood-commons/scafctl-plugin-sdk v0.8.0 h1:EE4FnUT+RjyUsAYDZ8C6YKK7fPjpckTA/6otlQz5nzk=
-github.com/oakwood-commons/scafctl-plugin-sdk v0.8.0/go.mod h1:FiF5Nx8FqKxsfYqr93NnHVVVQLUaV6rPOY7Nu6dOIsg=
+github.com/oakwood-commons/scafctl-plugin-sdk v0.9.0 h1:IiPapohzmwnVp6bxomBJLt87e6IAjszZF9IyWwym5Qw=
+github.com/oakwood-commons/scafctl-plugin-sdk v0.9.0/go.mod h1:oC2LqrVwXEQBgR2rIp+PbSF0mLfkC1a2G5KJb6CzdgE=
 github.com/oklog/oklog v0.3.2/go.mod h1:FCV+B7mhrz4o+ueLpx+KqkyXRGMWOYEvfiXtdGtbWGs=
 github.com/oklog/run v1.0.0/go.mod h1:dlhp/R75TPv97u0XWUtDeV/lRKWPKSdTuV0TZvrmrQA=
 github.com/oklog/run v1.1.0 h1:GEenZ1cK0+q0+wsJew9qUg/DyD8k3JzYsZAi5gYi2mA=
@@ -439,8 +439,8 @@ golang.org/x/sync v0.0.0-20190423024810-112230192c58/go.mod h1:RxMgew5VJxzue5/jJ
 golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
-golang.org/x/sync v0.20.0 h1:e0PTpb7pjO8GAtTs2dQ6jYa5BWYlMuX047Dco/pItO4=
-golang.org/x/sync v0.20.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
+golang.org/x/sync v0.21.0 h1:HLII4xRRTtCRkxYp4HNFF0Js/Og6q2i++KXbg0gHCwM=
+golang.org/x/sync v0.21.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
 golang.org/x/sys v0.0.0-20180823144017-11551d06cbcc/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
 golang.org/x/sys v0.0.0-20180830151530-49385e6e1522/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
 golang.org/x/sys v0.0.0-20180905080454-ebe1bf3edb33/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=

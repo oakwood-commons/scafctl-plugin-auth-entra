@@ -5,6 +5,7 @@
 package entra
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -75,6 +76,18 @@ type Plugin struct {
 	cachedHostClient *sdkplugin.HostServiceClient
 	openBrowser      BrowserOpenFunc
 	oboCache         *oboCache
+	mode             mode
+}
+
+var _ sdkplugin.ServerMode = (*Plugin)(nil) // compile-time interface check
+
+// activeMode returns the current mode. This guard returns an explicit error
+// rather than panicking if the invariant is violated.
+func (p *Plugin) activeMode() (mode, error) {
+	if p.mode == nil {
+		return nil, fmt.Errorf("auth handler not configured: call ConfigureAuthHandler or ActivateServerMode first")
+	}
+	return p.mode, nil
 }
 
 // GetAuthHandlers returns the list of auth handlers exposed by this plugin.
@@ -163,6 +176,9 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		p.oboCache = newOBOCache()
 	}
 
+	// Default to CLI mode
+	p.mode = &cliMode{p: p}
+
 	return nil
 }
 
@@ -175,45 +191,30 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 //     workload identity and service principal environment credentials.
 //  4. Explicit FlowInteractive -- authorization code + PKCE flow.
 //  5. Explicit FlowDeviceCode or empty flow -- device code polling flow.
+//
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) Login(ctx context.Context, handlerName string, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	// Determine which flow to use with credential detection.
-	flow := req.Flow
-	if flow == "" {
-		if p.hasWorkloadIdentityCredentials() {
-			flow = auth.FlowWorkloadIdentity
-		} else if p.hasServicePrincipalCredentials() {
-			flow = auth.FlowServicePrincipal
-		} else if p.config.DefaultFlow != "" {
-			flow = auth.Flow(p.config.DefaultFlow)
-		} else {
-			flow = auth.FlowDeviceCode
-		}
+	m, err := p.activeMode()
+	if err != nil {
+		return nil, err
 	}
-
-	switch flow { //nolint:exhaustive // Only Entra-supported flows are handled
-	case auth.FlowWorkloadIdentity:
-		return p.workloadIdentityLogin(ctx, req)
-	case auth.FlowServicePrincipal:
-		return p.servicePrincipalLogin(ctx, req)
-	case auth.FlowInteractive:
-		return p.authCodeLogin(ctx, req, deviceCodeCb)
-	case auth.FlowDeviceCode:
-		return p.deviceCodeLogin(ctx, req, deviceCodeCb)
-	default:
-		return nil, fmt.Errorf("unsupported flow: %s", flow)
-	}
+	return m.Login(ctx, req, deviceCodeCb)
 }
 
 // Logout revokes the current session.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) Logout(ctx context.Context, handlerName string) error {
 	if handlerName != HandlerName {
 		return fmt.Errorf("unknown handler: %s", handlerName)
 	}
-	return p.logoutInternal(ctx)
+	m, err := p.activeMode()
+	if err != nil {
+		return err
+	}
+	return m.Logout(ctx)
 }
 
 // logoutInternal clears stored credentials and cached tokens.
@@ -243,287 +244,69 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 }
 
 // GetStatus returns the current authentication status.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) GetStatus(ctx context.Context, handlerName string) (*auth.Status, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	// Check for workload identity credentials first (highest priority)
-	if p.hasWorkloadIdentityCredentials() {
-		return p.workloadIdentityStatus()
-	}
-
-	// Check for service principal credentials
-	if p.hasServicePrincipalCredentials() {
-		return p.servicePrincipalStatus()
-	}
-
-	// Check if we have stored credentials
-	if !p.secretExists(ctx, p.secretKey(ctx, secretSuffixRefreshToken)) {
-		return &auth.Status{Authenticated: false}, nil
-	}
-
-	// Load and validate metadata
-	metadata, err := p.loadMetadata(ctx)
+	m, err := p.activeMode()
 	if err != nil {
-		return &auth.Status{Authenticated: false}, nil //nolint:nilerr // corrupted metadata = not authenticated
+		return nil, err
 	}
-
-	// Check if refresh token is expired
-	if !metadata.RefreshTokenExpiresAt.IsZero() && time.Now().After(metadata.RefreshTokenExpiresAt) {
-		return &auth.Status{
-			Authenticated: false,
-			Reason:        "session expired",
-			Claims:        metadata.Claims,
-		}, nil
-	}
-
-	return &auth.Status{
-		Authenticated: true,
-		Claims:        metadata.Claims,
-		ExpiresAt:     metadata.RefreshTokenExpiresAt,
-		LastRefresh:   metadata.LastRefresh,
-		TenantID:      metadata.TenantID,
-		IdentityType:  auth.IdentityTypeUser,
-		ClientID:      metadata.ClientID,
-		Scopes:        metadata.Scopes,
-	}, nil
+	return m.GetStatus(ctx)
 }
 
 // GetToken returns a valid access token, refreshing if necessary.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	lgr := logr.FromContextOrDiscard(ctx)
-
-	// Use workload identity flow if credentials are present (highest priority)
-	if p.hasWorkloadIdentityCredentials() {
-		return p.getWorkloadIdentityToken(ctx, req)
-	}
-
-	// Use service principal flow if credentials are present
-	if p.hasServicePrincipalCredentials() {
-		return p.getServicePrincipalToken(ctx, req)
-	}
-
-	scope := req.Scope
-	if scope == "" {
-		return nil, fmt.Errorf("scope is required for token request")
-	}
-
-	// Qualify bare permission names
-	qualifiedScope := QualifyScope(scope)
-
-	minValidFor := req.MinValidFor
-	if minValidFor == 0 {
-		minValidFor = auth.DefaultMinValidFor
-	}
-
-	lgr.V(1).Info("getting token",
-		"handler", HandlerName,
-		"scope", qualifiedScope,
-		"minValidFor", minValidFor,
-		"forceRefresh", req.ForceRefresh,
-	)
-
-	hostClient := p.hostClient(ctx)
-	prefix := p.tokenCachePrefix(ctx)
-	fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
-	fullKey := prefix + fp + ":" + qualifiedScope
-
-	// Check cache first (unless force refresh)
-	if !req.ForceRefresh && hostClient != nil {
-		token, err := cacheGet(ctx, hostClient, fullKey)
-		if err == nil && token != nil && token.IsValidFor(minValidFor) {
-			lgr.V(1).Info("using cached token",
-				"scope", qualifiedScope,
-				"expiresAt", token.ExpiresAt,
-				"remainingValidity", token.TimeUntilExpiry(),
-			)
-			return &sdkplugin.TokenResponse{
-				AccessToken: token.AccessToken,
-				TokenType:   token.TokenType,
-				ExpiresAt:   token.ExpiresAt,
-				Scope:       token.Scope,
-				Flow:        token.Flow,
-				SessionID:   token.SessionID,
-			}, nil
-		}
-		if err != nil {
-			lgr.V(1).Info("cache lookup failed, will mint new token", "error", err)
-		} else if token != nil {
-			lgr.V(1).Info("cached token insufficient validity",
-				"expiresAt", token.ExpiresAt,
-				"remainingValidity", token.TimeUntilExpiry(),
-				"requiredValidity", minValidFor,
-			)
-		}
-	}
-
-	// Mint new token
-	token, err := p.mintToken(ctx, qualifiedScope)
+	m, err := p.activeMode()
 	if err != nil {
 		return nil, err
 	}
-
-	// Cache the token
-	if hostClient != nil {
-		if cacheErr := cacheSet(ctx, hostClient, fullKey, token); cacheErr != nil {
-			lgr.V(1).Info("failed to cache token", "error", cacheErr)
-		}
-	}
-
-	return &sdkplugin.TokenResponse{
-		AccessToken: token.AccessToken,
-		TokenType:   token.TokenType,
-		ExpiresAt:   token.ExpiresAt,
-		Scope:       token.Scope,
-		Flow:        token.Flow,
-		SessionID:   token.SessionID,
-	}, nil
+	return m.GetToken(ctx, req)
 }
 
 // ListCachedTokens returns metadata for all tokens stored by the Entra handler.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*auth.CachedTokenInfo, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	hostClient := p.hostClient(ctx)
-	if hostClient == nil {
-		return nil, fmt.Errorf("host service not available")
+	m, err := p.activeMode()
+	if err != nil {
+		return nil, err
 	}
-
-	var results []*auth.CachedTokenInfo
-
-	// Refresh token
-	if p.secretExists(ctx, p.secretKey(ctx, secretSuffixRefreshToken)) {
-		info := &auth.CachedTokenInfo{
-			Handler:   HandlerName,
-			TokenKind: "refresh",
-		}
-		if metadata, err := p.loadMetadata(ctx); err == nil && metadata != nil {
-			info.ExpiresAt = metadata.RefreshTokenExpiresAt
-			info.CachedAt = metadata.LastRefresh
-			info.Flow = metadata.LoginFlow
-			info.SessionID = metadata.SessionID
-		}
-		if !info.ExpiresAt.IsZero() {
-			info.IsExpired = time.Now().After(info.ExpiresAt)
-		}
-		results = append(results, info)
-	}
-
-	// Minted access tokens from cache
-	entries, _ := cacheListEntries(ctx, hostClient, p.tokenCachePrefix(ctx))
-	results = append(results, entries...)
-
-	return results, nil
+	return m.ListCachedTokens(ctx)
 }
 
 // PurgeExpiredTokens removes expired access tokens from the cache.
+// Delegates to the active mode (CLI mode by default).
 func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (int, error) {
 	if handlerName != HandlerName {
 		return 0, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	hostClient := p.hostClient(ctx)
-	if hostClient == nil {
-		return 0, fmt.Errorf("host service not available")
+	m, err := p.activeMode()
+	if err != nil {
+		return 0, err
 	}
-
-	return cachePurgeExpired(ctx, hostClient, p.tokenCachePrefix(ctx))
+	return m.PurgeExpiredTokens(ctx)
 }
 
 // DetectAvailableFlows reports which auth flows are available based on
 // environment credentials or configuration.
-func (p *Plugin) DetectAvailableFlows(_ context.Context, handlerName string) ([]sdkplugin.FlowAvailability, error) {
+// Delegates to the active mode (CLI mode by default).
+func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) ([]sdkplugin.FlowAvailability, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
-
-	var flows []sdkplugin.FlowAvailability
-
-	// Workload identity flow -- check config and environment variables
-	if p.hasWorkloadIdentityCredentials() {
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowWorkloadIdentity,
-			Available: true,
-			Reason:    "workload identity credentials configured",
-		})
-	} else {
-		reason := p.detectWorkloadIdentityUnavailableReason()
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowWorkloadIdentity,
-			Available: false,
-			Reason:    reason,
-		})
+	m, err := p.activeMode()
+	if err != nil {
+		return nil, err
 	}
-
-	// Service principal flow -- check config and environment variables
-	if p.hasServicePrincipalCredentials() {
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowServicePrincipal,
-			Available: true,
-			Reason:    "service principal credentials configured",
-		})
-	} else {
-		reason := "service principal credentials not configured"
-		var missing []string
-		if p.cfg.Profile != "" {
-			clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
-			clientSecret := p.profileOrEnv(p.config.ClientSecret, "clientSecret", EnvAzureClientSecret)
-			tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
-			if clientID == "" {
-				missing = append(missing, EnvAzureClientID)
-			}
-			if clientSecret == "" {
-				missing = append(missing, EnvAzureClientSecret)
-			}
-			if tenantID == "" {
-				missing = append(missing, EnvAzureTenantID)
-			}
-			if len(missing) > 0 {
-				reason = fmt.Sprintf("missing %s (not in profile config or environment)", strings.Join(missing, ", "))
-			}
-		} else {
-			if os.Getenv(EnvAzureClientID) == "" {
-				missing = append(missing, EnvAzureClientID)
-			}
-			if os.Getenv(EnvAzureClientSecret) == "" {
-				missing = append(missing, EnvAzureClientSecret)
-			}
-			if os.Getenv(EnvAzureTenantID) == "" {
-				missing = append(missing, EnvAzureTenantID)
-			}
-			if len(missing) > 0 {
-				reason = fmt.Sprintf("missing environment variables: %s", strings.Join(missing, ", "))
-			}
-		}
-		flows = append(flows, sdkplugin.FlowAvailability{
-			Flow:      auth.FlowServicePrincipal,
-			Available: false,
-			Reason:    reason,
-		})
-	}
-
-	// Device code flow -- always available
-	flows = append(flows, sdkplugin.FlowAvailability{
-		Flow:      auth.FlowDeviceCode,
-		Available: true,
-		Reason:    "device code flow is always available",
-	})
-
-	// Interactive flow -- always available
-	flows = append(flows, sdkplugin.FlowAvailability{
-		Flow:      auth.FlowInteractive,
-		Available: true,
-		Reason:    "interactive flow is always available",
-	})
-
-	return flows, nil
+	return m.DetectAvailableFlows(ctx)
 }
 
 // detectWorkloadIdentityUnavailableReason returns a specific reason why
@@ -581,6 +364,14 @@ func (p *Plugin) detectWorkloadIdentityUnavailableReason() string {
 func (p *Plugin) StopAuthHandler(_ context.Context, handlerName string) error {
 	if handlerName != HandlerName {
 		return fmt.Errorf("unknown handler: %s", handlerName)
+	}
+	m, err := p.activeMode()
+	if err != nil {
+		return err
+	}
+	type stopper interface{ Stop() }
+	if s, ok := m.(stopper); ok {
+		s.Stop()
 	}
 	return nil
 }
@@ -659,4 +450,69 @@ func (p *Plugin) profileOrEnv(configVal, jsonField, envVar string) string {
 // tokenCachePrefix returns the profile-scoped prefix for cached access tokens.
 func (p *Plugin) tokenCachePrefix(ctx context.Context) string {
 	return p.secretKey(ctx, secretSuffixTokenPrefix)
+}
+
+// ActivateServerMode activates server mode on the plugin.
+// It unmarshals the server configuration from the settings JSON and transitions
+// the plugin to server mode. This method is self-contained and does not require
+// ConfigureAuthHandler to be called first.
+func (p *Plugin) ActivateServerMode(ctx context.Context, settings json.RawMessage) error {
+	dec := json.NewDecoder(bytes.NewReader(settings))
+	dec.DisallowUnknownFields()
+	var sc ServerConfig
+	if err := dec.Decode(&sc); err != nil {
+		return fmt.Errorf("failed to parse server config: %w", err)
+	}
+	if trailing := bytes.TrimSpace(settings[dec.InputOffset():]); len(trailing) > 0 {
+		return fmt.Errorf("failed to parse server config: unexpected trailing data")
+	}
+
+	if err := sc.Validate(); err != nil {
+		return fmt.Errorf("server mode validation failed: %w", err)
+	}
+
+	if sc.Delegated != nil {
+		if err := validateDelegatedFlow(sc.Delegated, sc.ServerFlow); err != nil {
+			return fmt.Errorf("invalid delegated config: %w", err)
+		}
+	}
+
+	return p.activateServerMode(ctx, &sc)
+}
+
+// activateServerMode builds and installs the server mode. Separated from
+// ActivateServerMode so tests can call it directly without validation.
+func (p *Plugin) activateServerMode(ctx context.Context, sc *ServerConfig) error {
+	sm, err := buildServerMode(ctx, sc, nil)
+	if err != nil {
+		return err
+	}
+	p.mode = sm
+	return nil
+}
+
+// resolveServerCredential builds the appropriate ServerCredential based on the
+// server flow. It uses SecretRef for all secret resolution.
+func resolveServerCredential(serverFlow auth.Flow, cc *CredentialConfig) (ServerCredential, error) {
+	switch serverFlow {
+	case auth.FlowClientCredentials:
+		secret, err := cc.ClientSecret.Resolve()
+		if err != nil {
+			return nil, fmt.Errorf("resolving client secret: %w", err)
+		}
+		return &SecretCredential{Secret: secret}, nil
+	case auth.FlowWorkloadIdentity:
+		_, err := cc.WIFToken.Resolve()
+		if err != nil {
+			return nil, fmt.Errorf("resolving WIF token: %w", err)
+		}
+		// WIF tokens are resolved on every Apply call (they rotate),
+		// so we pass the SecretRef directly.
+		return &WIFCredential{
+			Token:               cc.WIFToken,
+			ClientAssertionType: clientAssertionType,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported server flow: %s", serverFlow)
+	}
 }

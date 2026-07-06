@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
+	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
 // DefaultClientID is the Azure CLI public client ID shipped with scafctl.
@@ -207,4 +210,104 @@ func qualifySingleScope(scope string) string {
 		return scope
 	}
 	return DefaultGraphResourceURI + scope
+}
+
+// ServerConfig defines the server-mode configuration for the Entra plugin.
+// It is self-contained and does not share fields with the CLI Config.
+// Populated from ActivateServerModeRequest settings.
+type ServerConfig struct {
+	// ClientID is the Azure application/client ID for server-mode token requests.
+	ClientID string `json:"clientId" yaml:"clientId"`
+
+	// TenantID is the Azure tenant ID for server-mode token requests.
+	TenantID string `json:"tenantId" yaml:"tenantId"`
+
+	// Authority is the Azure AD authority URL.
+	// Defaults to https://login.microsoftonline.com if empty.
+	Authority string `json:"authority,omitempty" yaml:"authority,omitempty"`
+
+	// ServerFlow is the authentication flow used to acquire tokens as the
+	// server identity. Must be "workload_identity" or "client_credentials".
+	// This determines which credential field (WIFToken vs ClientSecret) is used.
+	ServerFlow auth.Flow `json:"serverFlow" yaml:"serverFlow"`
+
+	// Credential holds the secret references for authentication.
+	Credential CredentialConfig `json:"credential" yaml:"credential"`
+
+	// Delegated defines flow routing for delegated (user/machine) contexts.
+	// When nil, all delegated requests are denied.
+	Delegated *DelegatedConfig `json:"delegated,omitempty" yaml:"delegated,omitempty"`
+}
+
+// CredentialConfig holds the credential references for server-mode authentication.
+// Which field is required depends on ServerFlow.
+type CredentialConfig struct {
+	// WIFToken points to the projected SA token (serverFlow=workload_identity).
+	// Supports env:// and file:// schemes. The token is re-read on every
+	// request because projected tokens rotate.
+	WIFToken sdkplugin.SecretRef `json:"wifToken,omitempty" yaml:"wifToken,omitempty"`
+
+	// ClientSecret is the client secret (serverFlow=client_credentials).
+	// Supports env:// and file:// schemes.
+	ClientSecret sdkplugin.SecretRef `json:"clientSecret,omitempty" yaml:"clientSecret,omitempty"` //nolint:gosec // config field, not a credential
+}
+
+// DelegatedConfig defines which delegation contexts are enabled.
+// At least one of UserFlow or Machine must be configured when present.
+type DelegatedConfig struct {
+	// UserFlow controls user-caller delegation.
+	// Must be "obo" or match the server flow. Empty means user delegation is denied.
+	UserFlow auth.Flow `json:"userFlow,omitempty" yaml:"userFlow,omitempty"`
+
+	// Machine enables machine-caller delegation using the server flow.
+	// When true, machine callers get a token via the server flow (client_credentials).
+	Machine bool `json:"machine,omitempty" yaml:"machine,omitempty"`
+}
+
+// Validate checks the ServerConfig for required fields.
+func (sc *ServerConfig) Validate() error {
+	if sc.ClientID == "" {
+		return fmt.Errorf("server config: clientId is required")
+	}
+	if sc.TenantID == "" {
+		return fmt.Errorf("server config: tenantId is required")
+	}
+	if sc.ServerFlow == "" {
+		return fmt.Errorf("server config: serverFlow is required")
+	}
+	if !isAllowedServerFlow(sc.ServerFlow) {
+		return fmt.Errorf("server config: serverFlow %q is not allowed (must be %q or %q)",
+			sc.ServerFlow, auth.FlowWorkloadIdentity, auth.FlowClientCredentials)
+	}
+	// Validate that the credential matching the server flow is present.
+	switch sc.ServerFlow {
+	case auth.FlowWorkloadIdentity:
+		if sc.Credential.WIFToken == "" {
+			return fmt.Errorf("server config: credential.wifToken is required for serverFlow %q", sc.ServerFlow)
+		}
+		if err := sc.Credential.WIFToken.Validate(); err != nil {
+			return fmt.Errorf("server config: credential.wifToken: %w", err)
+		}
+	case auth.FlowClientCredentials:
+		if sc.Credential.ClientSecret == "" {
+			return fmt.Errorf("server config: credential.clientSecret is required for serverFlow %q", sc.ServerFlow)
+		}
+		if err := sc.Credential.ClientSecret.Validate(); err != nil {
+			return fmt.Errorf("server config: credential.clientSecret: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetAuthority returns the authority URL, defaulting to DefaultAuthority.
+func (sc *ServerConfig) GetAuthority() string {
+	if sc.Authority == "" {
+		return DefaultAuthority
+	}
+	return sc.Authority
+}
+
+// TokenURL returns the OAuth2 token endpoint for this server config.
+func (sc *ServerConfig) TokenURL() string {
+	return fmt.Sprintf("%s/%s/oauth2/v2.0/token", strings.TrimRight(sc.GetAuthority(), "/"), sc.TenantID)
 }

@@ -33,7 +33,7 @@ const (
 	oboExpiryBuffer = 30 * time.Second
 )
 
-// OBOTokenOptions configures an On-Behalf-Of token acquisition.
+// OBOTokenOptions configures an On-Behalf-Of token acquisition (CLI mode).
 type OBOTokenOptions struct {
 	// Assertion is the access token of the upstream caller.
 	Assertion string `json:"-" yaml:"-"`
@@ -41,7 +41,7 @@ type OBOTokenOptions struct {
 	// Scope is the target resource scope to acquire.
 	Scope string `json:"scope" yaml:"scope"`
 
-	// ClientSecret is the confidential client secret.
+	// ClientSecret is the confidential client secret for the OBO request.
 	ClientSecret string `json:"-" yaml:"-"`
 }
 
@@ -98,7 +98,7 @@ func (c *oboCache) set(assertion, scope string, token *auth.Token) {
 	c.mu.Unlock()
 }
 
-// GetOBOToken acquires a token using the On-Behalf-Of flow.
+// GetOBOToken acquires a token using the On-Behalf-Of flow (CLI mode).
 func (p *Plugin) GetOBOToken(ctx context.Context, opts OBOTokenOptions) (*auth.Token, error) {
 	if opts.Assertion == "" {
 		return nil, fmt.Errorf("OBO assertion (upstream access token) is required")
@@ -107,7 +107,7 @@ func (p *Plugin) GetOBOToken(ctx context.Context, opts OBOTokenOptions) (*auth.T
 		return nil, fmt.Errorf("scope is required for OBO token request")
 	}
 	if opts.ClientSecret == "" {
-		return nil, fmt.Errorf("OBO flow requires a client secret (confidential client)")
+		return nil, fmt.Errorf("OBO flow requires a client secret")
 	}
 
 	qualifiedScope := QualifyScope(opts.Scope)
@@ -142,7 +142,7 @@ func (p *Plugin) GetOBOToken(ctx context.Context, opts OBOTokenOptions) (*auth.T
 	return token, nil
 }
 
-// mintOBOToken performs the actual OBO token exchange.
+// mintOBOToken performs the actual OBO token exchange (CLI mode).
 func (p *Plugin) mintOBOToken(ctx context.Context, assertion, scope, clientSecret string) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("minting OBO token", "scope", scope)
@@ -152,10 +152,10 @@ func (p *Plugin) mintOBOToken(ctx context.Context, assertion, scope, clientSecre
 	data := makeFormData(map[string]string{
 		"grant_type":          OBOGrantType,
 		"client_id":           p.config.ClientID,
-		"client_secret":       clientSecret,
 		"assertion":           assertion,
 		"scope":               scope,
 		"requested_token_use": OBORequestedTokenUse,
+		"client_secret":       clientSecret,
 	})
 
 	resp, err := p.httpClient.PostForm(ctx, endpoint, data)

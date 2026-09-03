@@ -20,7 +20,7 @@ import (
 const (
 	serverHTTPTimeout             = 5 * time.Second
 	serverHTTPRetryMax            = 2
-	serverHTTPRetryWaitMin        = 200 * time.Millisecond
+	serverHTTPRetryWaitMin        = 200 * time.Millisecond //nolint:revive // "Min" mirrors retryablehttp's RetryWaitMin field, not a unit-of-minutes suffix
 	serverHTTPRetryWaitMax        = 1 * time.Second
 	serverHTTPDialTimeout         = 5 * time.Second
 	serverHTTPKeepAlive           = 30 * time.Second

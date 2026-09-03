@@ -153,7 +153,7 @@ func TestLogin(t *testing.T) {
 func TestLogout(t *testing.T) {
 	t.Run("unknown handler", func(t *testing.T) {
 		p, _ := newTestPlugin(t, nil, nil)
-		err := p.Logout(context.Background(), "unknown")
+		err := p.Logout(context.Background(), "unknown", sdkplugin.LogoutRequest{})
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "unknown handler")
 	})
@@ -167,7 +167,7 @@ func TestLogout(t *testing.T) {
 		fake.secrets[SecretKeyMetadata] = `{"claims":{}}`
 		fake.secrets[SecretKeyTokenPrefix+"scope1"] = `{"accessToken":"tok1"}`
 
-		err := p.Logout(ctx, HandlerName)
+		err := p.Logout(ctx, HandlerName, sdkplugin.LogoutRequest{})
 		require.NoError(t, err)
 
 		assert.Empty(t, fake.secrets, "all secrets should be cleared after logout")
@@ -177,13 +177,13 @@ func TestLogout(t *testing.T) {
 func TestGetStatus(t *testing.T) {
 	t.Run("unknown handler", func(t *testing.T) {
 		p, _ := newTestPlugin(t, nil, nil)
-		_, err := p.GetStatus(context.Background(), "unknown")
+		_, err := p.GetStatus(context.Background(), "unknown", sdkplugin.StatusRequest{})
 		assert.Error(t, err)
 	})
 
 	t.Run("not authenticated when no refresh token", func(t *testing.T) {
 		p, _ := newTestPlugin(t, nil, nil)
-		status, err := p.GetStatus(context.Background(), HandlerName)
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.False(t, status.Authenticated)
 	})
@@ -207,7 +207,7 @@ func TestGetStatus(t *testing.T) {
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
-		status, err := p.GetStatus(ctx, HandlerName)
+		status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.True(t, status.Authenticated)
 		assert.Equal(t, "testuser", status.Claims.Subject)
@@ -227,7 +227,7 @@ func TestGetStatus(t *testing.T) {
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
-		status, err := p.GetStatus(ctx, HandlerName)
+		status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.False(t, status.Authenticated)
 		assert.Equal(t, "session expired", status.Reason)
@@ -239,7 +239,7 @@ func TestGetStatus(t *testing.T) {
 		t.Setenv(EnvAzureTenantID, "sp-tenant")
 		t.Setenv(EnvAzureClientSecret, "sp-secret")
 
-		status, err := p.GetStatus(context.Background(), HandlerName)
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.True(t, status.Authenticated)
 		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
@@ -1055,21 +1055,21 @@ func TestProfileScopedStorage(t *testing.T) {
 		t.Setenv(EnvAzureFederatedTokenFile, "")
 		t.Setenv(EnvAzureFederatedToken, "")
 
-		workStatus, err := p.GetStatus(ctxWork, HandlerName)
+		workStatus, err := p.GetStatus(ctxWork, HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.True(t, workStatus.Authenticated)
 		assert.Equal(t, "work-user", workStatus.Claims.Subject)
 		assert.Equal(t, "work-tenant", workStatus.TenantID)
 
 		// Verify personal profile status
-		personalStatus, err := p.GetStatus(ctxPersonal, HandlerName)
+		personalStatus, err := p.GetStatus(ctxPersonal, HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.True(t, personalStatus.Authenticated)
 		assert.Equal(t, "personal-user", personalStatus.Claims.Subject)
 		assert.Equal(t, "personal-tenant", personalStatus.TenantID)
 
 		// Default (no profile) should not see either
-		defaultStatus, err := p.GetStatus(context.Background(), HandlerName)
+		defaultStatus, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.False(t, defaultStatus.Authenticated)
 	})
@@ -1091,7 +1091,7 @@ func TestProfileScopedStorage(t *testing.T) {
 		fake.secrets[p.secretKey(ctxPersonal, secretSuffixMetadata)] = `{"claims":{}}`
 
 		// Logout work profile
-		err := p.Logout(ctxWork, HandlerName)
+		err := p.Logout(ctxWork, HandlerName, sdkplugin.LogoutRequest{})
 		require.NoError(t, err)
 
 		// Work profile secrets should be gone
@@ -1445,7 +1445,7 @@ func TestGetStatusWithProfileConfig(t *testing.T) {
 		t.Setenv(EnvAzureFederatedTokenFile, "")
 		t.Setenv(EnvAzureFederatedToken, "")
 
-		status, err := p.GetStatus(context.Background(), HandlerName)
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.True(t, status.Authenticated)
 		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)

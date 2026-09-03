@@ -655,7 +655,7 @@ func TestWorkloadIdentityStatus(t *testing.T) {
 		t.Setenv(EnvAzureFederatedTokenFile, "")
 		t.Setenv(EnvAzureClientSecret, "")
 
-		status, err := p.GetStatus(context.Background(), HandlerName)
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.True(t, status.Authenticated)
 		assert.Equal(t, auth.IdentityTypeWorkloadIdentity, status.IdentityType)

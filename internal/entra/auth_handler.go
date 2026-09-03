@@ -206,7 +206,7 @@ func (p *Plugin) Login(ctx context.Context, handlerName string, req sdkplugin.Lo
 
 // Logout revokes the current session.
 // Delegates to the active mode (CLI mode by default).
-func (p *Plugin) Logout(ctx context.Context, handlerName string) error {
+func (p *Plugin) Logout(ctx context.Context, handlerName string, _ sdkplugin.LogoutRequest) error {
 	if handlerName != HandlerName {
 		return fmt.Errorf("unknown handler: %s", handlerName)
 	}
@@ -245,7 +245,7 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 
 // GetStatus returns the current authentication status.
 // Delegates to the active mode (CLI mode by default).
-func (p *Plugin) GetStatus(ctx context.Context, handlerName string) (*auth.Status, error) {
+func (p *Plugin) GetStatus(ctx context.Context, handlerName string, _ sdkplugin.StatusRequest) (*auth.Status, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}

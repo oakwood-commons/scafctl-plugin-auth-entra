@@ -6,7 +6,6 @@ package entra
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -293,35 +292,20 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 	} else {
 		reason := "service principal credentials not configured"
 		var missing []string
-		if m.p.cfg.Profile != "" {
-			clientID := m.p.profileOrEnv(m.p.config.ClientID, "clientId", EnvAzureClientID)
-			clientSecret := m.p.profileOrEnv(m.p.config.ClientSecret, "clientSecret", EnvAzureClientSecret)
-			tenantID := m.p.profileOrEnv(m.p.config.TenantID, "tenantId", EnvAzureTenantID)
-			if clientID == "" {
-				missing = append(missing, EnvAzureClientID)
-			}
-			if clientSecret == "" {
-				missing = append(missing, EnvAzureClientSecret)
-			}
-			if tenantID == "" {
-				missing = append(missing, EnvAzureTenantID)
-			}
-			if len(missing) > 0 {
-				reason = fmt.Sprintf("missing %s (not in profile config or environment)", strings.Join(missing, ", "))
-			}
-		} else {
-			if os.Getenv(EnvAzureClientID) == "" {
-				missing = append(missing, EnvAzureClientID)
-			}
-			if os.Getenv(EnvAzureClientSecret) == "" {
-				missing = append(missing, EnvAzureClientSecret)
-			}
-			if os.Getenv(EnvAzureTenantID) == "" {
-				missing = append(missing, EnvAzureTenantID)
-			}
-			if len(missing) > 0 {
-				reason = fmt.Sprintf("missing environment variables: %s", strings.Join(missing, ", "))
-			}
+		clientID := m.p.profileOrEnv(m.p.config.ClientID, "clientId", EnvAzureClientID)
+		clientSecret := m.p.profileOrEnv(m.p.config.ClientSecret, "clientSecret", EnvAzureClientSecret)
+		tenantID := m.p.profileOrEnv(m.p.config.TenantID, "tenantId", EnvAzureTenantID)
+		if clientID == "" {
+			missing = append(missing, EnvAzureClientID)
+		}
+		if clientSecret == "" {
+			missing = append(missing, EnvAzureClientSecret)
+		}
+		if tenantID == "" {
+			missing = append(missing, EnvAzureTenantID)
+		}
+		if len(missing) > 0 {
+			reason = fmt.Sprintf("missing %s (not in config or environment)", strings.Join(missing, ", "))
 		}
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowServicePrincipal,

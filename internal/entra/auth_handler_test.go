@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -1575,5 +1577,213 @@ func TestGetStatusWithProfileConfig(t *testing.T) {
 		assert.True(t, status.Authenticated)
 		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
 		assert.Equal(t, "sp-client", status.ClientID)
+	})
+}
+
+// --- Top-level config tests (Issue #45) ---
+
+// clearEntraEnv unsets every credential/authority environment variable so a
+// test exercises config resolution alone.
+func clearEntraEnv(t *testing.T) {
+	t.Helper()
+	for _, env := range []string{
+		EnvAzureClientID, EnvAzureTenantID, EnvAzureClientSecret,
+		EnvAzureFederatedTokenFile, EnvAzureFederatedToken, EnvAzureAuthorityHost,
+	} {
+		t.Setenv(env, "")
+	}
+}
+
+// newTopLevelPlugin builds a Plugin configured from top-level handler settings
+// JSON with no profile active, mirroring the host's no-profile config path.
+func newTopLevelPlugin(t *testing.T, settings string) *Plugin {
+	t.Helper()
+	p := &Plugin{}
+	err := p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+		BinaryName: "scafctl",
+		Settings: map[string]json.RawMessage{
+			HandlerName: json.RawMessage(settings),
+		},
+	})
+	require.NoError(t, err)
+	return p
+}
+
+func TestTopLevelConfigServicePrincipal(t *testing.T) {
+	t.Run("top-level config enables SP credentials without env vars", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","clientSecret":"top-secret"}`)
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "top-client", creds.ClientID)
+		assert.Equal(t, "top-tenant", creds.TenantID)
+		assert.Equal(t, "top-secret", creds.ClientSecret)
+		assert.True(t, p.hasServicePrincipalCredentials())
+		assert.Empty(t, p.cfg.Profile, "no profile should be active")
+	})
+
+	t.Run("top-level config preferred over env vars", func(t *testing.T) {
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureClientSecret, "env-secret")
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","clientSecret":"top-secret"}`)
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "top-client", creds.ClientID)
+		assert.Equal(t, "top-tenant", creds.TenantID)
+		assert.Equal(t, "top-secret", creds.ClientSecret)
+	})
+
+	t.Run("top-level clientSecret combines with env identity", func(t *testing.T) {
+		// Settings carry only the secret; client/tenant come from env.
+		clearEntraEnv(t)
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		p := newTopLevelPlugin(t, `{"clientSecret":"top-secret"}`)
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "env-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "top-secret", creds.ClientSecret)
+	})
+
+	t.Run("env vars apply when config fields unset", func(t *testing.T) {
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureClientSecret, "env-secret")
+		p := newTopLevelPlugin(t, `{}`)
+
+		creds := p.resolveServicePrincipalCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "env-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-secret", creds.ClientSecret)
+	})
+
+	t.Run("flow detection reports SP available from config", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","clientSecret":"top-secret"}`)
+
+		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
+		require.NoError(t, err)
+		assert.Equal(t, auth.FlowServicePrincipal, firstAvailableFlow(t, flows))
+	})
+
+	t.Run("status reports SP authenticated from config", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","clientSecret":"top-secret"}`)
+
+		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.True(t, status.Authenticated)
+		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
+		assert.Equal(t, "top-client", status.ClientID)
+	})
+
+	t.Run("empty clientId settings restore defaults without profile", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"clientId":"","tenantId":"","clientSecret":"top-secret"}`)
+
+		assert.Equal(t, DefaultClientID, p.config.ClientID)
+		assert.Equal(t, DefaultTenantID, p.config.TenantID)
+	})
+}
+
+func TestTopLevelConfigWorkloadIdentity(t *testing.T) {
+	t.Run("top-level federatedToken enables WI without env vars", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","federatedToken":"top-fed-token"}`)
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "top-client", creds.ClientID)
+		assert.Equal(t, "top-tenant", creds.TenantID)
+		assert.Equal(t, "top-fed-token", creds.Token)
+		assert.Empty(t, creds.TokenFile)
+		assert.Equal(t, DefaultAuthority, creds.Authority)
+		assert.True(t, p.hasWorkloadIdentityCredentials())
+	})
+
+	t.Run("top-level federatedTokenFile enables WI without env vars", func(t *testing.T) {
+		clearEntraEnv(t)
+		tokenFile := filepath.Join(t.TempDir(), "sa-token")
+		require.NoError(t, os.WriteFile(tokenFile, []byte("projected-token"), 0o600))
+		p := newTopLevelPlugin(t, fmt.Sprintf(`{"clientId":"top-client","tenantId":"top-tenant","federatedTokenFile":%q}`, tokenFile))
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, tokenFile, creds.TokenFile)
+		assert.Empty(t, creds.Token)
+
+		token, err := creds.GetFederatedToken()
+		require.NoError(t, err)
+		assert.Equal(t, "projected-token", token)
+	})
+
+	t.Run("missing token file reason names its source", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"federatedTokenFile":"/nonexistent/token"}`)
+		assert.Contains(t, p.detectWorkloadIdentityUnavailableReason(), "federatedTokenFile (config) is set")
+
+		t.Setenv(EnvAzureFederatedTokenFile, "/nonexistent/token")
+		p = newTopLevelPlugin(t, `{}`)
+		assert.Contains(t, p.detectWorkloadIdentityUnavailableReason(), EnvAzureFederatedTokenFile+" is set")
+	})
+
+	t.Run("top-level authority used without env vars", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","federatedToken":"top-fed-token","authority":"https://config.authority.example.com"}`)
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "https://config.authority.example.com", creds.Authority)
+	})
+
+	t.Run("env authority applies when config authority unset", func(t *testing.T) {
+		clearEntraEnv(t)
+		t.Setenv(EnvAzureAuthorityHost, "https://env.authority.example.com")
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","federatedToken":"top-fed-token"}`)
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "https://env.authority.example.com", creds.Authority)
+	})
+
+	t.Run("top-level clientId combines with env tenant and token", func(t *testing.T) {
+		clearEntraEnv(t)
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureFederatedToken, "env-fed-token")
+		p := newTopLevelPlugin(t, `{"clientId":"top-client"}`)
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "top-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-fed-token", creds.Token)
+	})
+
+	t.Run("env vars apply when config fields unset", func(t *testing.T) {
+		clearEntraEnv(t)
+		t.Setenv(EnvAzureClientID, "env-client")
+		t.Setenv(EnvAzureTenantID, "env-tenant")
+		t.Setenv(EnvAzureFederatedToken, "env-fed-token")
+		p := newTopLevelPlugin(t, `{}`)
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "env-client", creds.ClientID)
+		assert.Equal(t, "env-tenant", creds.TenantID)
+		assert.Equal(t, "env-fed-token", creds.Token)
+	})
+
+	t.Run("nil when neither config nor env provides a token", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant"}`)
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		assert.Nil(t, creds)
 	})
 }

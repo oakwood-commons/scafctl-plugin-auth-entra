@@ -45,17 +45,17 @@ type Config struct {
 	DefaultFlow string `json:"defaultFlow,omitempty" yaml:"defaultFlow,omitempty"`
 
 	// ClientSecret is the client secret for service principal authentication.
-	// When set under a profile, this value takes precedence over the
-	// AZURE_CLIENT_SECRET environment variable.
+	// When set (profile or top-level config), this value takes precedence
+	// over the AZURE_CLIENT_SECRET environment variable.
 	ClientSecret string `json:"clientSecret,omitempty" yaml:"clientSecret,omitempty"` //nolint:gosec // config field name, not a credential
 
 	// FederatedTokenFile is the path to the projected service account token
-	// for workload identity federation. When set under a profile, this value
-	// takes precedence over AZURE_FEDERATED_TOKEN_FILE.
+	// for workload identity federation. When set (profile or top-level
+	// config), this value takes precedence over AZURE_FEDERATED_TOKEN_FILE.
 	FederatedTokenFile string `json:"federatedTokenFile,omitempty" yaml:"federatedTokenFile,omitempty"`
 
 	// FederatedToken is a raw federated token for workload identity federation.
-	// When set under a profile, this value takes precedence over
+	// When set (profile or top-level config), this value takes precedence over
 	// AZURE_FEDERATED_TOKEN.
 	FederatedToken string `json:"federatedToken,omitempty" yaml:"federatedToken,omitempty"` //nolint:gosec // config field name, not a credential
 

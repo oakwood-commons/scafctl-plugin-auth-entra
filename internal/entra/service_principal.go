@@ -58,16 +58,12 @@ func HasServicePrincipalCredentials() bool {
 	return GetServicePrincipalCredentials() != nil
 }
 
-// resolveServicePrincipalCredentials returns SP credentials, preferring config
-// values over environment variables when a profile is active.
+// resolveServicePrincipalCredentials returns SP credentials, preferring
+// explicitly configured values (profile or top-level config) over environment
+// variables.
 func (p *Plugin) resolveServicePrincipalCredentials() *ServicePrincipalCredentials {
-	if p.cfg.Profile == "" {
-		return GetServicePrincipalCredentials()
-	}
-
-	// Profile active: prefer explicitly configured values, fall back to env vars.
-	// Fields that still hold DefaultConfig() values were not set by the profile,
-	// so they must fall through to the environment variable.
+	// Prefer explicitly configured values, fall back to env vars. Fields not
+	// provided in the config fall through to the environment variable.
 	clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
 	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
 	clientSecret := p.profileOrEnv(p.config.ClientSecret, "clientSecret", EnvAzureClientSecret)
@@ -84,7 +80,7 @@ func (p *Plugin) resolveServicePrincipalCredentials() *ServicePrincipalCredentia
 }
 
 // hasServicePrincipalCredentials checks if SP credentials are available from
-// either config (when a profile is active) or environment variables.
+// config or environment variables.
 func (p *Plugin) hasServicePrincipalCredentials() bool {
 	return p.resolveServicePrincipalCredentials() != nil
 }
@@ -96,7 +92,7 @@ func (p *Plugin) servicePrincipalLogin(ctx context.Context, req sdkplugin.LoginR
 
 	creds := p.resolveServicePrincipalCredentials()
 	if creds == nil {
-		return nil, fmt.Errorf("service principal credentials not configured: set %s, %s, and %s environment variables or configure via profile",
+		return nil, fmt.Errorf("service principal credentials not configured: set %s, %s, and %s environment variables or configure clientId, tenantId, and clientSecret in config",
 			EnvAzureClientID, EnvAzureTenantID, EnvAzureClientSecret)
 	}
 

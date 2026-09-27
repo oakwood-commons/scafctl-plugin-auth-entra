@@ -74,6 +74,8 @@ func TestGetAuthHandlers(t *testing.T) {
 	assert.Contains(t, h.Capabilities, auth.CapScopesOnLogin)
 	assert.Contains(t, h.Capabilities, auth.CapScopesOnTokenRequest)
 	assert.Contains(t, h.Capabilities, auth.CapTenantID)
+	assert.Contains(t, h.Capabilities, auth.CapFederatedToken)
+	assert.Contains(t, h.Capabilities, auth.CapCallbackPort)
 }
 
 func TestConfigureAuthHandler(t *testing.T) {

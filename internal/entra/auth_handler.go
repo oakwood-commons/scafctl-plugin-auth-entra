@@ -109,6 +109,7 @@ func (p *Plugin) GetAuthHandlers(_ context.Context) ([]sdkplugin.AuthHandlerInfo
 				auth.CapScopesOnTokenRequest,
 				auth.CapTenantID,
 				auth.CapFederatedToken,
+				auth.CapCallbackPort,
 			},
 		},
 	}, nil

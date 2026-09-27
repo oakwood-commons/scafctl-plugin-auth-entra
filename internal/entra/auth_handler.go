@@ -132,16 +132,15 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		}
 	}
 
-	// For profiles, restore defaults for fields that were not explicitly set
-	// (or were set to empty) so that Validate succeeds. The actual env var
-	// fallback happens later in profileOrEnv during resolve calls.
-	if cfg.Profile != "" {
-		if !p.config.WasSet("clientId") && p.config.ClientID == "" {
-			p.config.ClientID = DefaultClientID
-		}
-		if !p.config.WasSet("tenantId") && p.config.TenantID == "" {
-			p.config.TenantID = DefaultTenantID
-		}
+	// Restore defaults for fields that were not explicitly set (or were set
+	// to empty) so that Validate succeeds, whether the config came from a
+	// profile or top-level settings. The actual env var fallback happens
+	// later in profileOrEnv during resolve calls.
+	if !p.config.WasSet("clientId") && p.config.ClientID == "" {
+		p.config.ClientID = DefaultClientID
+	}
+	if !p.config.WasSet("tenantId") && p.config.TenantID == "" {
+		p.config.TenantID = DefaultTenantID
 	}
 
 	if err := p.config.Validate(); err != nil {
@@ -310,25 +309,17 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 }
 
 // detectWorkloadIdentityUnavailableReason returns a specific reason why
-// workload identity credentials are not available. When a profile is active it
-// inspects resolved (config-then-env) values; otherwise it checks env vars only.
+// workload identity credentials are not available, using the same
+// config-then-env resolution as the resolver.
 func (p *Plugin) detectWorkloadIdentityUnavailableReason() string {
-	var tokenFile, directToken, clientID, tenantID string
-	if p.cfg.Profile != "" {
-		tokenFile = p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
-		directToken = p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
-		clientID = p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
-		tenantID = p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
-	} else {
-		tokenFile = os.Getenv(EnvAzureFederatedTokenFile)
-		directToken = os.Getenv(EnvAzureFederatedToken)
-		clientID = os.Getenv(EnvAzureClientID)
-		tenantID = os.Getenv(EnvAzureTenantID)
-	}
+	tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+	directToken := p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+	clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
+	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
 
 	hasTokenSource := directToken != ""
 	if tokenFile != "" {
-		if _, err := os.Stat(tokenFile); err == nil { //nolint:gosec // tokenFile is from trusted env var
+		if _, err := os.Stat(tokenFile); err == nil { //nolint:gosec // tokenFile is from trusted config or env var
 			hasTokenSource = true
 		} else if !hasTokenSource {
 			// Token file is set but inaccessible, and no direct token either.
@@ -349,10 +340,7 @@ func (p *Plugin) detectWorkloadIdentityUnavailableReason() string {
 		missing = append(missing, EnvAzureTenantID)
 	}
 	if len(missing) > 0 {
-		if p.cfg.Profile != "" {
-			return fmt.Sprintf("federated token is available but missing %s (not in profile config or environment)", strings.Join(missing, ", "))
-		}
-		return fmt.Sprintf("federated token is available but missing required environment variables: %s", strings.Join(missing, ", "))
+		return fmt.Sprintf("federated token is available but missing %s (not in config or environment)", strings.Join(missing, ", "))
 	}
 
 	return "workload identity credentials not configured"

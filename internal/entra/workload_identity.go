@@ -86,16 +86,12 @@ func HasWorkloadIdentityCredentials() bool {
 	return GetWorkloadIdentityCredentials() != nil
 }
 
-// resolveWorkloadIdentityCredentials returns WIF credentials, preferring config
-// values over environment variables when a profile is active.
+// resolveWorkloadIdentityCredentials returns WIF credentials, preferring
+// explicitly configured values (profile or top-level config) over environment
+// variables.
 func (p *Plugin) resolveWorkloadIdentityCredentials() *WorkloadIdentityCredentials {
-	if p.cfg.Profile == "" {
-		return GetWorkloadIdentityCredentials()
-	}
-
-	// Profile active: prefer explicitly configured values, fall back to env vars.
-	// Fields that still hold DefaultConfig() values were not set by the profile,
-	// so they must fall through to the environment variable.
+	// Prefer explicitly configured values, fall back to env vars. Fields not
+	// provided in the config fall through to the environment variable.
 	clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
 	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
 	tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
@@ -131,7 +127,7 @@ func (p *Plugin) resolveWorkloadIdentityCredentials() *WorkloadIdentityCredentia
 }
 
 // hasWorkloadIdentityCredentials checks if workload identity credentials are
-// available from either config (when a profile is active) or environment variables.
+// available from config or environment variables.
 func (p *Plugin) hasWorkloadIdentityCredentials() bool {
 	return p.resolveWorkloadIdentityCredentials() != nil
 }
@@ -165,21 +161,15 @@ func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginR
 
 	creds := p.resolveWorkloadIdentityCredentials()
 	if creds == nil {
-		var directToken, tokenFile, clientID, tenantID string
-		if p.cfg.Profile != "" {
-			directToken = p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
-			tokenFile = p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
-			clientID = p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
-			tenantID = p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
-		} else {
-			directToken = os.Getenv(EnvAzureFederatedToken)
-			tokenFile = os.Getenv(EnvAzureFederatedTokenFile)
-			clientID = os.Getenv(EnvAzureClientID)
-			tenantID = os.Getenv(EnvAzureTenantID)
-		}
+		// Diagnose with the same config-then-env resolution the resolver used.
+		directToken := p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+		tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+		clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
+		tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
 
 		if directToken == "" && tokenFile == "" {
-			return nil, fmt.Errorf("workload identity not configured: set %s or %s", EnvAzureFederatedTokenFile, EnvAzureFederatedToken)
+			return nil, fmt.Errorf("workload identity not configured: set federatedToken or federatedTokenFile in config, or the %s or %s environment variables",
+				EnvAzureFederatedTokenFile, EnvAzureFederatedToken)
 		}
 		if tokenFile != "" {
 			if _, err := os.Stat(tokenFile); err != nil { //nolint:gosec // tokenFile is from trusted config or env var

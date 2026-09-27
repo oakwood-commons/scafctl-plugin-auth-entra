@@ -502,6 +502,8 @@ func TestDetectAvailableFlows(t *testing.T) {
 				}
 				assert.Equal(t, tt.wantOrder, order)
 				assert.Equal(t, tt.wantFirst, firstAvailableFlow(t, flows))
+				// Login's empty-flow path uses the same preference.
+				assert.Equal(t, tt.wantFirst, p.preferredFlow())
 			})
 		}
 	})

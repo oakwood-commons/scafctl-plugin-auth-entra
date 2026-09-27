@@ -25,12 +25,17 @@ type cliMode struct {
 const defaultLoginFlow = auth.FlowDeviceCode
 
 // preferredFlow returns the flow to use when the caller did not specify
-// one: config DefaultFlow when set, otherwise defaultLoginFlow.
+// one: config DefaultFlow when it names a user flow (interactive or device
+// code), otherwise defaultLoginFlow. Credential-only flows (workload
+// identity, service principal) are reached via credential detection, so a
+// DefaultFlow naming them without credentials falls back to the default.
 func (p *Plugin) preferredFlow() auth.Flow {
-	if p.config.DefaultFlow != "" {
-		return auth.Flow(p.config.DefaultFlow)
+	switch f := auth.Flow(p.config.DefaultFlow); f { //nolint:exhaustive // only user flows are valid preferences
+	case auth.FlowInteractive, auth.FlowDeviceCode:
+		return f
+	default:
+		return defaultLoginFlow
 	}
-	return defaultLoginFlow
 }
 
 // Login performs the authentication flow in CLI mode.
@@ -42,8 +47,8 @@ func (p *Plugin) preferredFlow() auth.Flow {
 //     workload identity and service principal environment credentials.
 //  4. Explicit FlowInteractive -- authorization code + PKCE flow.
 //  5. Explicit FlowDeviceCode -- device code polling flow.
-//  6. Empty flow (no credentials detected) -- config DefaultFlow when set,
-//     otherwise the handler default (device code).
+//  6. Empty flow (no credentials detected) -- config DefaultFlow when it is
+//     interactive or device_code, otherwise the handler default (device code).
 func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
 	// Determine which flow to use with credential detection.
 	flow := req.Flow

@@ -193,17 +193,17 @@ func TestGetStatus(t *testing.T) {
 		ctx := context.Background()
 
 		fake.secrets[SecretKeyRefreshToken] = "test-refresh-token"
-		metadata := TokenMetadata{
+		metadata := auth.HandlerMetadata{
 			Claims: &auth.Claims{
 				Subject: "testuser",
 				Name:    "Test User",
 			},
-			RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
-			LastRefresh:           time.Now(),
-			TenantID:              "test-tenant",
-			ClientID:              "test-client",
-			Scopes:                []string{"openid"},
+			ExpiresAt:   time.Now().Add(24 * time.Hour),
+			LastRefresh: time.Now(),
+			ClientID:    "test-client",
+			Scopes:      []string{"openid"},
 		}
+		metadata.SetMeta(MetaKeyTenantID, "test-tenant")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -220,10 +220,11 @@ func TestGetStatus(t *testing.T) {
 		ctx := context.Background()
 
 		fake.secrets[SecretKeyRefreshToken] = "expired-token"
-		metadata := TokenMetadata{
-			Claims:                &auth.Claims{Subject: "testuser"},
-			RefreshTokenExpiresAt: time.Now().Add(-1 * time.Hour),
+		metadata := auth.HandlerMetadata{
+			Claims:    &auth.Claims{Subject: "testuser"},
+			ExpiresAt: time.Now().Add(-1 * time.Hour),
 		}
+		metadata.SetMeta(MetaKeyTenantID, "test-tenant")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -231,6 +232,22 @@ func TestGetStatus(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, status.Authenticated)
 		assert.Equal(t, "session expired", status.Reason)
+	})
+
+	t.Run("not authenticated with legacy pre-canonical metadata", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+		ctx := context.Background()
+
+		fake.secrets[SecretKeyRefreshToken] = "legacy-token"
+		fake.secrets[SecretKeyMetadata] = `{"claims":{"subject":"u"},"tenantId":"t","refreshTokenExpiresAt":"2099-01-01T00:00:00Z","loginFlow":"interactive","clientId":"c"}`
+
+		status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.False(t, status.Authenticated)
+
+		_, err = p.mintToken(ctx, "https://graph.microsoft.com/.default")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "re-authenticate")
 	})
 
 	t.Run("service principal env detection", func(t *testing.T) {
@@ -311,12 +328,13 @@ func TestListCachedTokens(t *testing.T) {
 
 		// Store a refresh token and metadata
 		fake.secrets[SecretKeyRefreshToken] = "rt"
-		metadata := TokenMetadata{
-			RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
-			LastRefresh:           time.Now(),
-			LoginFlow:             auth.FlowInteractive,
-			SessionID:             "sess1",
+		metadata := auth.HandlerMetadata{
+			ExpiresAt:     time.Now().Add(24 * time.Hour),
+			LastRefresh:   time.Now(),
+			LastLoginFlow: auth.FlowInteractive,
+			SessionID:     "sess1",
 		}
+		metadata.SetMeta(MetaKeyTenantID, "test-tenant")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -1138,21 +1156,21 @@ func TestProfileScopedStorage(t *testing.T) {
 		fake.secrets[workKey] = "work-refresh-token"
 		fake.secrets[personalKey] = "personal-refresh-token"
 
-		workMeta := TokenMetadata{
-			Claims:                &auth.Claims{Subject: "work-user"},
-			RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
-			TenantID:              "work-tenant",
-			ClientID:              "work-client",
+		workMeta := auth.HandlerMetadata{
+			Claims:    &auth.Claims{Subject: "work-user"},
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+			ClientID:  "work-client",
 		}
+		workMeta.SetMeta(MetaKeyTenantID, "work-tenant")
 		workMetaBytes, _ := json.Marshal(workMeta)
 		fake.secrets[workMetaKey] = string(workMetaBytes)
 
-		personalMeta := TokenMetadata{
-			Claims:                &auth.Claims{Subject: "personal-user"},
-			RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
-			TenantID:              "personal-tenant",
-			ClientID:              "personal-client",
+		personalMeta := auth.HandlerMetadata{
+			Claims:    &auth.Claims{Subject: "personal-user"},
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+			ClientID:  "personal-client",
 		}
+		personalMeta.SetMeta(MetaKeyTenantID, "personal-tenant")
 		personalMetaBytes, _ := json.Marshal(personalMeta)
 		fake.secrets[personalMetaKey] = string(personalMetaBytes)
 

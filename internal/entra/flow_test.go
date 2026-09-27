@@ -35,11 +35,11 @@ func TestMintToken(t *testing.T) {
 
 		// Pre-populate stored credentials
 		fake.secrets[SecretKeyRefreshToken] = "old-refresh-token"
-		metadata := TokenMetadata{
-			TenantID: "test-tenant",
+		metadata := auth.HandlerMetadata{
 			ClientID: "test-client",
 			Scopes:   []string{"openid"},
 		}
+		metadata.SetMeta(MetaKeyTenantID, "test-tenant")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -66,7 +66,8 @@ func TestMintToken(t *testing.T) {
 	t.Run("missing client ID in metadata", func(t *testing.T) {
 		p, fake := newTestPlugin(t, nil, nil)
 		fake.secrets[SecretKeyRefreshToken] = "refresh-token"
-		metadata := TokenMetadata{TenantID: "t", ClientID: ""}
+		metadata := auth.HandlerMetadata{ClientID: ""}
+		metadata.SetMeta(MetaKeyTenantID, "t")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -85,7 +86,8 @@ func TestMintToken(t *testing.T) {
 
 		p, fake := newTestPlugin(t, httpMock, nil)
 		fake.secrets[SecretKeyRefreshToken] = "rt"
-		metadata := TokenMetadata{TenantID: "t", ClientID: "c"}
+		metadata := auth.HandlerMetadata{ClientID: "c"}
+		metadata.SetMeta(MetaKeyTenantID, "t")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -105,7 +107,8 @@ func TestMintToken(t *testing.T) {
 
 		p, fake := newTestPlugin(t, httpMock, nil)
 		fake.secrets[SecretKeyRefreshToken] = "rt"
-		metadata := TokenMetadata{TenantID: "t", ClientID: "c"}
+		metadata := auth.HandlerMetadata{ClientID: "c"}
+		metadata.SetMeta(MetaKeyTenantID, "t")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -125,7 +128,8 @@ func TestMintToken(t *testing.T) {
 
 		p, fake := newTestPlugin(t, httpMock, nil)
 		fake.secrets[SecretKeyRefreshToken] = "rt"
-		metadata := TokenMetadata{TenantID: "t", ClientID: "c"}
+		metadata := auth.HandlerMetadata{ClientID: "c"}
+		metadata.SetMeta(MetaKeyTenantID, "t")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -145,12 +149,12 @@ func TestMintToken(t *testing.T) {
 
 		p, fake := newTestPlugin(t, httpMock, nil)
 		fake.secrets[SecretKeyRefreshToken] = "old-rt"
-		metadata := TokenMetadata{
-			TenantID:  "t",
-			ClientID:  "c",
-			LoginFlow: auth.FlowDeviceCode,
-			SessionID: "sess",
+		metadata := auth.HandlerMetadata{
+			ClientID:      "c",
+			LastLoginFlow: auth.FlowDeviceCode,
+			SessionID:     "sess",
 		}
+		metadata.SetMeta(MetaKeyTenantID, "t")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -199,7 +203,7 @@ func TestStoreCredentials(t *testing.T) {
 		err := p.storeCredentials(context.Background(), "t", tokenResp, "c", nil, "", "")
 		require.NoError(t, err)
 
-		var md TokenMetadata
+		var md auth.HandlerMetadata
 		_ = json.Unmarshal([]byte(fake.secrets[SecretKeyMetadata]), &md)
 		assert.NotEmpty(t, md.SessionID)
 	})
@@ -211,7 +215,7 @@ func TestStoreCredentials(t *testing.T) {
 		err := p.storeCredentials(context.Background(), "t", tokenResp, "c", nil, "", "keep-me")
 		require.NoError(t, err)
 
-		var md TokenMetadata
+		var md auth.HandlerMetadata
 		_ = json.Unmarshal([]byte(fake.secrets[SecretKeyMetadata]), &md)
 		assert.Equal(t, "keep-me", md.SessionID)
 	})
@@ -228,10 +232,29 @@ func TestStoreCredentials(t *testing.T) {
 		err := p.storeCredentials(context.Background(), "t", tokenResp, "c", nil, "", "")
 		require.NoError(t, err)
 
-		var md TokenMetadata
+		var md auth.HandlerMetadata
 		_ = json.Unmarshal([]byte(fake.secrets[SecretKeyMetadata]), &md)
 		assert.Equal(t, "user-sub", md.Claims.Subject)
 		assert.Equal(t, "Test User", md.Claims.Name)
+	})
+
+	t.Run("persists canonical field names", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+
+		tokenResp := &TokenResponse{RefreshToken: "rt"}
+		err := p.storeCredentials(context.Background(), "my-tenant", tokenResp, "c", nil, auth.FlowInteractive, "")
+		require.NoError(t, err)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal([]byte(fake.secrets[SecretKeyMetadata]), &raw))
+		assert.Contains(t, raw, "expiresAt")
+		assert.Equal(t, string(auth.FlowInteractive), raw["lastLoginFlow"])
+		assert.NotContains(t, raw, "refreshTokenExpiresAt")
+		assert.NotContains(t, raw, "loginFlow")
+		assert.NotContains(t, raw, "tenantId")
+		meta, ok := raw["metadata"].(map[string]any)
+		require.True(t, ok, "metadata map must be emitted")
+		assert.Equal(t, "my-tenant", meta[MetaKeyTenantID])
 	})
 }
 
@@ -1175,12 +1198,12 @@ func TestGetTokenAdditional(t *testing.T) {
 
 		// Also need refresh token + metadata for mintToken
 		fake.secrets[SecretKeyRefreshToken] = "refresh-token"
-		metadata := TokenMetadata{
-			TenantID:  "common",
-			ClientID:  p.config.ClientID,
-			LoginFlow: auth.FlowDeviceCode,
-			SessionID: "sess",
+		metadata := auth.HandlerMetadata{
+			ClientID:      p.config.ClientID,
+			LastLoginFlow: auth.FlowDeviceCode,
+			SessionID:     "sess",
 		}
+		metadata.SetMeta(MetaKeyTenantID, "common")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -1213,12 +1236,12 @@ func TestGetTokenAdditional(t *testing.T) {
 
 		// Set up refresh token + metadata (no cache)
 		fake.secrets[SecretKeyRefreshToken] = "refresh-token"
-		metadata := TokenMetadata{
-			TenantID:  "common",
-			ClientID:  p.config.ClientID,
-			LoginFlow: auth.FlowDeviceCode,
-			SessionID: "sess",
+		metadata := auth.HandlerMetadata{
+			ClientID:      p.config.ClientID,
+			LastLoginFlow: auth.FlowDeviceCode,
+			SessionID:     "sess",
 		}
+		metadata.SetMeta(MetaKeyTenantID, "common")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -1250,7 +1273,8 @@ func TestGetTokenAdditional(t *testing.T) {
 		t.Setenv(EnvAzureFederatedToken, "")
 
 		fake.secrets[SecretKeyRefreshToken] = "expired-rt"
-		metadata := TokenMetadata{TenantID: "t", ClientID: "c"}
+		metadata := auth.HandlerMetadata{ClientID: "c"}
+		metadata.SetMeta(MetaKeyTenantID, "t")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -1294,7 +1318,8 @@ func TestGetTokenAdditional(t *testing.T) {
 
 		// Set up refresh token + metadata
 		fake.secrets[SecretKeyRefreshToken] = "rt"
-		metadata := TokenMetadata{TenantID: "common", ClientID: p.config.ClientID}
+		metadata := auth.HandlerMetadata{ClientID: p.config.ClientID}
+		metadata.SetMeta(MetaKeyTenantID, "common")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 

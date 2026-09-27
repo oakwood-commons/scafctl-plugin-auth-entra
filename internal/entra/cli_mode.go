@@ -106,7 +106,7 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 	}
 
 	// Check if refresh token is expired
-	if !metadata.RefreshTokenExpiresAt.IsZero() && time.Now().After(metadata.RefreshTokenExpiresAt) {
+	if !metadata.ExpiresAt.IsZero() && time.Now().After(metadata.ExpiresAt) {
 		return &auth.Status{
 			Authenticated: false,
 			Reason:        "session expired",
@@ -117,9 +117,9 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 	return &auth.Status{
 		Authenticated: true,
 		Claims:        metadata.Claims,
-		ExpiresAt:     metadata.RefreshTokenExpiresAt,
+		ExpiresAt:     metadata.ExpiresAt,
 		LastRefresh:   metadata.LastRefresh,
-		TenantID:      metadata.TenantID,
+		TenantID:      metadata.MetaString(MetaKeyTenantID),
 		IdentityType:  auth.IdentityTypeUser,
 		ClientID:      metadata.ClientID,
 		Scopes:        metadata.Scopes,
@@ -234,9 +234,9 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 			TokenKind: "refresh",
 		}
 		if metadata, err := m.p.loadMetadata(ctx); err == nil && metadata != nil {
-			info.ExpiresAt = metadata.RefreshTokenExpiresAt
+			info.ExpiresAt = metadata.ExpiresAt
 			info.CachedAt = metadata.LastRefresh
-			info.Flow = metadata.LoginFlow
+			info.Flow = metadata.LastLoginFlow
 			info.SessionID = metadata.SessionID
 		}
 		if !info.ExpiresAt.IsZero() {

@@ -96,21 +96,15 @@ jobs:
             fi
           done
 
-          archive="${BINARY}_windows_amd64.zip"
-          if [ -f "${archive}" ]; then
-            mkdir -p tmp_windows_amd64
-            unzip -o "${archive}" -d tmp_windows_amd64
-            mv "tmp_windows_amd64/${BINARY}.exe" "${BINARY}-windows-amd64.exe"
-            rm -rf tmp_windows_amd64
-          fi
-
-          archive="${BINARY}_windows_arm64.zip"
-          if [ -f "${archive}" ]; then
-            mkdir -p tmp_windows_arm64
-            unzip -o "${archive}" -d tmp_windows_arm64
-            mv "tmp_windows_arm64/${BINARY}.exe" "${BINARY}-windows-arm64.exe"
-            rm -rf tmp_windows_arm64
-          fi
+          for platform in windows_amd64 windows_arm64; do
+            archive="${BINARY}_${platform}.zip"
+            if [ -f "${archive}" ]; then
+              mkdir -p "tmp_${platform}"
+              unzip -o "${archive}" -d "tmp_${platform}"
+              mv "tmp_${platform}/${BINARY}.exe" "${BINARY}-${platform//_/-}.exe"
+              rm -rf "tmp_${platform}"
+            fi
+          done
 
       - name: Build and push catalog artifact
         id: push
@@ -130,7 +124,8 @@ jobs:
             --platform "linux/arm64=dist/${BINARY}-linux-arm64" \
             --platform "darwin/amd64=dist/${BINARY}-darwin-amd64" \
             --platform "darwin/arm64=dist/${BINARY}-darwin-arm64" \
-            --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe"
+            --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe" \
+            --platform "windows/arm64=dist/${BINARY}-windows-arm64.exe"
 
           scafctl catalog push \
             "${NAME}@${VERSION}" \

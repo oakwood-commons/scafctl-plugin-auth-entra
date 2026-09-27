@@ -6,7 +6,7 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) auth handler plugin for
 ## Supported Auth Flows
 
 | Flow | Description |
-|------|-------------|
+| ------ | ------------- |
 | `interactive` | Authorization code + PKCE (browser-based) |
 | `device-code` | Device code polling (headless/SSH) |
 | `service-principal` | Client credentials (CI/CD) |
@@ -43,7 +43,7 @@ auth:
 ### Environment Variables
 
 | Variable | Description |
-|----------|-------------|
+| ---------- | ------------- |
 | `AZURE_CLIENT_ID` | App registration client ID (service principal / workload identity) |
 | `AZURE_TENANT_ID` | Azure AD tenant ID |
 | `AZURE_CLIENT_SECRET` | Client secret (service principal flow) |
@@ -69,6 +69,27 @@ scafctl auth token --handler entra --scope "https://graph.microsoft.com/.default
 # Logout
 scafctl auth logout --handler entra
 ~~~
+
+## Profiles
+
+Credentials are stored per profile. Every request arriving at the plugin
+carries a profile on its context; the profile is only ever taken from that
+per-request context -- an empty profile always means the **default
+(unscoped)** session (`scafctl.auth.entra.*` keys), never the configured
+`activeProfile`. The host resolves the active profile before the call when
+the active session is intended.
+
+Consequences for `scafctl auth logout`:
+
+- `auth logout entra` (no `--profile`, with `activeProfile` set): the host
+  resolves the active profile, so the active session is logged out.
+- `auth logout entra --profile default`: the default (unscoped) session is
+  logged out; the active profile's secrets are left intact.
+- `auth logout --all`: the host iterates *handlers* without setting a
+  profile, so this clears each handler's default (unscoped) session.
+  Profile-scoped sessions (including the `activeProfile` session) are not
+  touched. To log out of a profile-scoped session, use
+  `auth logout entra --profile <name>` (or the global `--auth-profile`).
 
 ## Development
 

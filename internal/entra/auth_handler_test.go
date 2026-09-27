@@ -1140,6 +1140,18 @@ func TestSecretKey(t *testing.T) {
 		assert.Equal(t, SecretKeyMetadata, p.secretKey(ctx, secretSuffixMetadata))
 		assert.Equal(t, SecretKeyTokenPrefix, p.secretKey(ctx, secretSuffixTokenPrefix))
 	})
+
+	t.Run("empty context profile ignores active-profile config", func(t *testing.T) {
+		// Issue #44: the plugin must not fall back to the profile set by
+		// ConfigureAuthHandler. An empty RPC profile means the default
+		// (unscoped) session.
+		p, _ := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "work"
+		ctx := context.Background()
+		assert.Equal(t, SecretKeyRefreshToken, p.secretKey(ctx, secretSuffixRefreshToken))
+		assert.Equal(t, SecretKeyMetadata, p.secretKey(ctx, secretSuffixMetadata))
+		assert.Equal(t, SecretKeyTokenPrefix, p.secretKey(ctx, secretSuffixTokenPrefix))
+	})
 }
 
 func TestProfileScopedStorage(t *testing.T) {
@@ -1230,6 +1242,39 @@ func TestProfileScopedStorage(t *testing.T) {
 		// Personal profile secrets should remain
 		_, personalExists := fake.secrets[p.secretKey(ctxPersonal, secretSuffixRefreshToken)]
 		assert.True(t, personalExists, "personal refresh token should remain")
+	})
+
+	t.Run("logout with empty RPC profile leaves active profile's secrets intact", func(t *testing.T) {
+		// Issue #44: with a non-default activeProfile, `logout entra
+		// --profile default` reaches the plugin with an empty profile. The
+		// plugin must clear the default (unscoped) session only, not fall
+		// back to the configured active profile.
+		p, fake := newTestPlugin(t, nil, nil)
+		p.cfg.Profile = "work"
+
+		ctxWork := auth.WithProfile(context.Background(), "work")
+		workKey := p.secretKey(ctxWork, secretSuffixRefreshToken)
+		workMetaKey := p.secretKey(ctxWork, secretSuffixMetadata)
+
+		// Populate both the active profile's and the default session's secrets
+		fake.secrets[workKey] = "work-rt"
+		fake.secrets[workMetaKey] = `{"claims":{}}`
+		fake.secrets[SecretKeyRefreshToken] = "default-rt"
+		fake.secrets[SecretKeyMetadata] = `{"claims":{}}`
+
+		// Logout with an empty RPC profile
+		err := p.Logout(context.Background(), HandlerName, sdkplugin.LogoutRequest{})
+		require.NoError(t, err)
+
+		// Default (unscoped) secrets should be gone
+		_, defaultExists := fake.secrets[SecretKeyRefreshToken]
+		assert.False(t, defaultExists, "default refresh token should be deleted")
+
+		// Active profile secrets should remain
+		_, workExists := fake.secrets[workKey]
+		assert.True(t, workExists, "active profile refresh token should remain")
+		_, workMetaExists := fake.secrets[workMetaKey]
+		assert.True(t, workMetaExists, "active profile metadata should remain")
 	})
 }
 

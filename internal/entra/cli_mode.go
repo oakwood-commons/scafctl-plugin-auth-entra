@@ -20,6 +20,24 @@ type cliMode struct {
 	p *Plugin
 }
 
+// defaultLoginFlow is the flow used when no flow is specified and no
+// credentials or DefaultFlow config indicate otherwise.
+const defaultLoginFlow = auth.FlowDeviceCode
+
+// preferredFlow returns the flow to use when the caller did not specify
+// one: config DefaultFlow when it names a user flow (interactive or device
+// code), otherwise defaultLoginFlow. Credential-only flows (workload
+// identity, service principal) are reached via credential detection, so a
+// DefaultFlow naming them without credentials falls back to the default.
+func (p *Plugin) preferredFlow() auth.Flow {
+	switch f := auth.Flow(p.config.DefaultFlow); f { //nolint:exhaustive // only user flows are valid preferences
+	case auth.FlowInteractive, auth.FlowDeviceCode:
+		return f
+	default:
+		return defaultLoginFlow
+	}
+}
+
 // Login performs the authentication flow in CLI mode.
 //
 // Flow selection precedence:
@@ -28,7 +46,9 @@ type cliMode struct {
 //  3. Implicit credential detection -- when no flow is specified, checks for
 //     workload identity and service principal environment credentials.
 //  4. Explicit FlowInteractive -- authorization code + PKCE flow.
-//  5. Explicit FlowDeviceCode or empty flow -- device code polling flow.
+//  5. Explicit FlowDeviceCode -- device code polling flow.
+//  6. Empty flow (no credentials detected) -- config DefaultFlow when it is
+//     interactive or device_code, otherwise the handler default (device code).
 func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
 	// Determine which flow to use with credential detection.
 	flow := req.Flow
@@ -37,10 +57,8 @@ func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceC
 			flow = auth.FlowWorkloadIdentity
 		} else if m.p.hasServicePrincipalCredentials() {
 			flow = auth.FlowServicePrincipal
-		} else if m.p.config.DefaultFlow != "" {
-			flow = auth.Flow(m.p.config.DefaultFlow)
 		} else {
-			flow = auth.FlowDeviceCode
+			flow = m.p.preferredFlow()
 		}
 	}
 
@@ -312,19 +330,28 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 		})
 	}
 
-	// Device code flow -- always available
-	flows = append(flows, sdkplugin.FlowAvailability{
+	// Device code and interactive flows are always available. Order the
+	// pair so the preferred flow comes first: config DefaultFlow when
+	// set, otherwise the handler default. The host picks the first
+	// available entry, so this ordering decides the flow used when no
+	// --flow flag is passed. Workload identity and service principal
+	// entries stay ahead so detected credentials keep precedence over
+	// DefaultFlow.
+	deviceCodeFlow := sdkplugin.FlowAvailability{
 		Flow:      auth.FlowDeviceCode,
 		Available: true,
 		Reason:    "device code flow is always available",
-	})
-
-	// Interactive flow -- always available
-	flows = append(flows, sdkplugin.FlowAvailability{
+	}
+	interactiveFlow := sdkplugin.FlowAvailability{
 		Flow:      auth.FlowInteractive,
 		Available: true,
 		Reason:    "interactive flow is always available",
-	})
+	}
+	if m.p.preferredFlow() == auth.FlowInteractive {
+		flows = append(flows, interactiveFlow, deviceCodeFlow)
+	} else {
+		flows = append(flows, deviceCodeFlow, interactiveFlow)
+	}
 
 	return flows, nil
 }

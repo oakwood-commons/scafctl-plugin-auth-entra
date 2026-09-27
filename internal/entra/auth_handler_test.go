@@ -438,6 +438,113 @@ func TestDetectAvailableFlows(t *testing.T) {
 		}
 		t.Fatal("service principal flow not found")
 	})
+
+	t.Run("default flow ordering", func(t *testing.T) {
+		// No credential env vars: WI and SP entries are unavailable, so
+		// the first available entry is whichever user flow is ordered
+		// first.
+		t.Setenv(EnvAzureClientID, "")
+		t.Setenv(EnvAzureClientSecret, "")
+		t.Setenv(EnvAzureTenantID, "")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureFederatedToken, "")
+
+		tests := []struct {
+			name        string
+			defaultFlow string
+			wantOrder   []auth.Flow
+			wantFirst   auth.Flow
+		}{
+			{
+				name:        "unset uses handler default",
+				defaultFlow: "",
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
+				wantFirst:   auth.FlowDeviceCode,
+			},
+			{
+				name:        "device_code",
+				defaultFlow: string(auth.FlowDeviceCode),
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
+				wantFirst:   auth.FlowDeviceCode,
+			},
+			{
+				name:        "interactive preferred over device code",
+				defaultFlow: string(auth.FlowInteractive),
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:   auth.FlowInteractive,
+			},
+			{
+				name:        "workload_identity keeps handler default user flow",
+				defaultFlow: string(auth.FlowWorkloadIdentity),
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
+				wantFirst:   auth.FlowDeviceCode,
+			},
+			{
+				name:        "service_principal keeps handler default user flow",
+				defaultFlow: string(auth.FlowServicePrincipal),
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
+				wantFirst:   auth.FlowDeviceCode,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				p, _ := newTestPlugin(t, nil, nil)
+				p.config.DefaultFlow = tt.defaultFlow
+
+				flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
+				require.NoError(t, err)
+				require.Len(t, flows, 4)
+
+				var order []auth.Flow
+				for _, f := range flows {
+					order = append(order, f.Flow)
+				}
+				assert.Equal(t, tt.wantOrder, order)
+				assert.Equal(t, tt.wantFirst, firstAvailableFlow(t, flows))
+				// Login's empty-flow path uses the same preference.
+				assert.Equal(t, tt.wantFirst, p.preferredFlow())
+			})
+		}
+	})
+
+	t.Run("available credentials take precedence over default flow", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		p.config.DefaultFlow = string(auth.FlowInteractive)
+
+		// Service principal credentials present: SP entry stays ahead of
+		// the preferred interactive flow.
+		t.Setenv(EnvAzureClientID, "sp-client")
+		t.Setenv(EnvAzureClientSecret, "sp-secret")
+		t.Setenv(EnvAzureTenantID, "sp-tenant")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureFederatedToken, "")
+
+		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
+		require.NoError(t, err)
+		assert.Equal(t, auth.FlowServicePrincipal, firstAvailableFlow(t, flows))
+
+		// Workload identity credentials present: WI entry wins.
+		t.Setenv(EnvAzureClientSecret, "")
+		t.Setenv(EnvAzureFederatedToken, "federated-token")
+
+		flows, err = p.DetectAvailableFlows(context.Background(), HandlerName)
+		require.NoError(t, err)
+		assert.Equal(t, auth.FlowWorkloadIdentity, firstAvailableFlow(t, flows))
+	})
+}
+
+// firstAvailableFlow returns the Flow of the first Available entry,
+// mirroring how the host selects a flow when no explicit flow is given.
+func firstAvailableFlow(t *testing.T, flows []sdkplugin.FlowAvailability) auth.Flow {
+	t.Helper()
+	for _, f := range flows {
+		if f.Available {
+			return f.Flow
+		}
+	}
+	t.Fatal("no available flow found")
+	return ""
 }
 
 func TestStopAuthHandler(t *testing.T) {

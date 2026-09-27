@@ -18,17 +18,10 @@ import (
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 )
 
-// TokenMetadata stores information about the stored credentials.
-type TokenMetadata struct {
-	Claims                *auth.Claims `json:"claims"`
-	RefreshTokenExpiresAt time.Time    `json:"refreshTokenExpiresAt"`
-	LastRefresh           time.Time    `json:"lastRefresh"`
-	TenantID              string       `json:"tenantId"`
-	ClientID              string       `json:"clientId,omitempty"`
-	Scopes                []string     `json:"scopes,omitempty"`
-	LoginFlow             auth.Flow    `json:"loginFlow,omitempty"`
-	SessionID             string       `json:"sessionId,omitempty"`
-}
+// MetaKeyTenantID is the Metadata map key under which the entra handler
+// persists the Azure tenant ID. Exported so call sites and tests share one
+// source of truth for the key.
+const MetaKeyTenantID = "tenantId"
 
 // TokenResponse represents the response from the token endpoint.
 type TokenResponse struct {
@@ -66,8 +59,10 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		return nil, fmt.Errorf("failed to load metadata: %w", err)
 	}
 
+	tenantID := metadata.MetaString(MetaKeyTenantID)
+
 	// Request new access token using refresh token
-	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", p.config.GetAuthority(), metadata.TenantID)
+	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", p.config.GetAuthority(), tenantID)
 
 	if metadata.ClientID == "" {
 		return nil, fmt.Errorf("stored credentials are missing client ID, please re-authenticate with '%s auth login entra'", p.binaryName())
@@ -151,7 +146,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	// If we got a new refresh token, store it (token rotation)
 	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
 		lgr.V(1).Info("refresh token rotated, storing new token")
-		if err := p.storeCredentials(ctx, metadata.TenantID, &tokenResp, metadata.ClientID, metadata.Scopes, metadata.LoginFlow, metadata.SessionID); err != nil {
+		if err := p.storeCredentials(ctx, tenantID, &tokenResp, metadata.ClientID, metadata.Scopes, metadata.LastLoginFlow, metadata.SessionID); err != nil {
 			lgr.V(1).Info("warning: failed to update refresh token", "error", err)
 		}
 	}
@@ -170,7 +165,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		TokenType:   tokenResp.TokenType,
 		ExpiresAt:   expiresAt,
 		Scope:       scope,
-		Flow:        metadata.LoginFlow,
+		Flow:        metadata.LastLoginFlow,
 		SessionID:   metadata.SessionID,
 	}, nil
 }
@@ -206,16 +201,16 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 		}
 	}
 
-	metadata := &TokenMetadata{
-		Claims:                claims,
-		RefreshTokenExpiresAt: time.Now().Add(DefaultRefreshTokenLifetime),
-		LastRefresh:           time.Now(),
-		TenantID:              tenantID,
-		ClientID:              clientID,
-		Scopes:                scopes,
-		LoginFlow:             loginFlow,
-		SessionID:             sessionID,
+	metadata := auth.HandlerMetadata{
+		Claims:        claims,
+		ExpiresAt:     time.Now().Add(DefaultRefreshTokenLifetime),
+		LastRefresh:   time.Now(),
+		Scopes:        scopes,
+		LastLoginFlow: loginFlow,
+		SessionID:     sessionID,
+		ClientID:      clientID,
 	}
+	metadata.SetMeta(MetaKeyTenantID, tenantID)
 
 	metadataBytes, err := json.Marshal(metadata)
 	if err != nil {
@@ -235,13 +230,13 @@ func (p *Plugin) loadRefreshToken(ctx context.Context) (string, error) {
 }
 
 // loadMetadata loads the stored token metadata from the host secret store.
-func (p *Plugin) loadMetadata(ctx context.Context) (*TokenMetadata, error) {
+func (p *Plugin) loadMetadata(ctx context.Context) (*auth.HandlerMetadata, error) {
 	raw, err := p.getSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
 	if err != nil {
 		return nil, err
 	}
 
-	var metadata TokenMetadata
+	var metadata auth.HandlerMetadata
 	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}

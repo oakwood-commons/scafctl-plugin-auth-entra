@@ -6,6 +6,7 @@ package entra
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -256,4 +257,102 @@ func TestBuildServerMode_Hooks_Observed(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, int64(1), hits.Load(), "OnCacheHit should fire on second call")
+}
+
+// sequenceTokenServer returns a token "tok-N" on the Nth request, counting calls.
+func sequenceTokenServer(t *testing.T, expiresIn int) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var calls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: fmt.Sprintf("tok-%d", n),
+			TokenType:   "Bearer",
+			ExpiresIn:   expiresIn,
+		})
+	}))
+	return ts, &calls
+}
+
+func serverModeConfig(t *testing.T) *ServerConfig {
+	t.Helper()
+	t.Setenv("TEST_CS_TOKEN_OPTS", "secret")
+	return &ServerConfig{
+		ClientID:   "cid",
+		TenantID:   "tid",
+		ServerFlow: auth.FlowClientCredentials,
+		Credential: CredentialConfig{ClientSecret: "env://TEST_CS_TOKEN_OPTS"},
+	}
+}
+
+func TestGetToken_ForceRefresh_RefetchesAndReplacesEntry(t *testing.T) {
+	// Tokens live long enough (6h) to stay cached under default config.
+	ts, calls := sequenceTokenServer(t, 6*3600)
+	defer ts.Close()
+
+	sm, err := buildServerMode(context.Background(), serverModeConfig(t), &ServerModeOptions{HTTPClient: newTestHTTPClient(ts)})
+	require.NoError(t, err)
+
+	req := sdkplugin.TokenRequest{
+		ServerContext: auth.ServerContextServer,
+		Scope:         "https://graph.microsoft.com/.default",
+	}
+
+	resp, err := sm.GetToken(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-1", resp.AccessToken)
+
+	// Normal second call is served from the cache.
+	resp, err = sm.GetToken(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-1", resp.AccessToken)
+	assert.Equal(t, int64(1), calls.Load())
+
+	// ForceRefresh fetches a new token despite the warm cache.
+	refreshed := req
+	refreshed.ForceRefresh = true
+	resp, err = sm.GetToken(context.Background(), refreshed)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-2", resp.AccessToken)
+	assert.Equal(t, int64(2), calls.Load(), "ForceRefresh must trigger a new token fetch")
+
+	// The cache entry was replaced: next call returns the new token without a fetch.
+	resp, err = sm.GetToken(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-2", resp.AccessToken)
+	assert.Equal(t, int64(2), calls.Load(), "ForceRefresh must replace the cache entry")
+}
+
+func TestGetToken_MinValidFor_SkipsShortLivedEntry(t *testing.T) {
+	// Tokens expire in 1h; a MinValidFor of 2h must refuse the cached entry.
+	ts, calls := sequenceTokenServer(t, 3600)
+	defer ts.Close()
+
+	sm, err := buildServerMode(context.Background(), serverModeConfig(t), &ServerModeOptions{HTTPClient: newTestHTTPClient(ts)})
+	require.NoError(t, err)
+
+	req := sdkplugin.TokenRequest{
+		ServerContext: auth.ServerContextServer,
+		Scope:         "https://graph.microsoft.com/.default",
+	}
+
+	_, err = sm.GetToken(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), calls.Load())
+
+	strict := req
+	strict.MinValidFor = 2 * time.Hour
+	resp, err := sm.GetToken(context.Background(), strict)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-2", resp.AccessToken)
+	assert.Equal(t, int64(2), calls.Load(), "cached token expiring within MinValidFor must not be returned")
+
+	// Within tolerance the cached entry is served without a fetch.
+	lenient := req
+	lenient.MinValidFor = 30 * time.Minute
+	resp, err = sm.GetToken(context.Background(), lenient)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-2", resp.AccessToken)
+	assert.Equal(t, int64(2), calls.Load(), "entry with sufficient validity should be served from cache")
 }

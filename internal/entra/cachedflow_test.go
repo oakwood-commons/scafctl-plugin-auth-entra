@@ -224,3 +224,80 @@ func TestCachedFlow_DifferentKeys_NotShared(t *testing.T) {
 
 	assert.Equal(t, int64(2), calls.Load(), "different scopes should produce different cache keys")
 }
+
+func TestCachedFlow_ForceRefresh_BypassesCacheAndReplacesEntry(t *testing.T) {
+	mgr := testManager(t)
+	tokens := []string{"tok-1", "tok-2", "tok-3"}
+	var calls atomic.Int64
+	inner := func(_ context.Context, _ FlowParams) (*sdkplugin.TokenResponse, error) {
+		n := calls.Add(1)
+		return &sdkplugin.TokenResponse{
+			AccessToken: tokens[n-1],
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(time.Hour),
+		}, nil
+	}
+	flow := cachedFlow(inner, mgr, clientCredentialCacheKeyGenerator, nil, nil)
+
+	params := FlowParams{ClientID: "cid", Scope: "scope"}
+
+	resp, err := flow(context.Background(), params)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-1", resp.AccessToken)
+
+	// Normal second call is served from the cache.
+	resp, err = flow(context.Background(), params)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-1", resp.AccessToken)
+	assert.Equal(t, int64(1), calls.Load())
+
+	// ForceRefresh fetches a new token despite the warm cache.
+	forced := params
+	forced.ForceRefresh = true
+	resp, err = flow(context.Background(), forced)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-2", resp.AccessToken)
+	assert.Equal(t, int64(2), calls.Load(), "ForceRefresh must bypass the cache")
+
+	// The cache entry was replaced: next call returns the new token without a fetch.
+	resp, err = flow(context.Background(), params)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-2", resp.AccessToken)
+	assert.Equal(t, int64(2), calls.Load(), "ForceRefresh must replace the cache entry")
+}
+
+func TestCachedFlow_MinValidFor_SkipsShortLivedEntry(t *testing.T) {
+	mgr := testManager(t)
+	// Cached entry has ~10m of remaining lifetime.
+	inner, calls := mockFlowFn("tok", 10*time.Minute)
+	flow := cachedFlow(inner, mgr, clientCredentialCacheKeyGenerator, nil, nil)
+
+	params := FlowParams{ClientID: "cid", Scope: "scope"}
+
+	_, err := flow(context.Background(), params)
+	require.NoError(t, err)
+
+	remaining := params
+	remaining.MinValidFor = 15 * time.Minute
+	_, err = flow(context.Background(), remaining)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), calls.Load(), "entry expiring within MinValidFor must not be returned")
+}
+
+func TestCachedFlow_MinValidFor_SufficientValidity_ServesCache(t *testing.T) {
+	mgr := testManager(t)
+	inner, calls := mockFlowFn("tok", time.Hour)
+	flow := cachedFlow(inner, mgr, clientCredentialCacheKeyGenerator, nil, nil)
+
+	params := FlowParams{ClientID: "cid", Scope: "scope"}
+
+	_, err := flow(context.Background(), params)
+	require.NoError(t, err)
+
+	remaining := params
+	remaining.MinValidFor = 10 * time.Minute
+	resp, err := flow(context.Background(), remaining)
+	require.NoError(t, err)
+	assert.Equal(t, "tok", resp.AccessToken)
+	assert.Equal(t, int64(1), calls.Load(), "entry with sufficient validity should be served from cache")
+}

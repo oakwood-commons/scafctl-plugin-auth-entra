@@ -106,6 +106,23 @@ func cachedFlow(
 		if !ok || mgr == nil {
 			return inner(ctx, params)
 		}
+		// fetchFresh bypasses the cache lookup and replaces the entry.
+		fetchFresh := func(ctx context.Context) (*sdkplugin.TokenResponse, error) {
+			resp, err := inner(ctx, params)
+			if err != nil {
+				return nil, err
+			}
+			mgr.Set(ctx, key, resp, time.Until(resp.ExpiresAt))
+			return resp, nil
+		}
+		if params.ForceRefresh {
+			return fetchFresh(ctx)
+		}
+		if params.MinValidFor > 0 {
+			if res := mgr.Get(ctx, key); res.OK && res.Value != nil && time.Until(res.Value.ExpiresAt) < params.MinValidFor {
+				return fetchFresh(ctx)
+			}
+		}
 		return mgr.Do(ctx, key, func(ctx context.Context) (manager.FetchResult[*sdkplugin.TokenResponse], error) {
 			resp, err := inner(ctx, params)
 			if err != nil {

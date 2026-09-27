@@ -21,10 +21,12 @@ type FlowFn func(ctx context.Context, params FlowParams) (*sdkplugin.TokenRespon
 
 // FlowParams contains the inputs for a server-mode token flow.
 type FlowParams struct {
-	assertion string          // the inbound bearer token (assertion for OBO)
-	Scope     string          // desired downstream scope
-	ClientID  string          // client ID for the token request
-	Caller    auth.CallerType // caller type for delegation routing
+	assertion    string          // the inbound bearer token (assertion for OBO)
+	Scope        string          // desired downstream scope
+	ClientID     string          // client ID for the token request
+	Caller       auth.CallerType // caller type for delegation routing
+	ForceRefresh bool            // bypass the cache and replace the entry
+	MinValidFor  time.Duration   // skip cached entries expiring sooner than this
 }
 
 // oboFlow returns a FlowFn that performs the On-Behalf-Of token exchange.

@@ -66,10 +66,12 @@ func (s *entraServerMode) GetToken(ctx context.Context, req sdkplugin.TokenReque
 		return nil, fmt.Errorf("no strategy configured for context %q", req.ServerContext)
 	}
 	return flow(ctx, FlowParams{
-		assertion: req.Assertion,
-		Scope:     req.Scope,
-		ClientID:  s.clientID,
-		Caller:    req.Caller,
+		assertion:    req.Assertion,
+		Scope:        req.Scope,
+		ClientID:     s.clientID,
+		Caller:       req.Caller,
+		ForceRefresh: req.ForceRefresh,
+		MinValidFor:  req.MinValidFor,
 	})
 }
 

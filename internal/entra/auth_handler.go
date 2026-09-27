@@ -323,7 +323,11 @@ func (p *Plugin) detectWorkloadIdentityUnavailableReason() string {
 			hasTokenSource = true
 		} else if !hasTokenSource {
 			// Token file is set but inaccessible, and no direct token either.
-			return fmt.Sprintf("%s is set but the file is missing or inaccessible: %v", EnvAzureFederatedTokenFile, err)
+			source := EnvAzureFederatedTokenFile
+			if p.config.WasSet("federatedTokenFile") {
+				source = "federatedTokenFile (config)"
+			}
+			return fmt.Sprintf("%s is set but the file is missing or inaccessible: %v", source, err)
 		}
 	}
 

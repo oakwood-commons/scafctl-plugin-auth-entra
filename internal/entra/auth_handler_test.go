@@ -1723,6 +1723,16 @@ func TestTopLevelConfigWorkloadIdentity(t *testing.T) {
 		assert.Equal(t, "projected-token", token)
 	})
 
+	t.Run("missing token file reason names its source", func(t *testing.T) {
+		clearEntraEnv(t)
+		p := newTopLevelPlugin(t, `{"federatedTokenFile":"/nonexistent/token"}`)
+		assert.Contains(t, p.detectWorkloadIdentityUnavailableReason(), "federatedTokenFile (config) is set")
+
+		t.Setenv(EnvAzureFederatedTokenFile, "/nonexistent/token")
+		p = newTopLevelPlugin(t, `{}`)
+		assert.Contains(t, p.detectWorkloadIdentityUnavailableReason(), EnvAzureFederatedTokenFile+" is set")
+	})
+
 	t.Run("top-level authority used without env vars", func(t *testing.T) {
 		clearEntraEnv(t)
 		p := newTopLevelPlugin(t, `{"clientId":"top-client","tenantId":"top-tenant","federatedToken":"top-fed-token","authority":"https://config.authority.example.com"}`)

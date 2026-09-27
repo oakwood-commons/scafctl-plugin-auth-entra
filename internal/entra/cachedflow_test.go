@@ -266,6 +266,33 @@ func TestCachedFlow_ForceRefresh_BypassesCacheAndReplacesEntry(t *testing.T) {
 	assert.Equal(t, int64(2), calls.Load(), "ForceRefresh must replace the cache entry")
 }
 
+func TestCachedFlow_ForceRefresh_DedupConcurrentCalls(t *testing.T) {
+	mgr := testManager(t)
+	var calls atomic.Int64
+	inner := func(_ context.Context, _ FlowParams) (*sdkplugin.TokenResponse, error) {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		return &sdkplugin.TokenResponse{AccessToken: "fresh", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}
+	flow := cachedFlow(inner, mgr, clientCredentialCacheKeyGenerator, nil, nil)
+	params := FlowParams{ClientID: "cid", Scope: "scope", ForceRefresh: true}
+
+	const n = 10
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			resp, err := flow(context.Background(), params)
+			assert.NoError(t, err)
+			assert.Equal(t, "fresh", resp.AccessToken)
+		}()
+	}
+	wg.Wait()
+
+	assert.LessOrEqual(t, calls.Load(), int64(2), "concurrent ForceRefresh calls should share one fetch")
+}
+
 func TestCachedFlow_MinValidFor_SkipsShortLivedEntry(t *testing.T) {
 	mgr := testManager(t)
 	// Cached entry has ~10m of remaining lifetime.

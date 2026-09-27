@@ -107,13 +107,18 @@ func cachedFlow(
 			return inner(ctx, params)
 		}
 		// fetchFresh bypasses the cache lookup and replaces the entry.
+		// Concurrent refreshes for the same key share one singleflight
+		// (on a refresh-scoped key that is never stored), so they issue a
+		// single request and cannot race each other's cache writes.
 		fetchFresh := func(ctx context.Context) (*sdkplugin.TokenResponse, error) {
-			resp, err := inner(ctx, params)
-			if err != nil {
-				return nil, err
-			}
-			mgr.Set(ctx, key, resp, time.Until(resp.ExpiresAt))
-			return resp, nil
+			return mgr.Do(ctx, "refresh|"+key, func(ctx context.Context) (manager.FetchResult[*sdkplugin.TokenResponse], error) {
+				resp, err := inner(ctx, params)
+				if err != nil {
+					return manager.FetchResult[*sdkplugin.TokenResponse]{}, err
+				}
+				mgr.Set(ctx, key, resp, time.Until(resp.ExpiresAt))
+				return manager.FetchResult[*sdkplugin.TokenResponse]{Value: resp, Policy: manager.DoNotCache}, nil
+			}, hooks)
 		}
 		if params.ForceRefresh {
 			return fetchFresh(ctx)

@@ -79,6 +79,15 @@ per-request context -- an empty profile always means the **default
 `activeProfile`. The host resolves the active profile before the call when
 the active session is intended.
 
+**Breaking change:** the secret-key profile is no longer back-filled from
+the `activeProfile` the host applied when configuring the plugin. A host
+that configures the plugin with an active profile but does not attach
+profile metadata to individual auth calls now reads, writes, and clears
+only the default (unscoped) session; profile-scoped credentials stored by
+earlier plugin versions under such a host are ignored (log in again to
+recreate them in the session the host requests). Hosts that resolve the
+active profile per request are unaffected.
+
 Consequences for `scafctl auth logout`:
 
 - `auth logout entra` (no `--profile`, with `activeProfile` set): the host

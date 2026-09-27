@@ -1188,7 +1188,7 @@ func TestGetTokenAdditional(t *testing.T) {
 		t.Setenv(EnvAzureFederatedToken, "")
 
 		// Pre-populate cache with a stale token
-		fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
 		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "stale-cached-token",
@@ -1256,7 +1256,7 @@ func TestGetTokenAdditional(t *testing.T) {
 		assert.Equal(t, "minted-at", resp.AccessToken)
 
 		// Verify token was cached
-		fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
 		cacheKey := SecretKeyTokenPrefix + fp + ":https://graph.microsoft.com/.default"
 		assert.Contains(t, fake.secrets, cacheKey)
 	})
@@ -1308,7 +1308,7 @@ func TestGetTokenAdditional(t *testing.T) {
 		t.Setenv(EnvAzureFederatedToken, "")
 
 		// Expired cache entry
-		fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
 		cacheKey := fp + ":api://myapi/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "expired-at",

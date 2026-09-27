@@ -230,7 +230,7 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 // precedence over ambient service principal / workload identity environment
 // credentials in CLI mode (see cli_mode.go).
 func (p *Plugin) validStoredUserSession(ctx context.Context) (*auth.HandlerMetadata, bool) {
-	if !p.secretExists(ctx, p.secretKey(ctx, secretSuffixRefreshToken)) {
+	if rt, err := p.loadRefreshToken(ctx); err != nil || rt == "" {
 		return nil, false
 	}
 

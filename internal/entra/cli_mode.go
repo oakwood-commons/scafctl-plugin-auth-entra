@@ -199,7 +199,10 @@ func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenReque
 
 	hostClient := m.p.hostClient(ctx)
 	prefix := m.p.tokenCachePrefix(ctx)
-	fp := fingerprintHash(m.p.config.ClientID + ":" + m.p.config.TenantID + ":" + m.p.config.GetAuthority())
+	// "user:" keeps user-session entries apart from SP/WI entries that share
+	// the same client/tenant/authority (otherwise a cached machine token
+	// could be served in place of the user's).
+	fp := fingerprintHash("user:" + m.p.config.ClientID + ":" + m.p.config.TenantID + ":" + m.p.config.GetAuthority())
 	fullKey := prefix + fp + ":" + qualifiedScope
 
 	// Check cache first (unless force refresh)

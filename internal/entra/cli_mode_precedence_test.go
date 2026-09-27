@@ -349,3 +349,50 @@ func TestCLICredentialPrecedenceToken(t *testing.T) {
 		assert.Equal(t, "federated-token", requests[0].Data.Get("client_assertion"))
 	})
 }
+
+func TestCLIUserSessionIsolation(t *testing.T) {
+	ctx := context.Background()
+	graphScope := "https://graph.microsoft.com/.default"
+
+	t.Run("machine token cached under same client is not served to user", func(t *testing.T) {
+		clearCredentialEnv(t)
+		httpClient := NewMockHTTPClient()
+		httpClient.AddResponse(200, TokenResponse{
+			AccessToken:  "user-access-token",
+			RefreshToken: "stored-refresh-token",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			Scope:        graphScope + " offline_access",
+		})
+		p, fake := newTestPlugin(t, httpClient, nil)
+		storeUserSession(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour))
+
+		// SP/WI-style key: same client/tenant/authority, no user discriminator.
+		fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		entryBytes, _ := json.Marshal(tokenCacheEntry{
+			AccessToken: "machine-access-token",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(time.Hour),
+			Scope:       graphScope,
+			CachedAt:    time.Now(),
+			Flow:        auth.FlowServicePrincipal,
+		})
+		fake.secrets[SecretKeyTokenPrefix+fp+":"+graphScope] = string(entryBytes)
+
+		resp, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{Scope: graphScope})
+		require.NoError(t, err)
+		assert.Equal(t, "user-access-token", resp.AccessToken)
+	})
+
+	t.Run("empty refresh token does not outrank SP env", func(t *testing.T) {
+		clearCredentialEnv(t)
+		setServicePrincipalEnv(t)
+		p, fake := newTestPlugin(t, nil, nil)
+		storeUserSession(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour))
+		fake.secrets[SecretKeyRefreshToken] = ""
+
+		status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
+	})
+}

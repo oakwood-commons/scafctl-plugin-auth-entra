@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -1419,5 +1423,76 @@ func TestWorkloadIdentityLoginErrors(t *testing.T) {
 		}, nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), EnvAzureTenantID)
+	})
+}
+
+// --- authCodeLogin callback port tests (Issue #43) ---
+
+// freePort asks the OS for an unused TCP port.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+	return port
+}
+
+// probeCallback extracts the redirect_uri from the authorization URL, dials it,
+// and returns the port it listened on. A bare GET with no code parameter gets
+// an HTTP 400 response, proving a callback server is listening there.
+func probeCallback(t *testing.T, authURL string) string {
+	t.Helper()
+	u, err := url.Parse(authURL)
+	require.NoError(t, err)
+	redirect := u.Query().Get("redirect_uri")
+	require.NotEmpty(t, redirect, "authorization URL must carry a redirect_uri")
+
+	resp, err := http.Get(redirect) //nolint:noctx // test helper hitting a local server
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	ru, err := url.Parse(redirect)
+	require.NoError(t, err)
+	port := ru.Port()
+	require.NotEmpty(t, port)
+	return port
+}
+
+func TestAuthCodeLoginCallbackPort(t *testing.T) {
+	t.Run("requested port is used and the server listens on it", func(t *testing.T) {
+		port := freePort(t)
+
+		p, _ := newTestPlugin(t, nil, nil)
+		var gotPort string
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			gotPort = probeCallback(t, authURL)
+			return nil
+		}
+
+		_, err := p.authCodeLogin(context.Background(), sdkplugin.LoginRequest{
+			Flow:         auth.FlowInteractive,
+			CallbackPort: port,
+		}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no authorization code received")
+		assert.Equal(t, strconv.Itoa(port), gotPort)
+	})
+
+	t.Run("ephemeral port when no callback port requested", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		var gotPort string
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			gotPort = probeCallback(t, authURL)
+			return nil
+		}
+
+		_, err := p.authCodeLogin(context.Background(), sdkplugin.LoginRequest{
+			Flow: auth.FlowInteractive,
+		}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no authorization code received")
+		assert.NotEmpty(t, gotPort, "OS-assigned ephemeral port should appear in the redirect URI")
 	})
 }

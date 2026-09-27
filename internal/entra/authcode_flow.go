@@ -67,8 +67,10 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 		return nil, fmt.Errorf("entra: state_generate: %w", err)
 	}
 
-	// Start local callback server for OAuth redirect
-	callbackServer, err := oauth.StartCallbackServer(ctx, 0, state)
+	// Start local callback server for OAuth redirect. A zero CallbackPort
+	// lets the OS pick an ephemeral port; a specific port keeps the
+	// redirect URI predictable for SSH/devcontainer port forwarding.
+	callbackServer, err := oauth.StartCallbackServer(ctx, req.CallbackPort, state)
 	if err != nil {
 		return nil, fmt.Errorf("entra: callback_server: %w", err)
 	}

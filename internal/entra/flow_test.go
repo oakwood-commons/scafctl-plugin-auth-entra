@@ -237,6 +237,25 @@ func TestStoreCredentials(t *testing.T) {
 		assert.Equal(t, "user-sub", md.Claims.Subject)
 		assert.Equal(t, "Test User", md.Claims.Name)
 	})
+
+	t.Run("persists canonical field names", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+
+		tokenResp := &TokenResponse{RefreshToken: "rt"}
+		err := p.storeCredentials(context.Background(), "my-tenant", tokenResp, "c", nil, auth.FlowInteractive, "")
+		require.NoError(t, err)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal([]byte(fake.secrets[SecretKeyMetadata]), &raw))
+		assert.Contains(t, raw, "expiresAt")
+		assert.Equal(t, string(auth.FlowInteractive), raw["lastLoginFlow"])
+		assert.NotContains(t, raw, "refreshTokenExpiresAt")
+		assert.NotContains(t, raw, "loginFlow")
+		assert.NotContains(t, raw, "tenantId")
+		meta, ok := raw["metadata"].(map[string]any)
+		require.True(t, ok, "metadata map must be emitted")
+		assert.Equal(t, "my-tenant", meta[MetaKeyTenantID])
+	})
 }
 
 // --- makeFormData tests ---

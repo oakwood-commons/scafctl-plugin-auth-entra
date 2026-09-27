@@ -224,6 +224,7 @@ func TestGetStatus(t *testing.T) {
 			Claims:    &auth.Claims{Subject: "testuser"},
 			ExpiresAt: time.Now().Add(-1 * time.Hour),
 		}
+		metadata.SetMeta(MetaKeyTenantID, "test-tenant")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -231,6 +232,22 @@ func TestGetStatus(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, status.Authenticated)
 		assert.Equal(t, "session expired", status.Reason)
+	})
+
+	t.Run("not authenticated with legacy pre-canonical metadata", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+		ctx := context.Background()
+
+		fake.secrets[SecretKeyRefreshToken] = "legacy-token"
+		fake.secrets[SecretKeyMetadata] = `{"claims":{"subject":"u"},"tenantId":"t","refreshTokenExpiresAt":"2099-01-01T00:00:00Z","loginFlow":"interactive","clientId":"c"}`
+
+		status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.False(t, status.Authenticated)
+
+		_, err = p.mintToken(ctx, "https://graph.microsoft.com/.default")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "re-authenticate")
 	})
 
 	t.Run("service principal env detection", func(t *testing.T) {
@@ -317,6 +334,7 @@ func TestListCachedTokens(t *testing.T) {
 			LastLoginFlow: auth.FlowInteractive,
 			SessionID:     "sess1",
 		}
+		metadata.SetMeta(MetaKeyTenantID, "test-tenant")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 

@@ -241,6 +241,13 @@ func (p *Plugin) loadMetadata(ctx context.Context) (*auth.HandlerMetadata, error
 		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
+	// Pre-canonical sessions stored tenantId at the top level; they decode
+	// with no tenant and a zero ExpiresAt. Reject them so callers report
+	// unauthenticated and the documented one-time re-login is triggered.
+	if metadata.MetaString(MetaKeyTenantID) == "" {
+		return nil, fmt.Errorf("stored session metadata is missing tenant ID (legacy format), please re-authenticate with '%s auth login entra'", p.binaryName())
+	}
+
 	return &metadata, nil
 }
 

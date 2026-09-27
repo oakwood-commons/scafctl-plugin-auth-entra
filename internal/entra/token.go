@@ -224,6 +224,33 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 	return nil
 }
 
+// validStoredUserSession reports whether a usable user session is stored:
+// a refresh token, loadable metadata with a not-yet-expired refresh token,
+// and a last login flow of interactive or device_code. Such a session takes
+// precedence over ambient service principal / workload identity environment
+// credentials in CLI mode (see cli_mode.go).
+func (p *Plugin) validStoredUserSession(ctx context.Context) (*auth.HandlerMetadata, bool) {
+	if !p.secretExists(ctx, p.secretKey(ctx, secretSuffixRefreshToken)) {
+		return nil, false
+	}
+
+	metadata, err := p.loadMetadata(ctx)
+	if err != nil {
+		return nil, false
+	}
+
+	if !metadata.ExpiresAt.IsZero() && time.Now().After(metadata.ExpiresAt) {
+		return nil, false
+	}
+
+	switch metadata.LastLoginFlow {
+	case auth.FlowInteractive, auth.FlowDeviceCode:
+		return metadata, true
+	default:
+		return nil, false
+	}
+}
+
 // loadRefreshToken loads the stored refresh token from the host secret store.
 func (p *Plugin) loadRefreshToken(ctx context.Context) (string, error) {
 	return p.getSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))

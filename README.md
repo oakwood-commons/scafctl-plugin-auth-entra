@@ -51,6 +51,33 @@ auth:
 | `AZURE_FEDERATED_TOKEN` | Raw federated token (workload identity, testing) |
 | `AZURE_AUTHORITY_HOST` | Custom authority host (defaults to `login.microsoftonline.com`) |
 
+### Credential Precedence
+
+In CLI mode, credentials are resolved in this order:
+
+1. **Stored user session** — a refresh token from an earlier `interactive` or
+   `device-code` login that has not expired.
+2. **Workload identity** — `AZURE_FEDERATED_TOKEN_FILE` / `AZURE_FEDERATED_TOKEN`
+   (or config `federatedToken`/`federatedTokenFile`) plus client and tenant IDs.
+3. **Service principal** — `AZURE_CLIENT_SECRET` (or config `clientSecret`)
+   plus client and tenant IDs.
+
+An explicit user login is a stronger signal of intent than ambient
+environment variables: once a user session is stored, `auth status`, `auth
+token`, and every provider call use the logged-in user even on machines where
+the `AZURE_*` service principal / workload identity variables are set (common
+for Terraform and the Azure SDKs).
+
+`scafctl auth logout entra` clears the stored session and restores
+environment-credential behavior. An expired or corrupted session is ignored
+and falls back to environment credentials the same way.
+
+Note: `scafctl auth login entra --flow interactive` consults the resulting
+status before running the flow. On a machine with SP/WI env variables set and
+no stored user session, use `--force` (or unset the variables) for the first
+interactive login; scafctl's pre-login check reports the env credential as
+"already authenticated" regardless of identity type.
+
 ## Usage
 
 ~~~bash

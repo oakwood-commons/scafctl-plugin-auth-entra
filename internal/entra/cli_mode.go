@@ -73,7 +73,23 @@ func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceC
 	case auth.FlowServicePrincipal:
 		return m.p.servicePrincipalLogin(ctx, req)
 	case auth.FlowInteractive:
-		return m.p.interactiveLogin(ctx, req, deviceCodeCb, req.Flow == "", m.p.headlessReason())
+		headless := m.p.headlessReason()
+		implicit := req.Flow == ""
+		// The host passes our own DetectAvailableFlows ranking back as
+		// req.Flow for a no-flag login, so a headless session on a
+		// paste-back host arrives here with FlowInteractive that the
+		// user did not explicitly choose. Nothing in the login request
+		// distinguishes that host-resolved flow from a typed
+		// --flow interactive, so on headless paste-back sessions both
+		// stay fallback-eligible like the empty-flow path: a runtime
+		// paste-prompt failure then falls back to device code instead of
+		// waiting out the unreachable callback (issue #66). Displays
+		// keep the explicit semantics -- the callback can plausibly
+		// arrive there -- and hosts without paste-back are untouched.
+		if !implicit && headless != "" && m.p.cfg.SupportsPromptAuthResponse() {
+			implicit = true
+		}
+		return m.p.interactiveLogin(ctx, req, deviceCodeCb, implicit, headless)
 	case auth.FlowDeviceCode:
 		return m.p.deviceCodeLogin(ctx, req, deviceCodeCb)
 	default:

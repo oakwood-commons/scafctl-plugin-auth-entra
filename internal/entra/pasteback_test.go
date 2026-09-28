@@ -516,3 +516,87 @@ func TestPasteBackHeadlessPromptFailureFallsBack(t *testing.T) {
 	assert.Contains(t, err.Error(), "device_code_request")
 	assert.Contains(t, strings.Join(*logLines, "\n"), "falling back to device code")
 }
+
+// TestPasteBackHostResolvedLoginFallsBackOnPromptFailure: the host passes a
+// no-flag login's resolved flow back as req.Flow, so a headless paste-back
+// session arrives at interactiveLogin via FlowInteractive. That
+// host-resolved login must stay fallback-eligible: a runtime prompt failure
+// diverts to device code instead of waiting out the unreachable callback.
+// Covers the gap the empty-Flow tests leave (both review threads on PR #67).
+func TestPasteBackHostResolvedLoginFallsBackOnPromptFailure(t *testing.T) {
+	clearCredentialEnv(t)
+
+	httpMock := NewMockHTTPClient()
+	p, fake := newTestPlugin(t, httpMock, nil)
+	advertisePasteBack(p)
+	p.headlessReason = func() string { return "no DISPLAY or WAYLAND_DISPLAY (headless session)" }
+	p.openBrowser = func(_ context.Context, _ string) error {
+		return errors.New("xdg-open: not found")
+	}
+	fake.promptFunc = func(_ context.Context, _ *proto.PromptAuthResponseRequest) (string, error) {
+		return "", status.Error(codes.Unavailable, "host is non-interactive")
+	}
+
+	ctx, logLines := capturingLogger()
+	// req.Flow carries the host-resolved interactive flow, not a user flag.
+	_, err := p.Login(ctx, HandlerName, sdkplugin.LoginRequest{
+		Flow:    auth.FlowInteractive,
+		Timeout: 30 * time.Second,
+	}, nil)
+	require.Error(t, err) // no device code mock response configured
+	assert.Contains(t, err.Error(), "device_code_request")
+	assert.Contains(t, strings.Join(*logLines, "\n"), "falling back to device code")
+}
+
+// TestPasteBackHostResolvedLoginCompletesViaPaste: the same host-resolved
+// headless Login with a working prompt completes via the paste and never
+// diverts to device code.
+func TestPasteBackHostResolvedLoginCompletesViaPaste(t *testing.T) {
+	clearCredentialEnv(t)
+
+	httpMock := pasteTokenResponse()
+	p, fake := newTestPlugin(t, httpMock, nil)
+	advertisePasteBack(p)
+	p.headlessReason = func() string { return "no DISPLAY or WAYLAND_DISPLAY (headless session)" }
+	p.openBrowser = func(_ context.Context, _ string) error {
+		return errors.New("xdg-open: not found")
+	}
+	fake.promptFunc = func(_ context.Context, req *proto.PromptAuthResponseRequest) (string, error) {
+		return validPasteFromRequest(t, req, url.Values{"code": {"PASTED-CODE"}}), nil
+	}
+
+	resp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+		Flow: auth.FlowInteractive,
+	}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "paste-subject", resp.Claims.Subject)
+	reqs := httpMock.GetRequests()
+	require.Len(t, reqs, 1)
+	assert.Equal(t, "PASTED-CODE", reqs[0].Data.Get("code"))
+}
+
+// TestPasteBackDisplayKeepsExplicitInteractiveSemantics: with a display
+// detected, an interactive login whose prompt fails keeps the explicit
+// wait for the callback (the callback can plausibly arrive on a desktop)
+// -- no divert to device code.
+func TestPasteBackDisplayKeepsExplicitInteractiveSemantics(t *testing.T) {
+	clearCredentialEnv(t)
+
+	httpMock := NewMockHTTPClient()
+	p, fake := newTestPlugin(t, httpMock, nil)
+	advertisePasteBack(p)
+	p.headlessReason = func() string { return "" } // display: callback plausible
+	p.openBrowser = func(_ context.Context, _ string) error { return nil }
+	fake.promptFunc = func(_ context.Context, _ *proto.PromptAuthResponseRequest) (string, error) {
+		return "", status.Error(codes.Unavailable, "host is non-interactive")
+	}
+
+	ctx, logLines := capturingLogger()
+	_, err := p.Login(ctx, HandlerName, sdkplugin.LoginRequest{
+		Flow:    auth.FlowInteractive,
+		Timeout: 150 * time.Millisecond,
+	}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no response received from browser within")
+	assert.NotContains(t, strings.Join(*logLines, "\n"), "falling back to device code")
+}

@@ -226,9 +226,10 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 
 // validStoredUserSession reports whether a usable user session is stored:
 // a refresh token, loadable metadata with a not-yet-expired refresh token,
-// and a last login flow of interactive or device_code. Such a session takes
-// precedence over ambient service principal / workload identity environment
-// credentials in CLI mode (see cli_mode.go).
+// a client ID (the refresh-token request requires it), and a last login
+// flow of interactive or device_code. Such a session takes precedence over
+// ambient service principal / workload identity environment credentials in
+// CLI mode (see cli_mode.go).
 func (p *Plugin) validStoredUserSession(ctx context.Context) (*auth.HandlerMetadata, bool) {
 	if rt, err := p.loadRefreshToken(ctx); err != nil || rt == "" {
 		return nil, false
@@ -240,6 +241,10 @@ func (p *Plugin) validStoredUserSession(ctx context.Context) (*auth.HandlerMetad
 	}
 
 	if !metadata.ExpiresAt.IsZero() && time.Now().After(metadata.ExpiresAt) {
+		return nil, false
+	}
+
+	if metadata.ClientID == "" {
 		return nil, false
 	}
 

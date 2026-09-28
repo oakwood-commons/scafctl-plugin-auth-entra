@@ -409,6 +409,45 @@ func TestCLIUserSessionIsolation(t *testing.T) {
 		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
 	})
 
+	t.Run("session missing client ID falls back to SP env", func(t *testing.T) {
+		clearCredentialEnv(t)
+		setServicePrincipalEnv(t)
+		httpClient := NewMockHTTPClient()
+		httpClient.AddResponse(200, TokenResponse{
+			AccessToken: "sp-access-token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+		p, fake := newTestPlugin(t, httpClient, nil)
+		storeUserSession(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour))
+
+		// Overwrite metadata: loadable, unexpired user-flow session, but no
+		// client ID, which the refresh-token request cannot work without.
+		metadata := auth.HandlerMetadata{
+			Claims:        &auth.Claims{Subject: "stored-user"},
+			ExpiresAt:     time.Now().Add(24 * time.Hour),
+			LastRefresh:   time.Now(),
+			LastLoginFlow: auth.FlowInteractive,
+			SessionID:     "sess-1",
+		}
+		metadata.SetMeta(MetaKeyTenantID, "user-tenant")
+		metadataBytes, err := json.Marshal(metadata)
+		require.NoError(t, err)
+		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
+
+		status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.True(t, status.Authenticated)
+		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
+
+		resp, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{Scope: graphScope})
+		require.NoError(t, err)
+		assert.Equal(t, "sp-access-token", resp.AccessToken)
+		requests := httpClient.GetRequests()
+		require.Len(t, requests, 1)
+		assert.Equal(t, "client_credentials", requests[0].Data.Get("grant_type"))
+	})
+
 	t.Run("earlier session's cached token is not served to a new session", func(t *testing.T) {
 		clearCredentialEnv(t)
 		httpClient := NewMockHTTPClient()

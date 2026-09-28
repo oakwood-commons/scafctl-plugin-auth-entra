@@ -181,8 +181,12 @@ policies.
 On hosts that support paste-back, interactive login works there anyway:
 
 1. The plugin starts its callback server and prints the authorization URL.
-2. Open that URL in any browser (your laptop's), sign in, and wait for the
-   error-free landing on `http://localhost:<port>/?code=...&state=...`.
+2. Open that URL in any browser (your laptop's) and sign in. After consent,
+   the browser is redirected to `http://localhost:<port>/?code=...&state=...`
+   and will usually show a connection error there -- the callback listener
+   runs inside the workspace and is unreachable from the laptop. That error
+   is expected: authentication already succeeded, and the authorization
+   code is in the address bar.
 3. Copy the address-bar URL and paste it into the prompt the host shows
    (the scheme may be dropped when copying; it is restored automatically).
 4. The paste is strictly validated -- scheme, host, port, and path must

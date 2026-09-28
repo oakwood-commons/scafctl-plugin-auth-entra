@@ -7,8 +7,8 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) auth handler plugin for
 
 | Flow | Description |
 | ------ | ------------- |
-| `interactive` | Authorization code + PKCE (browser-based) |
-| `device-code` | Device code polling (headless/SSH) |
+| `interactive` | Authorization code + PKCE, opens a browser (default when no flow is given) |
+| `device-code` | Device code polling (headless/SSH; automatic fallback when no browser is available) |
 | `service-principal` | Client credentials (CI/CD) |
 | `workload-identity` | Federated token (Kubernetes pods) |
 
@@ -81,10 +81,11 @@ interactive login; scafctl's pre-login check reports the env credential as
 ## Usage
 
 ~~~bash
-# Interactive login
-scafctl auth login --handler entra --flow interactive
+# Interactive login (default; no --flow needed). When no browser is
+# available (e.g. headless/SSH), falls back to device code automatically.
+scafctl auth login --handler entra
 
-# Device code login
+# Device code login, e.g. to opt out of the browser flow entirely
 scafctl auth login --handler entra --flow device-code
 
 # Check status

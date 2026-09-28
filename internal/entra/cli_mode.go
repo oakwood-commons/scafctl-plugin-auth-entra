@@ -20,8 +20,13 @@ type cliMode struct {
 }
 
 // defaultLoginFlow is the flow used when no flow is specified and no
-// credentials or DefaultFlow config indicate otherwise.
-const defaultLoginFlow = auth.FlowDeviceCode
+// credentials or DefaultFlow config indicate otherwise. Interactive
+// (authorization code + PKCE) is the safer default than device code: its
+// code is bound to the local machine by the localhost redirect and PKCE,
+// while a device code is machine-independent and the flow most abused in
+// phishing. Headless environments fall back to device code via
+// interactiveLogin.
+const defaultLoginFlow = auth.FlowInteractive
 
 // preferredFlow returns the flow to use when the caller did not specify
 // one: config DefaultFlow when it names a user flow (interactive or device
@@ -47,7 +52,8 @@ func (p *Plugin) preferredFlow() auth.Flow {
 //  4. Explicit FlowInteractive -- authorization code + PKCE flow.
 //  5. Explicit FlowDeviceCode -- device code polling flow.
 //  6. Empty flow (no credentials detected) -- config DefaultFlow when it is
-//     interactive or device_code, otherwise the handler default (device code).
+//     interactive or device_code, otherwise the handler default (interactive;
+//     falls back to device code when no browser is available).
 func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
 	// Determine which flow to use with credential detection.
 	flow := req.Flow
@@ -67,7 +73,7 @@ func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceC
 	case auth.FlowServicePrincipal:
 		return m.p.servicePrincipalLogin(ctx, req)
 	case auth.FlowInteractive:
-		return m.p.authCodeLogin(ctx, req, deviceCodeCb)
+		return m.p.interactiveLogin(ctx, req, deviceCodeCb, req.Flow == "", m.p.headlessReason())
 	case auth.FlowDeviceCode:
 		return m.p.deviceCodeLogin(ctx, req, deviceCodeCb)
 	default:
@@ -385,9 +391,13 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 	// pair so the preferred flow comes first: config DefaultFlow when
 	// set, otherwise the handler default. The host picks the first
 	// available entry, so this ordering decides the flow used when no
-	// --flow flag is passed. Workload identity and service principal
-	// entries stay ahead so detected credentials keep precedence over
-	// DefaultFlow.
+	// --flow flag is passed -- including for an implicit interactive
+	// default on a headless session: a headless (browserless) session
+	// reorders the pair to device code first, so the host resolves a
+	// no-flag login to device code instead of an auth-code flow that
+	// cannot complete. Workload identity and service principal entries
+	// stay ahead so detected credentials keep precedence over DefaultFlow.
+	// An explicit --flow interactive still runs the auth-code flow.
 	deviceCodeFlow := sdkplugin.FlowAvailability{
 		Flow:      auth.FlowDeviceCode,
 		Available: true,
@@ -398,9 +408,14 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 		Available: true,
 		Reason:    "interactive flow is always available",
 	}
-	if m.p.preferredFlow() == auth.FlowInteractive {
+	headlessReason := m.p.headlessReason()
+	if m.p.preferredFlow() == auth.FlowInteractive && headlessReason == "" {
 		flows = append(flows, interactiveFlow, deviceCodeFlow)
 	} else {
+		if headlessReason != "" {
+			interactiveFlow.Reason = "interactive flow requires a browser (" +
+				headlessReason + "); pass --flow interactive to force it"
+		}
 		flows = append(flows, deviceCodeFlow, interactiveFlow)
 	}
 

@@ -91,6 +91,7 @@ func TestConfigureAuthHandler(t *testing.T) {
 		assert.NotNil(t, p.graphClient)
 		assert.NotNil(t, p.clock)
 		assert.NotNil(t, p.openBrowser)
+		assert.NotNil(t, p.headlessReason)
 	})
 
 	t.Run("unknown handler", func(t *testing.T) {
@@ -499,44 +500,78 @@ func TestDetectAvailableFlows(t *testing.T) {
 		tests := []struct {
 			name        string
 			defaultFlow string
+			headless    bool
 			wantOrder   []auth.Flow
 			wantFirst   auth.Flow
+			// Login's empty-flow preference is headless-independent: the
+			// fallback then happens inside Login, not via this ordering.
+			wantPreferred auth.Flow
 		}{
 			{
-				name:        "unset uses handler default",
-				defaultFlow: "",
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
-				wantFirst:   auth.FlowDeviceCode,
+				name:          "unset uses handler default",
+				defaultFlow:   "",
+				wantOrder:     []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:     auth.FlowInteractive,
+				wantPreferred: auth.FlowInteractive,
 			},
 			{
-				name:        "device_code",
-				defaultFlow: string(auth.FlowDeviceCode),
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
-				wantFirst:   auth.FlowDeviceCode,
+				name:          "device_code",
+				defaultFlow:   string(auth.FlowDeviceCode),
+				wantOrder:     []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
+				wantFirst:     auth.FlowDeviceCode,
+				wantPreferred: auth.FlowDeviceCode,
 			},
 			{
-				name:        "interactive preferred over device code",
-				defaultFlow: string(auth.FlowInteractive),
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
-				wantFirst:   auth.FlowInteractive,
+				name:          "interactive preferred over device code",
+				defaultFlow:   string(auth.FlowInteractive),
+				wantOrder:     []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:     auth.FlowInteractive,
+				wantPreferred: auth.FlowInteractive,
 			},
 			{
-				name:        "workload_identity keeps handler default user flow",
-				defaultFlow: string(auth.FlowWorkloadIdentity),
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
-				wantFirst:   auth.FlowDeviceCode,
+				name:          "workload_identity keeps handler default user flow",
+				defaultFlow:   string(auth.FlowWorkloadIdentity),
+				wantOrder:     []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:     auth.FlowInteractive,
+				wantPreferred: auth.FlowInteractive,
 			},
 			{
-				name:        "service_principal keeps handler default user flow",
-				defaultFlow: string(auth.FlowServicePrincipal),
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
-				wantFirst:   auth.FlowDeviceCode,
+				name:          "service_principal keeps handler default user flow",
+				defaultFlow:   string(auth.FlowServicePrincipal),
+				wantOrder:     []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:     auth.FlowInteractive,
+				wantPreferred: auth.FlowInteractive,
+			},
+			{
+				// The host passes the first available entry as req.Flow for
+				// a no-flag login, so headless sessions must reorder the
+				// pair or the resolved flow cannot complete.
+				name:          "unset on headless session resolves device code first",
+				defaultFlow:   "",
+				headless:      true,
+				wantOrder:     []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
+				wantFirst:     auth.FlowDeviceCode,
+				wantPreferred: auth.FlowInteractive,
+			},
+			{
+				name:          "interactive config on headless session still resolves device code first",
+				defaultFlow:   string(auth.FlowInteractive),
+				headless:      true,
+				wantOrder:     []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
+				wantFirst:     auth.FlowDeviceCode,
+				wantPreferred: auth.FlowInteractive,
 			},
 		}
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				p, _ := newTestPlugin(t, nil, nil)
+				p.headlessReason = func() string {
+					if tt.headless {
+						return "test: no display"
+					}
+					return ""
+				}
 				p.config.DefaultFlow = tt.defaultFlow
 
 				flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
@@ -546,11 +581,16 @@ func TestDetectAvailableFlows(t *testing.T) {
 				var order []auth.Flow
 				for _, f := range flows {
 					order = append(order, f.Flow)
+					if f.Flow == auth.FlowInteractive && tt.headless {
+						assert.Contains(t, f.Reason, "requires a browser",
+							"headless sessions must explain why interactive is demoted")
+					}
 				}
 				assert.Equal(t, tt.wantOrder, order)
 				assert.Equal(t, tt.wantFirst, firstAvailableFlow(t, flows))
-				// Login's empty-flow path uses the same preference.
-				assert.Equal(t, tt.wantFirst, p.preferredFlow())
+				// Login's empty-flow path uses the same preference; its
+				// headless fallback happens separately, via interactiveLogin.
+				assert.Equal(t, tt.wantPreferred, p.preferredFlow())
 			})
 		}
 	})

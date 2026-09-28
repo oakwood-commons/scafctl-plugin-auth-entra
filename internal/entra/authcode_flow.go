@@ -23,7 +23,11 @@ func defaultBrowserOpener(ctx context.Context, u string) error {
 }
 
 // authCodeLogin performs the authorization code + PKCE authentication flow.
-func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
+// When browserRequired is true, a failure to open the browser aborts the
+// flow with errBrowserUnavailable so the caller can fall back to device
+// code; otherwise the URL is shown for manual opening and the flow waits
+// for the callback as before.
+func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt), browserRequired bool) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting authorization code + PKCE flow")
 
@@ -94,6 +98,9 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	lgr.V(1).Info("opening browser for authentication", "url", authURL)
 	browserOpenErr := p.openBrowser(ctx, authURL)
 	if browserOpenErr != nil {
+		if browserRequired {
+			return nil, fmt.Errorf("entra: auth_code: %w: %w", errBrowserUnavailable, browserOpenErr)
+		}
 		lgr.V(0).Info("failed to open browser, please open this URL manually", "url", authURL)
 	}
 

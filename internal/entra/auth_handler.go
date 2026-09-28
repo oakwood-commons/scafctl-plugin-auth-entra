@@ -72,6 +72,7 @@ type Plugin struct {
 	clock            clock.Clock
 	cachedHostClient *sdkplugin.HostServiceClient
 	openBrowser      BrowserOpenFunc
+	headlessReason   func() string
 	mode             mode
 }
 
@@ -175,6 +176,11 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		p.openBrowser = defaultBrowserOpener
 	}
 
+	// Initialize headless detection (can be overridden for testing)
+	if p.headlessReason == nil {
+		p.headlessReason = defaultHeadlessReason
+	}
+
 	// Default to CLI mode
 	p.mode = &cliMode{p: p}
 
@@ -189,7 +195,10 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 //  3. Implicit credential detection -- when no flow is specified, checks for
 //     workload identity and service principal environment credentials.
 //  4. Explicit FlowInteractive -- authorization code + PKCE flow.
-//  5. Explicit FlowDeviceCode or empty flow -- device code polling flow.
+//  5. Explicit FlowDeviceCode -- device code polling flow.
+//  6. Empty flow (no credentials detected) -- config DefaultFlow when it is
+//     interactive or device_code, otherwise the handler default (interactive;
+//     falls back to device code when no browser is available).
 //
 // Delegates to the active mode (CLI mode by default).
 func (p *Plugin) Login(ctx context.Context, handlerName string, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {

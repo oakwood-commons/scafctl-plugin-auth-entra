@@ -57,8 +57,8 @@ Keys under `auth.entra`:
 | `clientId` | Azure CLI public client ID | App registration client ID |
 | `tenantId` | `common` | Tenant GUID, `organizations`, or `common` |
 | `authority` | `https://login.microsoftonline.com` | Authority URL; must be `https://` with a host. See the sovereign-cloud note |
-| `defaultScopes` | `openid profile` | Scopes requested at login when no `--scope` is given |
-| `defaultFlow` | `interactive` | `interactive` or `device_code`; used when no flow is requested and no env credentials are detected. `interactive` still falls back to device code on headless machines |
+| `defaultScopes` | `openid profile` | Scopes requested at interactive/device-code login when no `--scope` is given; service-principal and workload-identity logins ignore it and default to a fixed `https://graph.microsoft.com/.default` / `https://management.azure.com/.default` unless `--scope` is passed |
+| `defaultFlow` | `interactive` | `interactive` or `device_code`; used when no flow is requested and no service-principal/workload-identity credentials are detected (in config or environment). `interactive` still falls back to device code on headless machines |
 | `clientSecret` | - | Service principal secret (top-level or per-profile); overrides `AZURE_CLIENT_SECRET` |
 | `federatedTokenFile` | - | Workload identity token file (top-level or per-profile); overrides `AZURE_FEDERATED_TOKEN_FILE` |
 | `federatedToken` | - | Raw workload identity token for testing (top-level or per-profile); overrides `AZURE_FEDERATED_TOKEN` |

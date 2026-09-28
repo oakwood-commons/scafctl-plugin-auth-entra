@@ -34,7 +34,7 @@ tasks:
     cmds:
       - >-
         scafctl build plugin --force
-        --name auth-entra
+        --name entra
         --kind auth-handler
         --version 0.1.0
         --platform {{OS}}/{{ARCH}}={{.DIST}}/{{.BINARY}}
@@ -55,7 +55,7 @@ tasks:
     cmds:
       - >-
         scafctl build plugin --force
-        --name auth-entra
+        --name entra
         --kind auth-handler
         --version {{.VERSION}}
         --platform {{OS}}/{{ARCH}}={{.DIST}}/{{.BINARY}}

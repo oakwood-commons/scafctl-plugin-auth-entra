@@ -15,30 +15,72 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) auth handler plugin for
 ## Installation
 
 ~~~bash
+# Build and install into the local scafctl catalog
+task publish:local
+
+# Or build a catalog artifact manually
 scafctl build plugin --force \
-  --name auth-entra \
+  --name entra \
   --kind auth-handler \
   --version 0.1.0 \
   --platform darwin/arm64=./dist/scafctl-plugin-auth-entra
 ~~~
 
-Or install from the catalog:
+The catalog artifact name must be `entra` (not `auth-entra`): releases and
+scafctl's official-handler lookup both resolve this handler as `entra`.
+
+Or install the official release from the catalog:
 
 ~~~bash
-scafctl install plugin auth-entra
+scafctl auth handlers install entra
 ~~~
 
 ## Configuration
 
-Add the handler to your scafctl config (`~/.config/scafctl/config.yaml`):
+Add the handler to your scafctl config (`~/.config/scafctl/config.yaml`).
+Settings live in the typed `auth.entra` block; an `auth.handlers.entra`
+block is not forwarded to this plugin:
 
 ~~~yaml
 auth:
-  handlers:
-    entra:
-      clientId: "<your-app-registration-client-id>"
-      tenantId: "<your-tenant-id>"
+  entra:
+    clientId: "<your-app-registration-client-id>"
+    tenantId: "<your-tenant-id>"
 ~~~
+
+### Config Keys
+
+Keys under `auth.entra`:
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `clientId` | Azure CLI public client ID | App registration client ID |
+| `tenantId` | `common` | Tenant GUID, `organizations`, or `common` |
+| `authority` | `https://login.microsoftonline.com` | Authority URL; must be `https://` with a host. See the sovereign-cloud note |
+| `defaultScopes` | `openid profile` | Scopes requested at login when no `--scope` is given |
+| `defaultFlow` | `interactive` | `interactive` or `device_code`; used when no flow is requested and no env credentials are detected. `interactive` still falls back to device code on headless machines |
+| `clientSecret` | - | Service principal secret (top-level or per-profile); overrides `AZURE_CLIENT_SECRET` |
+| `federatedTokenFile` | - | Workload identity token file (top-level or per-profile); overrides `AZURE_FEDERATED_TOKEN_FILE` |
+| `federatedToken` | - | Raw workload identity token for testing (top-level or per-profile); overrides `AZURE_FEDERATED_TOKEN` |
+| `httpClient` | - | HTTP client settings for token requests (timeouts, retries); response caching/compression stay off unless enabled here |
+| `activeProfile` | - | Profile scafctl resolves when none is given (host-side; not forwarded to the plugin) |
+| `profiles.<name>.*` | - | Per-profile overrides of the keys above |
+
+`clientSecret`, `federatedTokenFile`, and `federatedToken` work at the top
+level without a profile; a profile overlays them
+(`scafctl auth login entra --profile <name>`). Other keys under
+`auth.entra` are not recognized and are ignored.
+
+### Sovereign Clouds
+
+For a national (sovereign) cloud, set `authority` to the cloud's login
+host, e.g. `https://login.microsoftonline.us` for Azure US Government.
+The interactive flow reports its authorize URL as the verification URI,
+and scafctl cancels the login unless that URL's host is trusted: the
+built-in trusted list for `entra` is `login.microsoftonline.com` and
+`login.microsoft.com`. Also set the cloud's login host in
+`auth.trustedVerificationDomains` (or
+`auth.handlers.entra.trustedVerificationDomains`) so the login proceeds.
 
 ### Environment Variables
 
@@ -49,7 +91,11 @@ auth:
 | `AZURE_CLIENT_SECRET` | Client secret (service principal flow) |
 | `AZURE_FEDERATED_TOKEN_FILE` | Path to projected SA token (workload identity) |
 | `AZURE_FEDERATED_TOKEN` | Raw federated token (workload identity, testing) |
-| `AZURE_AUTHORITY_HOST` | Custom authority host (defaults to `login.microsoftonline.com`) |
+| `AZURE_AUTHORITY_HOST` | Authority URL for the workload identity flow only (defaults to `https://login.microsoftonline.com`); other flows use the `authority` config key |
+
+Setting the matching config key (`clientId`, `tenantId`, `authority`,
+`clientSecret`, `federatedTokenFile`, `federatedToken`) takes precedence
+over the environment variable.
 
 ### Credential Precedence
 
@@ -80,23 +126,46 @@ interactive login; scafctl's pre-login check reports the env credential as
 
 ## Usage
 
+The handler is a positional argument (`scafctl auth login entra`), not a
+`--handler entra` flag:
+
 ~~~bash
-# Interactive login (default; no --flow needed). When no browser is
-# available (e.g. headless/SSH), falls back to device code automatically.
-scafctl auth login --handler entra
+# Interactive login (default; no --flow needed). Opens a browser via
+# authorization code + PKCE; falls back to device code automatically on
+# headless machines (no DISPLAY/WAYLAND_DISPLAY, SSH sessions).
+scafctl auth login entra
 
 # Device code login, e.g. to opt out of the browser flow entirely
-scafctl auth login --handler entra --flow device-code
+scafctl auth login entra --flow device-code
+
+# Login with a specific tenant and/or custom app registration
+scafctl auth login entra --tenant <tenant-id> --client-id <client-id>
+
+# Interactive login over SSH or in a devcontainer: forward the port and
+# pin it so the redirect URI is predictable
+scafctl auth login entra --flow interactive --callback-port 8400
+
+# Non-interactive service principal / workload identity (credentials
+# from env vars or config, see above)
+scafctl auth login entra --flow service-principal
+scafctl auth login entra --flow workload-identity
 
 # Check status
-scafctl auth status --handler entra
+scafctl auth status entra
 
 # Get a token
-scafctl auth token --handler entra --scope "https://graph.microsoft.com/.default"
+scafctl auth token entra --scope "https://graph.microsoft.com/.default"
 
 # Logout
-scafctl auth logout --handler entra
+scafctl auth logout entra
 ~~~
+
+### Upgrade Note
+
+**Breaking change:** stored session metadata moved to the canonical
+`auth.HandlerMetadata` schema. Sessions stored by plugin versions v0.3.0 and
+earlier are rejected as legacy; log in once (`scafctl auth login entra`)
+after upgrading to recreate the session.
 
 ## Profiles
 

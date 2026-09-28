@@ -311,7 +311,7 @@ func TestClientCredentialFlow(t *testing.T) {
 
 		cred := &SecretCredential{Secret: "cc-secret"}
 		client := newTestHTTPClient(ts)
-		flow := clientCredentialFlow(ts.URL, cred, client)
+		flow := clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)
 
 		resp, err := flow(context.Background(), FlowParams{
 			Scope:    "https://graph.microsoft.com/.default",
@@ -333,6 +333,19 @@ func TestClientCredentialFlow(t *testing.T) {
 		assert.Empty(t, receivedForm.Get("requested_token_use"))
 	})
 
+	t.Run("tags response with configured workload identity flow", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(TokenResponse{AccessToken: "wif-token", TokenType: "Bearer", ExpiresIn: 3600})
+		}))
+		defer ts.Close()
+
+		flow := clientCredentialFlow(ts.URL, &SecretCredential{Secret: "s"}, newTestHTTPClient(ts), auth.FlowWorkloadIdentity)
+		resp, err := flow(context.Background(), FlowParams{Scope: "api://x/.default", ClientID: "c"})
+		require.NoError(t, err)
+		assert.Equal(t, auth.FlowWorkloadIdentity, resp.Flow)
+	})
+
 	t.Run("error when credential Apply fails", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			t.Fatal("should not reach server")
@@ -341,7 +354,7 @@ func TestClientCredentialFlow(t *testing.T) {
 
 		cred := &SecretCredential{Secret: ""} // will fail Apply
 		client := newTestHTTPClient(ts)
-		flow := clientCredentialFlow(ts.URL, cred, client)
+		flow := clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)
 
 		_, err := flow(context.Background(), FlowParams{
 			Scope:    "scope",
@@ -364,7 +377,7 @@ func TestClientCredentialFlow(t *testing.T) {
 
 		cred := &SecretCredential{Secret: "secret"}
 		client := newTestHTTPClient(ts)
-		flow := clientCredentialFlow(ts.URL, cred, client)
+		flow := clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)
 
 		_, err := flow(context.Background(), FlowParams{
 			Scope:    "scope",
@@ -403,8 +416,8 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client),
-				auth.ServerContextDelegated: delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client)),
+				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
+				auth.ServerContextDelegated: delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)),
 			},
 			credential: cred,
 			clientID:   "my-client",
@@ -430,8 +443,8 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client),
-				auth.ServerContextDelegated: delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client)),
+				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
+				auth.ServerContextDelegated: delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)),
 			},
 			credential: cred,
 			clientID:   "my-client",
@@ -459,8 +472,8 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client),
-				auth.ServerContextDelegated: delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client)),
+				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
+				auth.ServerContextDelegated: delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)),
 			},
 			credential: cred,
 			clientID:   "my-client",
@@ -502,7 +515,7 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer: clientCredentialFlow(ts.URL, cred, client),
+				auth.ServerContextServer: clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
 			},
 			credential: cred,
 			clientID:   "override-client-id",
@@ -526,7 +539,7 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 		// Only server context registered — no delegated
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer: clientCredentialFlow(ts.URL, cred, client),
+				auth.ServerContextServer: clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
 			},
 			credential: cred,
 			clientID:   "cid",
@@ -552,7 +565,7 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 		// Only server context registered — no delegated
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer: clientCredentialFlow(ts.URL, cred, client),
+				auth.ServerContextServer: clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
 			},
 			credential: cred,
 			clientID:   "cid",
@@ -583,8 +596,8 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client),
-				auth.ServerContextDelegated: delegatedDispatch(nil, clientCredentialFlow(ts.URL, cred, client)),
+				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
+				auth.ServerContextDelegated: delegatedDispatch(nil, clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)),
 			},
 			credential: cred,
 			clientID:   "wif-client",
@@ -614,8 +627,8 @@ func TestEntraServerMode_GetToken(t *testing.T) {
 		// UserFlow = client_credentials (matches serverFlow), so user route is CC not OBO
 		sm := &entraServerMode{
 			strategies: map[auth.ServerContext]FlowFn{
-				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client),
-				auth.ServerContextDelegated: delegatedDispatch(clientCredentialFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client)),
+				auth.ServerContextServer:    clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials),
+				auth.ServerContextDelegated: delegatedDispatch(clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials), clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials)),
 			},
 			credential: cred,
 			clientID:   "my-client",
@@ -644,7 +657,7 @@ func TestDelegatedDispatch(t *testing.T) {
 
 		cred := &SecretCredential{Secret: "s"}
 		client := newTestHTTPClient(ts)
-		dispatch := delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client))
+		dispatch := delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials))
 
 		resp, err := dispatch(context.Background(), FlowParams{
 			assertion: "user-assertion",
@@ -664,7 +677,7 @@ func TestDelegatedDispatch(t *testing.T) {
 
 		cred := &SecretCredential{Secret: "s"}
 		client := newTestHTTPClient(ts)
-		dispatch := delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client))
+		dispatch := delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials))
 
 		resp, err := dispatch(context.Background(), FlowParams{
 			Scope:    "scope",
@@ -682,7 +695,7 @@ func TestDelegatedDispatch(t *testing.T) {
 
 		cred := &SecretCredential{Secret: "s"}
 		client := newTestHTTPClient(ts)
-		dispatch := delegatedDispatch(nil, clientCredentialFlow(ts.URL, cred, client))
+		dispatch := delegatedDispatch(nil, clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials))
 
 		_, err := dispatch(context.Background(), FlowParams{
 			Caller: auth.CallerUser,
@@ -712,7 +725,7 @@ func TestDelegatedDispatch(t *testing.T) {
 
 		cred := &SecretCredential{Secret: "s"}
 		client := newTestHTTPClient(ts)
-		dispatch := delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client))
+		dispatch := delegatedDispatch(oboFlow(ts.URL, cred, client), clientCredentialFlow(ts.URL, cred, client, auth.FlowClientCredentials))
 
 		_, err := dispatch(context.Background(), FlowParams{
 			Caller: "unknown",

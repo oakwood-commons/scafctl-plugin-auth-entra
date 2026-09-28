@@ -58,9 +58,10 @@ func oboFlow(tokenURL string, cred ServerCredential, httpClient HTTPClient) Flow
 }
 
 // clientCredentialFlow returns a FlowFn that performs the client_credentials grant.
-// Responses carry auth.FlowClientCredentials so callers can tell how the token
-// was acquired.
-func clientCredentialFlow(tokenURL string, cred ServerCredential, httpClient HTTPClient) FlowFn {
+// Responses are tagged with flow -- the configured server flow, since both
+// client_credentials and workload_identity use this grant -- so callers can
+// tell how the token was acquired.
+func clientCredentialFlow(tokenURL string, cred ServerCredential, httpClient HTTPClient, flow auth.Flow) FlowFn {
 	return func(ctx context.Context, params FlowParams) (*sdkplugin.TokenResponse, error) {
 		data := url.Values{
 			"grant_type": {"client_credentials"},
@@ -70,7 +71,7 @@ func clientCredentialFlow(tokenURL string, cred ServerCredential, httpClient HTT
 		if err := cred.Apply(data); err != nil {
 			return nil, fmt.Errorf("applying server credential: %w", err)
 		}
-		return executeTokenRequest(ctx, httpClient, tokenURL, data, auth.FlowClientCredentials)
+		return executeTokenRequest(ctx, httpClient, tokenURL, data, flow)
 	}
 }
 

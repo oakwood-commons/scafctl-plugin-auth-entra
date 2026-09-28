@@ -125,6 +125,30 @@ func TestConfigureAuthHandler(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to parse handler config")
 	})
 
+	t.Run("forwarded httpClient override builds both clients", func(t *testing.T) {
+		p := &Plugin{}
+		cfg := map[string]json.RawMessage{
+			HandlerName: json.RawMessage(`{"httpClient":{"timeout":"5s","retryMax":1}}`),
+		}
+		err := p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{Settings: cfg})
+		require.NoError(t, err)
+		require.NotNil(t, p.config.HTTPClient)
+		assert.Equal(t, "5s", p.config.HTTPClient.Timeout)
+		assert.NotNil(t, p.httpClient)
+		assert.NotNil(t, p.graphClient)
+	})
+
+	t.Run("invalid forwarded httpClient value", func(t *testing.T) {
+		p := &Plugin{}
+		cfg := map[string]json.RawMessage{
+			HandlerName: json.RawMessage(`{"httpClient":{"timeout":"not-a-duration"}}`),
+		}
+		err := p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{Settings: cfg})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "httpClient config")
+		assert.Nil(t, p.httpClient)
+	})
+
 	t.Run("embedder binary name", func(t *testing.T) {
 		p := &Plugin{}
 		err := p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{

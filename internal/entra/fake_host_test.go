@@ -10,12 +10,22 @@ import (
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/plugin/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // fakeHostService implements proto.HostServiceClient backed by an in-memory map.
 type fakeHostService struct {
 	mu      sync.Mutex
 	secrets map[string]string
+	// promptFunc backs PromptAuthResponse; tests use it to deliver pasted
+	// redirect URLs, block until canceled, or return host errors. nil
+	// mimics a pre-paste-back host (gRPC Unimplemented).
+	promptFunc func(ctx context.Context, req *proto.PromptAuthResponseRequest) (string, error)
+	// promptReq captures the most recent PromptAuthResponse request.
+	promptReq *proto.PromptAuthResponseRequest
+	// promptCalls counts PromptAuthResponse invocations.
+	promptCalls int
 }
 
 func newFakeHostService() *fakeHostService {
@@ -80,4 +90,33 @@ func (f *fakeHostService) GetAuthToken(_ context.Context, _ *proto.GetAuthTokenR
 
 func (f *fakeHostService) GetAuthGroups(_ context.Context, _ *proto.GetAuthGroupsRequest, _ ...grpc.CallOption) (*proto.GetAuthGroupsResponse, error) {
 	return &proto.GetAuthGroupsResponse{}, nil
+}
+
+// PromptAuthResponse records the request and delegates to promptFunc. The
+// default (nil promptFunc) mimics a host built against an older SDK that
+// does not implement the RPC, so existing tests keep pre-paste-back
+// behavior.
+func (f *fakeHostService) PromptAuthResponse(ctx context.Context, in *proto.PromptAuthResponseRequest, _ ...grpc.CallOption) (*proto.PromptAuthResponseResponse, error) {
+	f.mu.Lock()
+	f.promptCalls++
+	f.promptReq = in
+	fn := f.promptFunc
+	f.mu.Unlock()
+
+	if fn == nil {
+		return nil, status.Error(codes.Unimplemented, "PromptAuthResponse not implemented")
+	}
+	value, err := fn(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.PromptAuthResponseResponse{Value: value}, nil
+}
+
+// promptRequest returns the most recent PromptAuthResponse request and the
+// number of calls, mutex-guarded for assertions after Login returns.
+func (f *fakeHostService) promptRequest() (*proto.PromptAuthResponseRequest, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.promptReq, f.promptCalls
 }

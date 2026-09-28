@@ -5,7 +5,9 @@ package entra
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -112,7 +114,35 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 		})
 	}
 
-	// Wait for authorization code or timeout
+	// Ask the host to collect a pasted redirect URL in the background
+	// (issue #66). In remote workspaces (DevSpaces, Codespaces) the browser
+	// runs on the user's laptop and the localhost redirect cannot reach
+	// this machine; the user pastes the URL the browser landed on instead.
+	// Older hosts return Unimplemented from the RPC itself and
+	// non-interactive hosts return Unavailable; both (and any other host
+	// error) are logged at debug and left undelivered so the select below
+	// keeps today's callback-only behavior.
+	pasteCh := make(chan string, 1)
+	promptCtx, cancelPrompt := context.WithCancel(ctx)
+	defer cancelPrompt()
+	if hostClient := p.hostClient(ctx); hostClient != nil {
+		go func() {
+			value, err := hostClient.PromptAuthResponse(promptCtx, HandlerName, authURL, redirectURI)
+			if err != nil {
+				logr.FromContextOrDiscard(promptCtx).V(1).Info("host paste-back prompt unavailable, waiting for callback only", "error", err)
+				return
+			}
+			select {
+			case pasteCh <- value:
+			case <-promptCtx.Done():
+			}
+		}()
+	}
+
+	// Wait for the authorization code from the local callback, a pasted
+	// redirect URL (remote workspaces), the timeout, or cancellation.
+	// Whichever arrives first wins; the deferred cancelPrompt releases the
+	// paste goroutine when another source wins.
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
@@ -120,21 +150,16 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	select {
 	case result := <-callbackServer.ResultChan():
 		if result.Err != nil {
-			// The callback error carries query parameters supplied by the
-			// redirect origin (error/error_description); strip control
-			// characters so terminal escape sequences cannot reach the user
-			// (issue #49). Remove once oakwood-commons/oauth-helpers#17
-			// ships and the dependency is bumped.
-			errMsg := sanitizeControlChars(result.Err.Error())
-			if strings.Contains(errMsg, "AADSTS") {
-				if hint := aadstsHint(errMsg); hint != "" {
-					return nil, fmt.Errorf("entra: auth_code: %s\nHint: %s", errMsg, hint)
-				}
-			}
-			return nil, fmt.Errorf("entra: auth_code: %s", errMsg)
+			return nil, authCallbackError(result.Err.Error())
 		}
 		authCode = result.Code
 		lgr.V(1).Info("received authorization code")
+	case pasted := <-pasteCh:
+		authCode, err = parsePastedRedirect(pasted, redirectURI, state)
+		if err != nil {
+			return nil, err
+		}
+		lgr.V(1).Info("received pasted authorization response")
 	case <-timer.C:
 		return nil, fmt.Errorf("entra: auth_code: no response received from browser within %s; "+
 			"if using a custom --client-id, ensure http://localhost is registered as a redirect URI "+
@@ -186,6 +211,74 @@ func sanitizeControlChars(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// authCallbackError formats a redirect-supplied error message (from the HTTP
+// callback or a pasted redirect URL): control characters are stripped (issue
+// #49; remove the sanitize call once oakwood-commons/oauth-helpers#17 ships
+// and the dependency is bumped) and a well-known AADSTS code gets a hint.
+func authCallbackError(raw string) error {
+	msg := sanitizeControlChars(raw)
+	if hint := aadstsHint(msg); hint != "" {
+		return fmt.Errorf("entra: auth_code: %s\nHint: %s", msg, hint)
+	}
+	return fmt.Errorf("entra: auth_code: %s", msg)
+}
+
+// effectivePath normalizes a URL path for callback comparison: a redirect
+// URI without a path (http://localhost:port) and the browser's landing page
+// (http://localhost:port/?code=...) address the same location, so "" and
+// "/" are equivalent.
+func effectivePath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	return p
+}
+
+// parsePastedRedirect validates a redirect URL pasted by the user (issue
+// #66) and extracts the authorization code. The paste is parsed
+// defensively: surrounding whitespace is trimmed and a dropped "http://"
+// scheme is restored. Scheme, host, port, and path must match the running
+// callback server's redirect URI exactly, and the state parameter must
+// match the generated state in constant time (CSRF protection, mirroring
+// the HTTP callback handler). An error= response is reported through the
+// same sanitizeControlChars + AADSTS hint machinery as the callback path.
+func parsePastedRedirect(pasted, redirectURI, expectedState string) (string, error) {
+	raw := strings.TrimSpace(pasted)
+	// Terminals and address bars often strip the scheme when copying; the
+	// callback URI is always http, so restore it before parsing.
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", errors.New("entra: pasted response is not a valid URL")
+	}
+	want, err := url.Parse(redirectURI)
+	if err != nil || want.Scheme == "" || want.Hostname() == "" {
+		return "", fmt.Errorf("entra: pasted response does not match this login's callback URI (expected %s)", redirectURI)
+	}
+	if u.Scheme != want.Scheme || u.Hostname() != want.Hostname() || u.Port() != want.Port() ||
+		effectivePath(u.Path) != effectivePath(want.Path) {
+		return "", fmt.Errorf("entra: pasted response does not match this login's callback URI (expected %s)", redirectURI)
+	}
+	q := u.Query()
+	if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(expectedState)) != 1 {
+		return "", errors.New("entra: pasted response state mismatch (possible CSRF attack)")
+	}
+	if e := q.Get("error"); e != "" {
+		msg := "OAuth error: " + e
+		if d := q.Get("error_description"); d != "" {
+			msg += ": " + d
+		}
+		return "", authCallbackError(msg)
+	}
+	code := q.Get("code")
+	if code == "" {
+		return "", errors.New("entra: pasted response contains no authorization code")
+	}
+	return code, nil
 }
 
 // exchangeAuthCode exchanges an authorization code for tokens at the Entra

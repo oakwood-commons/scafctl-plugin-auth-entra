@@ -395,7 +395,12 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 	// default on a headless session: a headless (browserless) session
 	// reorders the pair to device code first, so the host resolves a
 	// no-flag login to device code instead of an auth-code flow that
-	// cannot complete. Workload identity and service principal entries
+	// cannot complete. Host paste-back support (issue #66) is the
+	// exception: the auth-code flow can complete without a local browser
+	// (the user pastes the redirect URL back through the host), so
+	// interactive stays first even on headless sessions; device code then
+	// remains reachable only via --flow device-code or a defaultFlow:
+	// device_code config. Workload identity and service principal entries
 	// stay ahead so detected credentials keep precedence over DefaultFlow.
 	// An explicit --flow interactive still runs the auth-code flow.
 	deviceCodeFlow := sdkplugin.FlowAvailability{
@@ -409,10 +414,11 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 		Reason:    "interactive flow is always available",
 	}
 	headlessReason := m.p.headlessReason()
-	if m.p.preferredFlow() == auth.FlowInteractive && headlessReason == "" {
+	if m.p.preferredFlow() == auth.FlowInteractive &&
+		(headlessReason == "" || m.p.cfg.SupportsPromptAuthResponse()) {
 		flows = append(flows, interactiveFlow, deviceCodeFlow)
 	} else {
-		if headlessReason != "" {
+		if headlessReason != "" && !m.p.cfg.SupportsPromptAuthResponse() {
 			interactiveFlow.Reason = "interactive flow requires a browser (" +
 				headlessReason + "); pass --flow interactive to force it"
 		}

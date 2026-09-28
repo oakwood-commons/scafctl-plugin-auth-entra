@@ -224,6 +224,21 @@ func TestStoreCredentials(t *testing.T) {
 		assert.Equal(t, "keep-me", md.SessionID)
 	})
 
+	t.Run("rotation without ID token keeps previous claims", func(t *testing.T) {
+		p, fake := newTestPlugin(t, nil, nil)
+
+		prev := &auth.Claims{Subject: "user-sub", ObjectID: "user-oid"}
+		tokenResp := &TokenResponse{RefreshToken: "rt"}
+		err := p.storeCredentialsWithClaims(context.Background(), "t", tokenResp, "c", nil, "", "keep-me", prev)
+		require.NoError(t, err)
+
+		var md auth.HandlerMetadata
+		_ = json.Unmarshal([]byte(fake.secrets[SecretKeyMetadata]), &md)
+		require.NotNil(t, md.Claims)
+		assert.Equal(t, "user-oid", md.Claims.ObjectID)
+		assert.Equal(t, "user-sub", md.Claims.Subject)
+	})
+
 	t.Run("extracts claims from ID token", func(t *testing.T) {
 		p, fake := newTestPlugin(t, nil, nil)
 

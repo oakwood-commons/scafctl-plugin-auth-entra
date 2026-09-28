@@ -291,6 +291,12 @@ func TestServerConfigAuthorityValidation(t *testing.T) {
 		assert.Contains(t, err.Error(), "host")
 	})
 
+	t.Run("https authority with port but no hostname rejected", func(t *testing.T) {
+		err := newConfig("https://:443").Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "host")
+	})
+
 	t.Run("custom https authority accepted", func(t *testing.T) {
 		require.NoError(t, newConfig("https://custom.auth").Validate())
 	})

@@ -152,7 +152,7 @@ func validateAuthorityURL(authority string) error {
 	if u.Scheme != "https" {
 		return fmt.Errorf("authority %q must use https://", authority)
 	}
-	if u.Host == "" {
+	if u.Hostname() == "" {
 		return fmt.Errorf("authority %q must include a host", authority)
 	}
 	return nil

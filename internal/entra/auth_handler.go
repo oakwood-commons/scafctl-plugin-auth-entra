@@ -243,6 +243,19 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 	return nil
 }
 
+// clearUserTokenCache removes all cached access tokens for the active
+// profile. Interactive and device-code logins call it right before storing
+// new credentials, so a login without a preceding logout can never serve a
+// token that was cached for the previous identity (issue #49). Refresh-token
+// rotation inside mintToken must NOT go through here -- same identity, same
+// session, and it would evict the very entries it keeps fresh.
+func (p *Plugin) clearUserTokenCache(ctx context.Context) {
+	lgr := logr.FromContextOrDiscard(ctx)
+	if hostClient := p.hostClient(ctx); hostClient != nil {
+		cacheClear(ctx, lgr, hostClient, p.tokenCachePrefix(ctx))
+	}
+}
+
 // GetStatus returns the current authentication status.
 // Delegates to the active mode (CLI mode by default).
 func (p *Plugin) GetStatus(ctx context.Context, handlerName string, _ sdkplugin.StatusRequest) (*auth.Status, error) {

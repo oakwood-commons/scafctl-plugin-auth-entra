@@ -6,6 +6,7 @@ package entra
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -133,6 +134,26 @@ func (c *Config) Validate() error {
 	}
 	if c.TenantID == "" {
 		return fmt.Errorf("tenantId is required")
+	}
+	if err := validateAuthorityURL(c.GetAuthority()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateAuthorityURL rejects authority values that are not https URLs
+// with a host (issue #49): http:// and host-less values must never reach
+// token requests.
+func validateAuthorityURL(authority string) error {
+	u, err := url.Parse(authority) //nolint:gosec // validating, not fetching
+	if err != nil {
+		return fmt.Errorf("authority %q is not a valid URL: %w", authority, err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("authority %q must use https://", authority)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("authority %q must include a host", authority)
 	}
 	return nil
 }
@@ -295,6 +316,9 @@ func (sc *ServerConfig) Validate() error {
 		if err := sc.Credential.ClientSecret.Validate(); err != nil {
 			return fmt.Errorf("server config: credential.clientSecret: %w", err)
 		}
+	}
+	if err := validateAuthorityURL(sc.GetAuthority()); err != nil {
+		return fmt.Errorf("server config: %w", err)
 	}
 	return nil
 }

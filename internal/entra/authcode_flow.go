@@ -118,13 +118,18 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	select {
 	case result := <-callbackServer.ResultChan():
 		if result.Err != nil {
-			errMsg := result.Err.Error()
+			// The callback error carries query parameters supplied by the
+			// redirect origin (error/error_description); strip control
+			// characters so terminal escape sequences cannot reach the user
+			// (issue #49). Remove once oakwood-commons/oauth-helpers#17
+			// ships and the dependency is bumped.
+			errMsg := sanitizeControlChars(result.Err.Error())
 			if strings.Contains(errMsg, "AADSTS") {
 				if hint := aadstsHint(errMsg); hint != "" {
-					return nil, fmt.Errorf("entra: auth_code: %w\nHint: %s", result.Err, hint)
+					return nil, fmt.Errorf("entra: auth_code: %s\nHint: %s", errMsg, hint)
 				}
 			}
-			return nil, fmt.Errorf("entra: auth_code: %w", result.Err)
+			return nil, fmt.Errorf("entra: auth_code: %s", errMsg)
 		}
 		authCode = result.Code
 		lgr.V(1).Info("received authorization code")
@@ -141,6 +146,10 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	if err != nil {
 		return nil, fmt.Errorf("entra: token_exchange: %w", err)
 	}
+
+	// Drop tokens cached for any previous identity before the new session's
+	// credentials land (issue #49).
+	p.clearUserTokenCache(ctx)
 
 	// Store refresh token and metadata
 	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "interactive", ""); err != nil {
@@ -162,6 +171,19 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 		Claims:    claims,
 		ExpiresAt: time.Now().Add(DefaultRefreshTokenLifetime),
 	}, nil
+}
+
+// sanitizeControlChars strips C0 (U+0000-U+001F), DEL (U+007F), and C1
+// (U+0080-U+009F) control characters from a string, so callback-supplied
+// text cannot inject terminal escape sequences into errors printed to the
+// terminal (issue #49).
+func sanitizeControlChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r <= 0x1f || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // exchangeAuthCode exchanges an authorization code for tokens at the Entra

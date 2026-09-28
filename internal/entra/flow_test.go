@@ -1187,8 +1187,15 @@ func TestGetTokenAdditional(t *testing.T) {
 		t.Setenv(EnvAzureFederatedTokenFile, "")
 		t.Setenv(EnvAzureFederatedToken, "")
 
-		// Pre-populate cache with a stale token
-		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":sess")
+		// Pre-populate cache with a stale token under the session's
+		// effective identity (metadata-derived key)
+		metadata := auth.HandlerMetadata{
+			ClientID:      p.config.ClientID,
+			LastLoginFlow: auth.FlowDeviceCode,
+			SessionID:     "sess",
+		}
+		metadata.SetMeta(MetaKeyTenantID, "common")
+		fp := p.userSessionFingerprint(&metadata)
 		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "stale-cached-token",
@@ -1202,12 +1209,6 @@ func TestGetTokenAdditional(t *testing.T) {
 
 		// Also need refresh token + metadata for mintToken
 		fake.secrets[SecretKeyRefreshToken] = "refresh-token"
-		metadata := auth.HandlerMetadata{
-			ClientID:      p.config.ClientID,
-			LastLoginFlow: auth.FlowDeviceCode,
-			SessionID:     "sess",
-		}
-		metadata.SetMeta(MetaKeyTenantID, "common")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 
@@ -1255,10 +1256,8 @@ func TestGetTokenAdditional(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "minted-at", resp.AccessToken)
 
-		// Verify token was cached
-		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":sess")
-		cacheKey := SecretKeyTokenPrefix + fp + ":https://graph.microsoft.com/.default"
-		assert.Contains(t, fake.secrets, cacheKey)
+		// Verify token was cached under the session's metadata-derived key
+		assert.Contains(t, fake.secrets, SecretKeyTokenPrefix+p.userSessionFingerprint(&metadata)+":https://graph.microsoft.com/.default")
 	})
 
 	t.Run("mint failure propagates error", func(t *testing.T) {
@@ -1307,8 +1306,10 @@ func TestGetTokenAdditional(t *testing.T) {
 		t.Setenv(EnvAzureFederatedTokenFile, "")
 		t.Setenv(EnvAzureFederatedToken, "")
 
-		// Expired cache entry
-		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":")
+		// Expired cache entry under the (config-fallback, no-session) key
+		metadata := auth.HandlerMetadata{ClientID: p.config.ClientID}
+		metadata.SetMeta(MetaKeyTenantID, "common")
+		fp := p.userSessionFingerprint(&metadata)
 		cacheKey := fp + ":api://myapi/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "expired-at",
@@ -1322,8 +1323,6 @@ func TestGetTokenAdditional(t *testing.T) {
 
 		// Set up refresh token + metadata
 		fake.secrets[SecretKeyRefreshToken] = "rt"
-		metadata := auth.HandlerMetadata{ClientID: p.config.ClientID}
-		metadata.SetMeta(MetaKeyTenantID, "common")
 		metadataBytes, _ := json.Marshal(metadata)
 		fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 

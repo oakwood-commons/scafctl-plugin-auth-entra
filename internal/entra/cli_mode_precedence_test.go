@@ -77,10 +77,13 @@ func storeUserSessionWithID(t *testing.T, fake *fakeHostService, flow auth.Flow,
 	fake.secrets[SecretKeyMetadata] = string(metadataBytes)
 }
 
-// userTokenCacheKey mirrors userSessionToken's cache key for a session.
+// userTokenCacheKey mirrors userSessionToken's cache key for a session
+// stored by storeUserSessionWithID (client "stored-client", tenant
+// "user-tenant", no oid claim).
 func userTokenCacheKey(p *Plugin, sessionID, scope string) string {
-	fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":" + sessionID)
-	return SecretKeyTokenPrefix + fp + ":" + scope
+	metadata := auth.HandlerMetadata{ClientID: "stored-client", SessionID: sessionID}
+	metadata.SetMeta(MetaKeyTenantID, "user-tenant")
+	return SecretKeyTokenPrefix + p.userSessionFingerprint(&metadata) + ":" + scope
 }
 
 func TestCLICredentialPrecedenceStatus(t *testing.T) {

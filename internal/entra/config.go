@@ -16,7 +16,9 @@ import (
 )
 
 // DefaultClientID is the Azure CLI public client ID shipped with scafctl.
-// This well-known public client supports the device code flow.
+// This well-known first-party public client supports both the device code
+// flow and the browser-based authorization code + PKCE flow (it allows
+// http://localhost redirect URIs).
 const DefaultClientID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
 // DefaultTenantID is the default multi-tenant tenant identifier.

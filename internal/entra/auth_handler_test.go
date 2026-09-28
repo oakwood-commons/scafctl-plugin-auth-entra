@@ -505,8 +505,8 @@ func TestDetectAvailableFlows(t *testing.T) {
 			{
 				name:        "unset uses handler default",
 				defaultFlow: "",
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
-				wantFirst:   auth.FlowDeviceCode,
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:   auth.FlowInteractive,
 			},
 			{
 				name:        "device_code",
@@ -523,14 +523,14 @@ func TestDetectAvailableFlows(t *testing.T) {
 			{
 				name:        "workload_identity keeps handler default user flow",
 				defaultFlow: string(auth.FlowWorkloadIdentity),
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
-				wantFirst:   auth.FlowDeviceCode,
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:   auth.FlowInteractive,
 			},
 			{
 				name:        "service_principal keeps handler default user flow",
 				defaultFlow: string(auth.FlowServicePrincipal),
-				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowDeviceCode, auth.FlowInteractive},
-				wantFirst:   auth.FlowDeviceCode,
+				wantOrder:   []auth.Flow{auth.FlowWorkloadIdentity, auth.FlowServicePrincipal, auth.FlowInteractive, auth.FlowDeviceCode},
+				wantFirst:   auth.FlowInteractive,
 			},
 		}
 

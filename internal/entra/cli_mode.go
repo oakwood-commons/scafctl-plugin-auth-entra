@@ -6,6 +6,8 @@ package entra
 import (
 	"context"
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -20,8 +22,13 @@ type cliMode struct {
 }
 
 // defaultLoginFlow is the flow used when no flow is specified and no
-// credentials or DefaultFlow config indicate otherwise.
-const defaultLoginFlow = auth.FlowDeviceCode
+// credentials or DefaultFlow config indicate otherwise. Interactive
+// (authorization code + PKCE) is the safer default than device code: its
+// code is bound to the local machine by the localhost redirect and PKCE,
+// while a device code is machine-independent and the flow most abused in
+// phishing. Headless environments fall back to device code via
+// interactiveLogin.
+const defaultLoginFlow = auth.FlowInteractive
 
 // preferredFlow returns the flow to use when the caller did not specify
 // one: config DefaultFlow when it names a user flow (interactive or device
@@ -47,7 +54,8 @@ func (p *Plugin) preferredFlow() auth.Flow {
 //  4. Explicit FlowInteractive -- authorization code + PKCE flow.
 //  5. Explicit FlowDeviceCode -- device code polling flow.
 //  6. Empty flow (no credentials detected) -- config DefaultFlow when it is
-//     interactive or device_code, otherwise the handler default (device code).
+//     interactive or device_code, otherwise the handler default (interactive;
+//     falls back to device code when no browser is available).
 func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
 	// Determine which flow to use with credential detection.
 	flow := req.Flow
@@ -67,7 +75,7 @@ func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceC
 	case auth.FlowServicePrincipal:
 		return m.p.servicePrincipalLogin(ctx, req)
 	case auth.FlowInteractive:
-		return m.p.authCodeLogin(ctx, req, deviceCodeCb)
+		return m.p.interactiveLogin(ctx, req, deviceCodeCb, req.Flow == "", browserUnavailableReason(runtime.GOOS, os.Getenv))
 	case auth.FlowDeviceCode:
 		return m.p.deviceCodeLogin(ctx, req, deviceCodeCb)
 	default:

@@ -72,6 +72,7 @@ type Plugin struct {
 	clock            clock.Clock
 	cachedHostClient *sdkplugin.HostServiceClient
 	openBrowser      BrowserOpenFunc
+	headlessReason   func() string
 	mode             mode
 }
 
@@ -173,6 +174,11 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 	// Initialize browser opener (can be overridden for testing)
 	if p.openBrowser == nil {
 		p.openBrowser = defaultBrowserOpener
+	}
+
+	// Initialize headless detection (can be overridden for testing)
+	if p.headlessReason == nil {
+		p.headlessReason = defaultHeadlessReason
 	}
 
 	// Default to CLI mode

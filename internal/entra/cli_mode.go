@@ -6,8 +6,6 @@ package entra
 import (
 	"context"
 	"fmt"
-	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -75,7 +73,7 @@ func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceC
 	case auth.FlowServicePrincipal:
 		return m.p.servicePrincipalLogin(ctx, req)
 	case auth.FlowInteractive:
-		return m.p.interactiveLogin(ctx, req, deviceCodeCb, req.Flow == "", browserUnavailableReason(runtime.GOOS, os.Getenv))
+		return m.p.interactiveLogin(ctx, req, deviceCodeCb, req.Flow == "", m.p.headlessReason())
 	case auth.FlowDeviceCode:
 		return m.p.deviceCodeLogin(ctx, req, deviceCodeCb)
 	default:
@@ -393,9 +391,13 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 	// pair so the preferred flow comes first: config DefaultFlow when
 	// set, otherwise the handler default. The host picks the first
 	// available entry, so this ordering decides the flow used when no
-	// --flow flag is passed. Workload identity and service principal
-	// entries stay ahead so detected credentials keep precedence over
-	// DefaultFlow.
+	// --flow flag is passed -- including for an implicit interactive
+	// default on a headless session: a headless (browserless) session
+	// reorders the pair to device code first, so the host resolves a
+	// no-flag login to device code instead of an auth-code flow that
+	// cannot complete. Workload identity and service principal entries
+	// stay ahead so detected credentials keep precedence over DefaultFlow.
+	// An explicit --flow interactive still runs the auth-code flow.
 	deviceCodeFlow := sdkplugin.FlowAvailability{
 		Flow:      auth.FlowDeviceCode,
 		Available: true,
@@ -406,9 +408,14 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 		Available: true,
 		Reason:    "interactive flow is always available",
 	}
-	if m.p.preferredFlow() == auth.FlowInteractive {
+	headlessReason := m.p.headlessReason()
+	if m.p.preferredFlow() == auth.FlowInteractive && headlessReason == "" {
 		flows = append(flows, interactiveFlow, deviceCodeFlow)
 	} else {
+		if headlessReason != "" {
+			interactiveFlow.Reason = "interactive flow requires a browser (" +
+				headlessReason + "); pass --flow interactive to force it"
+		}
 		flows = append(flows, deviceCodeFlow, interactiveFlow)
 	}
 

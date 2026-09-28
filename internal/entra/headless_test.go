@@ -61,12 +61,12 @@ func TestBrowserUnavailableReason(t *testing.T) {
 // flow, no env credentials, no config -> browser-based interactive flow.
 func TestImplicitLoginDefaultInteractive(t *testing.T) {
 	clearCredentialEnv(t)
-	// DISPLAY is set so cheap headless detection (Linux-only) cannot divert
-	// the implicit default on a headless CI runner.
-	t.Setenv("DISPLAY", ":0")
 
 	httpMock := NewMockHTTPClient()
 	p, _ := newTestPlugin(t, httpMock, nil)
+	// A browser is available for the up-front check; the callback probe
+	// drives the flow to its error.
+	p.headlessReason = func() string { return "" }
 	var gotPort string
 	p.openBrowser = func(_ context.Context, authURL string) error {
 		gotPort = probeCallback(t, authURL)
@@ -89,12 +89,12 @@ func TestImplicitLoginDefaultInteractive(t *testing.T) {
 // flow -> device code with a notice.
 func TestImplicitLoginBrowserFailureFallsBack(t *testing.T) {
 	clearCredentialEnv(t)
-	// Neutralize up-front headless detection; this test drives the
-	// browser-open failure path.
-	t.Setenv("DISPLAY", ":0")
 
 	httpMock := NewMockHTTPClient()
 	p, _ := newTestPlugin(t, httpMock, nil)
+	// Headless detection is quiet; this test drives the browser-open
+	// failure path.
+	p.headlessReason = func() string { return "" }
 	p.openBrowser = func(_ context.Context, _ string) error {
 		return errors.New("xdg-open: not found")
 	}
@@ -146,6 +146,8 @@ func TestExplicitInteractiveDoesNotFallBack(t *testing.T) {
 
 	httpMock := NewMockHTTPClient()
 	p, _ := newTestPlugin(t, httpMock, nil)
+	// Even a headless session must not divert an explicit flow.
+	p.headlessReason = func() string { return "no DISPLAY or WAYLAND_DISPLAY (headless session)" }
 	p.openBrowser = func(_ context.Context, _ string) error {
 		return errors.New("no browser")
 	}

@@ -6,6 +6,8 @@ package entra
 import (
 	"context"
 	"errors"
+	"os"
+	"runtime"
 
 	"github.com/go-logr/logr"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
@@ -15,6 +17,12 @@ import (
 // browser failed and the caller marked the browser as required, so the
 // caller can fall back to device code.
 var errBrowserUnavailable = errors.New("cannot open a browser")
+
+// defaultHeadlessReason reports why a browser cannot be opened on this
+// machine, or "" when one plausibly can.
+func defaultHeadlessReason() string {
+	return browserUnavailableReason(runtime.GOOS, os.Getenv)
+}
 
 // browserUnavailableReason reports why a browser cannot be opened, or ""
 // when one plausibly can. Only cheap environment signals are used: a

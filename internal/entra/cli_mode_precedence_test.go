@@ -51,6 +51,13 @@ func setWorkloadIdentityEnv(t *testing.T) {
 // the given flow and refresh-token expiry, mimicking what Login stores.
 func storeUserSession(t *testing.T, fake *fakeHostService, flow auth.Flow, expiresAt time.Time) {
 	t.Helper()
+	storeUserSessionWithID(t, fake, flow, expiresAt, "sess-1")
+}
+
+// storeUserSessionWithID is storeUserSession with an explicit session ID, so
+// tests can mimic a second login overwriting the stored session.
+func storeUserSessionWithID(t *testing.T, fake *fakeHostService, flow auth.Flow, expiresAt time.Time, sessionID string) {
+	t.Helper()
 	fake.secrets[SecretKeyRefreshToken] = "stored-refresh-token"
 	metadata := auth.HandlerMetadata{
 		Claims: &auth.Claims{
@@ -60,7 +67,7 @@ func storeUserSession(t *testing.T, fake *fakeHostService, flow auth.Flow, expir
 		ExpiresAt:     expiresAt,
 		LastRefresh:   time.Now(),
 		LastLoginFlow: flow,
-		SessionID:     "sess-1",
+		SessionID:     sessionID,
 		ClientID:      "stored-client",
 		Scopes:        []string{"openid", "profile", "offline_access"},
 	}
@@ -68,6 +75,12 @@ func storeUserSession(t *testing.T, fake *fakeHostService, flow auth.Flow, expir
 	metadataBytes, err := json.Marshal(metadata)
 	require.NoError(t, err)
 	fake.secrets[SecretKeyMetadata] = string(metadataBytes)
+}
+
+// userTokenCacheKey mirrors userSessionToken's cache key for a session.
+func userTokenCacheKey(p *Plugin, sessionID, scope string) string {
+	fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":" + sessionID)
+	return SecretKeyTokenPrefix + fp + ":" + scope
 }
 
 func TestCLICredentialPrecedenceStatus(t *testing.T) {
@@ -394,5 +407,64 @@ func TestCLIUserSessionIsolation(t *testing.T) {
 		status, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, err)
 		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
+	})
+
+	t.Run("earlier session's cached token is not served to a new session", func(t *testing.T) {
+		clearCredentialEnv(t)
+		httpClient := NewMockHTTPClient()
+		httpClient.AddResponse(200, TokenResponse{
+			AccessToken:  "user-b-access-token",
+			RefreshToken: "stored-refresh-token", // same token: no rotation
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+		p, fake := newTestPlugin(t, httpClient, nil)
+
+		// First user's session with a still-fresh cached token.
+		storeUserSessionWithID(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour), "session-a")
+		entryBytes, err := json.Marshal(tokenCacheEntry{
+			AccessToken: "user-a-access-token",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(1 * time.Hour),
+			Scope:       graphScope,
+			CachedAt:    time.Now(),
+			Flow:        auth.FlowInteractive,
+		})
+		require.NoError(t, err)
+		fake.secrets[userTokenCacheKey(p, "session-a", graphScope)] = string(entryBytes)
+
+		// Forced re-login overwrites the session; Login always generates a
+		// new session ID for the fresh session.
+		storeUserSessionWithID(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour), "session-b")
+
+		resp, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{Scope: graphScope})
+		require.NoError(t, err)
+		assert.Equal(t, "user-b-access-token", resp.AccessToken)
+
+		// The cache entry must have been bypassed, not served.
+		requests := httpClient.GetRequests()
+		require.Len(t, requests, 1)
+		assert.Equal(t, "refresh_token", requests[0].Data.Get("grant_type"))
+	})
+
+	t.Run("cached token is still served within the same session", func(t *testing.T) {
+		clearCredentialEnv(t)
+		p, fake := newTestPlugin(t, nil, nil)
+		storeUserSessionWithID(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour), "session-a")
+
+		entryBytes, err := json.Marshal(tokenCacheEntry{
+			AccessToken: "user-a-access-token",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(1 * time.Hour),
+			Scope:       graphScope,
+			CachedAt:    time.Now(),
+			Flow:        auth.FlowInteractive,
+		})
+		require.NoError(t, err)
+		fake.secrets[userTokenCacheKey(p, "session-a", graphScope)] = string(entryBytes)
+
+		resp, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: graphScope})
+		require.NoError(t, err)
+		assert.Equal(t, "user-a-access-token", resp.AccessToken)
 	})
 }

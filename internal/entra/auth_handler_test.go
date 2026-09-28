@@ -298,7 +298,7 @@ func TestGetToken(t *testing.T) {
 		t.Setenv(EnvAzureFederatedToken, "")
 
 		// Pre-populate cache
-		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":")
 		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "cached-access-token",
@@ -876,7 +876,7 @@ func TestGetGroups(t *testing.T) {
 		t.Setenv(EnvAzureFederatedToken, "")
 
 		// Pre-populate cache with a Graph token
-		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":")
 		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "graph-token",
@@ -924,7 +924,7 @@ func TestGetGroups(t *testing.T) {
 		t.Setenv(EnvAzureFederatedToken, "")
 
 		// Pre-populate cache
-		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":")
 		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "graph-token",
@@ -1290,7 +1290,7 @@ func TestProfileScopedTokenCache(t *testing.T) {
 		ctxWork := auth.WithProfile(ctx, "work")
 		ctxPersonal := auth.WithProfile(ctx, "personal")
 
-		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		fp := fingerprintHash("user:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority() + ":")
 		scope := "https://graph.microsoft.com/.default"
 
 		// Cache token under work profile

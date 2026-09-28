@@ -152,8 +152,8 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 // session after an explicit login even when AZURE_* env vars are set.
 func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
 	// Use the stored user session first when valid (highest priority)
-	if _, ok := m.p.validStoredUserSession(ctx); ok {
-		return m.userSessionToken(ctx, req)
+	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
+		return m.userSessionToken(ctx, req, metadata.SessionID)
 	}
 
 	// Use workload identity flow if credentials are present
@@ -169,12 +169,12 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 	// No environment credentials and no valid session: fall through to the
 	// session path, which reports the relevant error (missing scope, or
 	// not authenticated when refreshing fails).
-	return m.userSessionToken(ctx, req)
+	return m.userSessionToken(ctx, req, "")
 }
 
-// userSessionToken serves a token from the stored user session: cache
-// lookup first, then minting via the refresh token.
-func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
+// userSessionToken serves a token from the user session identified by
+// sessionID: cache lookup first, then minting via the refresh token.
+func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenRequest, sessionID string) (*sdkplugin.TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	scope := req.Scope
@@ -200,9 +200,11 @@ func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenReque
 	hostClient := m.p.hostClient(ctx)
 	prefix := m.p.tokenCachePrefix(ctx)
 	// "user:" keeps user-session entries apart from SP/WI entries that share
-	// the same client/tenant/authority (otherwise a cached machine token
-	// could be served in place of the user's).
-	fp := fingerprintHash("user:" + m.p.config.ClientID + ":" + m.p.config.TenantID + ":" + m.p.config.GetAuthority())
+	// the same client/tenant/authority, and the trailing sessionID keeps
+	// entries apart across stored sessions: each login gets a new session ID
+	// (refresh-token rotation reuses it), so a token cached for an earlier
+	// session is never served to a later one.
+	fp := fingerprintHash("user:" + m.p.config.ClientID + ":" + m.p.config.TenantID + ":" + m.p.config.GetAuthority() + ":" + sessionID)
 	fullKey := prefix + fp + ":" + qualifiedScope
 
 	// Check cache first (unless force refresh)

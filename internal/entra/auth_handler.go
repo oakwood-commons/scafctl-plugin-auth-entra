@@ -411,17 +411,16 @@ func (p *Plugin) binaryName() string {
 	return "scafctl"
 }
 
-// secretKey returns a profile-scoped secret key. It checks the context first
-// and falls back to the profile set during ConfigureAuthHandler. When no
-// profile is active, the key matches the legacy unscoped format for backward
-// compatibility. The profile name is hex-encoded to prevent dot-delimited
-// collisions (e.g. a profile named "prod.token" would otherwise overlap with
-// the token cache prefix for profile "prod").
+// secretKey returns a profile-scoped secret key. An empty context profile
+// always maps to the default (unscoped) key format: there is deliberately no
+// fallback to the profile configured during ConfigureAuthHandler, because the
+// host resolves the active profile before the gRPC call when the active
+// session is intended. A request arriving without a profile must act on the
+// unscoped session (issue #44). The profile name is hex-encoded to prevent
+// dot-delimited collisions (e.g. a profile named "prod.token" would otherwise
+// overlap with the token cache prefix for profile "prod").
 func (p *Plugin) secretKey(ctx context.Context, suffix string) string {
 	profile := auth.ProfileFromContext(ctx)
-	if profile == "" {
-		profile = p.cfg.Profile
-	}
 	if profile == "" {
 		return secretKeyBase + "." + suffix
 	}

@@ -165,12 +165,10 @@ scafctl auth token entra --scope "https://graph.microsoft.com/.default"
 scafctl auth logout entra
 ~~~
 
-Pass an explicit `--scope` for interactive login, e.g.
-`--scope "https://graph.microsoft.com/.default"` (`openid profile
-offline_access` are appended automatically so the response contains an ID
-token and a refresh token). Without one the authorize URL ships an empty
-resource scope and Entra rejects the login with `AADSTS900144` (the
-`scope` parameter is required).
+`openid profile offline_access` are always requested for interactive
+login, so the response contains an ID token and a refresh token. `--scope`
+is optional; pass one (e.g. `--scope "https://graph.microsoft.com/.default"`)
+only when the login should also consent to a specific API.
 
 ### Remote workspaces (paste-back login)
 

@@ -18,6 +18,11 @@ import (
 // caller can fall back to device code.
 var errBrowserUnavailable = errors.New("cannot open a browser")
 
+// errPromptUnavailable is returned by the auth-code flow when the host's
+// paste-back prompt failed on a login that depends on it (implicit and
+// headless), so the caller can fall back to device code.
+var errPromptUnavailable = errors.New("host paste-back prompt unavailable")
+
 // defaultHeadlessReason reports why a browser cannot be opened on this
 // machine, or "" when one plausibly can.
 func defaultHeadlessReason() string {
@@ -59,9 +64,13 @@ func (p *Plugin) interactiveLogin(ctx context.Context, req sdkplugin.LoginReques
 	// browser-open failure degrades to the prompt + wait instead of an
 	// abort; without it, browserRequired keeps the implicit fallback.
 	browserRequired := implicit && !pasteBack
-	resp, err := p.authCodeLogin(ctx, req, deviceCodeCb, browserRequired)
+	promptRequired := implicit && pasteBack && headlessReason != ""
+	resp, err := p.authCodeLogin(ctx, req, deviceCodeCb, browserRequired, promptRequired)
 	if implicit && errors.Is(err, errBrowserUnavailable) {
 		return p.deviceCodeFallback(ctx, req, deviceCodeCb, "opening the browser failed")
+	}
+	if errors.Is(err, errPromptUnavailable) {
+		return p.deviceCodeFallback(ctx, req, deviceCodeCb, headlessReason+"; host paste-back prompt failed")
 	}
 	return resp, err
 }

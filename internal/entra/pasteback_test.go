@@ -473,3 +473,25 @@ func TestPasteBackHeadlessDetectAvailableFlowsOrdering(t *testing.T) {
 		assert.Equal(t, auth.FlowDeviceCode, firstAvailableFlow(t, flows))
 	})
 }
+
+// TestPasteBackHeadlessPromptFailureFallsBack: a host that advertised
+// paste-back but whose prompt fails at runtime must not strand an implicit
+// headless login on the unreachable callback; it falls back to device code.
+func TestPasteBackHeadlessPromptFailureFallsBack(t *testing.T) {
+	clearCredentialEnv(t)
+
+	httpMock := NewMockHTTPClient()
+	p, fake := newTestPlugin(t, httpMock, nil)
+	advertisePasteBack(p)
+	p.openBrowser = func(_ context.Context, _ string) error { return nil }
+	fake.promptFunc = func(_ context.Context, _ *proto.PromptAuthResponseRequest) (string, error) {
+		return "", status.Error(codes.Unavailable, "host is non-interactive")
+	}
+
+	ctx, logLines := capturingLogger()
+	_, err := p.interactiveLogin(ctx, sdkplugin.LoginRequest{Timeout: time.Minute}, nil, true,
+		"no DISPLAY or WAYLAND_DISPLAY (headless session)")
+	require.Error(t, err) // no device code mock response configured
+	assert.Contains(t, err.Error(), "device_code_request")
+	assert.Contains(t, strings.Join(*logLines, "\n"), "falling back to device code")
+}

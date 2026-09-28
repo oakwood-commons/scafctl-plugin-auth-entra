@@ -29,7 +29,7 @@ func defaultBrowserOpener(ctx context.Context, u string) error {
 // flow with errBrowserUnavailable so the caller can fall back to device
 // code; otherwise the URL is shown for manual opening and the flow waits
 // for the callback as before.
-func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt), browserRequired bool) (*sdkplugin.LoginResponse, error) {
+func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt), browserRequired, promptRequired bool) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting authorization code + PKCE flow")
 
@@ -121,14 +121,23 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	// Older hosts return Unimplemented from the RPC itself and
 	// non-interactive hosts return Unavailable; both (and any other host
 	// error) are logged at debug and left undelivered so the select below
-	// keeps today's callback-only behavior.
+	// keeps today's callback-only behavior -- unless promptRequired (an
+	// implicit headless login that skipped device code because paste-back
+	// was advertised), where the callback is unreachable and a prompt
+	// failure is surfaced as errPromptUnavailable so the caller can fall
+	// back to device code instead of waiting out the timeout.
 	pasteCh := make(chan string, 1)
+	promptErrCh := make(chan error, 1)
 	promptCtx, cancelPrompt := context.WithCancel(ctx)
 	defer cancelPrompt()
 	if hostClient := p.hostClient(ctx); hostClient != nil {
 		go func() {
 			value, err := hostClient.PromptAuthResponse(promptCtx, HandlerName, authURL, redirectURI)
 			if err != nil {
+				if promptRequired {
+					promptErrCh <- err
+					return
+				}
 				logr.FromContextOrDiscard(promptCtx).V(1).Info("host paste-back prompt unavailable, waiting for callback only", "error", err)
 				return
 			}
@@ -160,6 +169,8 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 			return nil, err
 		}
 		lgr.V(1).Info("received pasted authorization response")
+	case promptErr := <-promptErrCh:
+		return nil, fmt.Errorf("entra: auth_code: %w: %w", errPromptUnavailable, promptErr)
 	case <-timer.C:
 		return nil, fmt.Errorf("entra: auth_code: no response received from browser within %s; "+
 			"if using a custom --client-id, ensure http://localhost is registered as a redirect URI "+

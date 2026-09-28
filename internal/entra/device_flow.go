@@ -45,12 +45,7 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 
 	// Ensure OIDC scopes are included so the response contains an ID token
 	// with user claims (preferred_username, name).
-	if p.config.ShouldInjectOIDCScopes() {
-		scopes = ensureOIDCScopes(scopes)
-	}
-
-	// Merge any additional scopes configured in the profile.
-	scopes = p.config.MergeAdditionalScopes(scopes)
+	scopes = ensureOIDCScopes(scopes)
 
 	// Determine timeout
 	timeout := req.Timeout

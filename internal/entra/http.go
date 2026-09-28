@@ -33,24 +33,37 @@ const (
 	defaultHTTPRetryWaitMax   = 10 * time.Second
 )
 
+// mergeHTTPClientDefaults returns the plugin's HTTP defaults as an
+// httpc.AppConfig with the host-forwarded settings (auth.entra.httpClient)
+// overlaid. Response caching and compression stay disabled for auth traffic
+// unless the forwarded config explicitly enables them.
+func mergeHTTPClientDefaults(cfg *httpc.AppConfig) *httpc.AppConfig {
+	base := &httpc.AppConfig{
+		Timeout:           defaultHTTPTimeout.String(),
+		RetryMax:          defaultHTTPRetryMax,
+		RetryWaitMin:      defaultHTTPRetryWaitFloor.String(),
+		RetryWaitMax:      defaultHTTPRetryWaitMax.String(),
+		EnableCache:       boolPtr(false),
+		EnableCompression: boolPtr(false),
+	}
+	return httpc.MergeAppConfig(base, cfg)
+}
+
+func boolPtr(b bool) *bool { return &b }
+
 // DefaultGraphClient implements GraphClient using httpc.
 type DefaultGraphClient struct {
 	client *httpc.Client
 }
 
-// NewDefaultGraphClient creates a new Graph API HTTP client.
-func NewDefaultGraphClient(logger logr.Logger) *DefaultGraphClient {
-	return &DefaultGraphClient{
-		client: httpc.NewClient(&httpc.ClientConfig{
-			Timeout:           defaultHTTPTimeout,
-			RetryMax:          defaultHTTPRetryMax,
-			RetryWaitMin:      defaultHTTPRetryWaitFloor,
-			RetryWaitMax:      defaultHTTPRetryWaitMax,
-			EnableCache:       false,
-			EnableCompression: false,
-			Logger:            logger,
-		}),
+// NewDefaultGraphClient creates a new Graph API HTTP client. Forwarded
+// auth.entra.httpClient settings overlay the plugin defaults; nil keeps them.
+func NewDefaultGraphClient(cfg *httpc.AppConfig, logger logr.Logger) (*DefaultGraphClient, error) {
+	client, err := httpc.NewClientFromAppConfig(mergeHTTPClientDefaults(cfg), logger)
+	if err != nil {
+		return nil, err
 	}
+	return &DefaultGraphClient{client: client}, nil
 }
 
 // Get performs an authenticated GET request against the Microsoft Graph API.
@@ -70,18 +83,14 @@ type DefaultHTTPClient struct {
 }
 
 // NewDefaultHTTPClient creates a new default HTTP client backed by httpc.
-func NewDefaultHTTPClient(logger logr.Logger) *DefaultHTTPClient {
-	return &DefaultHTTPClient{
-		client: httpc.NewClient(&httpc.ClientConfig{
-			Timeout:           defaultHTTPTimeout,
-			RetryMax:          defaultHTTPRetryMax,
-			RetryWaitMin:      defaultHTTPRetryWaitFloor,
-			RetryWaitMax:      defaultHTTPRetryWaitMax,
-			EnableCache:       false,
-			EnableCompression: false,
-			Logger:            logger,
-		}),
+// Forwarded auth.entra.httpClient settings overlay the plugin defaults; nil
+// keeps them.
+func NewDefaultHTTPClient(cfg *httpc.AppConfig, logger logr.Logger) (*DefaultHTTPClient, error) {
+	client, err := httpc.NewClientFromAppConfig(mergeHTTPClientDefaults(cfg), logger)
+	if err != nil {
+		return nil, err
 	}
+	return &DefaultHTTPClient{client: client}, nil
 }
 
 // PostForm performs a POST request with form-encoded data.

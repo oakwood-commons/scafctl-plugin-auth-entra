@@ -135,7 +135,7 @@ func buildServerMode(ctx context.Context, sc *ServerConfig, opts *ServerModeOpti
 	}
 
 	// Server flow — always client_credentials grant
-	strategies[auth.ServerContextServer] = cachedFlow(clientCredentialFlow(tokenURL, cred, httpClient), mgr, clientCredentialCacheKeyGenerator, nil, hooks)
+	strategies[auth.ServerContextServer] = cachedFlow(clientCredentialFlow(tokenURL, cred, httpClient, sc.ServerFlow), mgr, clientCredentialCacheKeyGenerator, nil, hooks)
 
 	// Delegated flows — dispatches by CallerType internally
 	if sc.Delegated != nil {
@@ -147,13 +147,13 @@ func buildServerMode(ctx context.Context, sc *ServerConfig, opts *ServerModeOpti
 				userFlow = cachedFlow(oboFlow(tokenURL, cred, httpClient), mgr, oboCacheKeyGenerator, nil, hooks)
 			} else {
 				// Must match server flow (validated earlier)
-				userFlow = cachedFlow(clientCredentialFlow(tokenURL, cred, httpClient), mgr, clientCredentialCacheKeyGenerator, nil, hooks)
+				userFlow = cachedFlow(clientCredentialFlow(tokenURL, cred, httpClient, sc.ServerFlow), mgr, clientCredentialCacheKeyGenerator, nil, hooks)
 			}
 		}
 
 		// Machine delegation — always uses server flow (cached)
 		if sc.Delegated.Machine {
-			machineFlow = cachedFlow(clientCredentialFlow(tokenURL, cred, httpClient), mgr, clientCredentialCacheKeyGenerator, nil, hooks)
+			machineFlow = cachedFlow(clientCredentialFlow(tokenURL, cred, httpClient, sc.ServerFlow), mgr, clientCredentialCacheKeyGenerator, nil, hooks)
 		}
 
 		strategies[auth.ServerContextDelegated] = delegatedDispatch(userFlow, machineFlow)

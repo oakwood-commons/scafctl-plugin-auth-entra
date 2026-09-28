@@ -66,7 +66,10 @@ func GetWorkloadIdentityCredentials() *WorkloadIdentityCredentials {
 		return nil
 	}
 
-	authority := os.Getenv(EnvAzureAuthorityHost)
+	// Trim any trailing slash: workload identity webhooks commonly inject
+	// e.g. https://login.microsoftonline.com/, which would otherwise
+	// produce a double slash in the token URL.
+	authority := strings.TrimRight(os.Getenv(EnvAzureAuthorityHost), "/")
 	if authority == "" {
 		authority = DefaultAuthority
 	}
@@ -96,7 +99,9 @@ func (p *Plugin) resolveWorkloadIdentityCredentials() *WorkloadIdentityCredentia
 	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
 	tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
 	directToken := p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
-	authority := p.profileOrEnv(p.config.Authority, "authority", EnvAzureAuthorityHost)
+	// See GetWorkloadIdentityCredentials: trim trailing slash from the
+	// authority so injected values do not yield a double slash downstream.
+	authority := strings.TrimRight(p.profileOrEnv(p.config.Authority, "authority", EnvAzureAuthorityHost), "/")
 	if authority == "" {
 		authority = DefaultAuthority
 	}
@@ -193,6 +198,12 @@ func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginR
 
 	// Use a default scope if none provided, qualifying bare names the same way
 	// getWorkloadIdentityToken does so login validation behaves consistently.
+	// The client credentials grant targets a single resource, so more than one
+	// requested scope is rejected rather than silently dropped after the first.
+	if len(req.Scopes) > 1 {
+		return nil, fmt.Errorf("workload identity login accepts a single scope, got %d: %s",
+			len(req.Scopes), strings.Join(req.Scopes, " "))
+	}
 	scope := "https://management.azure.com/.default"
 	if len(req.Scopes) > 0 {
 		scope = QualifyScope(req.Scopes[0])
@@ -376,5 +387,7 @@ func (p *Plugin) workloadIdentityStatus() (*auth.Status, error) {
 		TenantID:     creds.TenantID,
 		IdentityType: auth.IdentityTypeWorkloadIdentity,
 		ClientID:     creds.ClientID,
+		TokenFile:    creds.TokenFile,
+		Flow:         auth.FlowWorkloadIdentity,
 	}, nil
 }

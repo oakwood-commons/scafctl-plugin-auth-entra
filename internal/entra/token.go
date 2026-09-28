@@ -96,6 +96,8 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 			return nil, &ClaimsChallengeError{
 				Claims: errResp.Claims,
 				Scope:  scope,
+				Hint: fmt.Sprintf("re-run '%s auth login entra --flow interactive --force' "+
+					"to complete the required step-up authentication", p.binaryName()),
 			}
 		}
 

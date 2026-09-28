@@ -64,13 +64,14 @@ func (p *Plugin) interactiveLogin(ctx context.Context, req sdkplugin.LoginReques
 	// browser-open failure degrades to the prompt + wait instead of an
 	// abort; without it, browserRequired keeps the implicit fallback.
 	browserRequired := implicit && !pasteBack
-	promptRequired := implicit && pasteBack && headlessReason != ""
-	resp, err := p.authCodeLogin(ctx, req, deviceCodeCb, browserRequired, promptRequired)
+	pasteFallback := implicit && pasteBack
+	promptRequired := pasteFallback && headlessReason != ""
+	resp, err := p.authCodeLogin(ctx, req, deviceCodeCb, browserRequired, promptRequired, pasteFallback)
 	if implicit && errors.Is(err, errBrowserUnavailable) {
 		return p.deviceCodeFallback(ctx, req, deviceCodeCb, "opening the browser failed")
 	}
 	if errors.Is(err, errPromptUnavailable) {
-		return p.deviceCodeFallback(ctx, req, deviceCodeCb, headlessReason+"; host paste-back prompt failed")
+		return p.deviceCodeFallback(ctx, req, deviceCodeCb, "host paste-back prompt failed and no callback can arrive")
 	}
 	return resp, err
 }

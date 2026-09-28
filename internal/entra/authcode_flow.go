@@ -29,7 +29,7 @@ func defaultBrowserOpener(ctx context.Context, u string) error {
 // flow with errBrowserUnavailable so the caller can fall back to device
 // code; otherwise the URL is shown for manual opening and the flow waits
 // for the callback as before.
-func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt), browserRequired, promptRequired bool) (*sdkplugin.LoginResponse, error) {
+func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt), browserRequired, promptRequired, pasteFallback bool) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting authorization code + PKCE flow")
 
@@ -126,6 +126,9 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	// was advertised), where the callback is unreachable and a prompt
 	// failure is surfaced as errPromptUnavailable so the caller can fall
 	// back to device code instead of waiting out the timeout.
+	// pasteFallback (implicit login, paste-back advertised) also requires
+	// the prompt once the browser failed to open: no callback can arrive.
+	promptRequired = promptRequired || (pasteFallback && browserOpenErr != nil)
 	pasteCh := make(chan string, 1)
 	promptErrCh := make(chan error, 1)
 	promptCtx, cancelPrompt := context.WithCancel(ctx)
@@ -178,6 +181,9 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	case <-ctx.Done():
 		return nil, fmt.Errorf("entra: auth_code: authentication cancelled")
 	}
+	// Release the host prompt now rather than after the token exchange,
+	// so a late paste is not accepted and then discarded.
+	cancelPrompt()
 
 	// Exchange authorization code for tokens
 	tokenResp, err := p.exchangeAuthCode(ctx, tenantID, authCode, redirectURI, codeVerifier)

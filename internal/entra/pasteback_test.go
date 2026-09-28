@@ -423,6 +423,27 @@ func TestPasteBackHeadlessWithoutSupportKeepsFallback(t *testing.T) {
 	assert.Contains(t, strings.Join(*logLines, "\n"), "falling back to device code")
 }
 
+// TestPasteBackBrowserAndPromptFailureFallsBack: with a display detected,
+// an implicit login whose browser open AND paste prompt both fail has no
+// way to receive a code, so it falls back to device code.
+func TestPasteBackBrowserAndPromptFailureFallsBack(t *testing.T) {
+	clearCredentialEnv(t)
+
+	httpMock := NewMockHTTPClient()
+	p, fake := newTestPlugin(t, httpMock, nil)
+	advertisePasteBack(p)
+	p.openBrowser = func(_ context.Context, _ string) error { return errors.New("no opener") }
+	fake.promptFunc = func(_ context.Context, _ *proto.PromptAuthResponseRequest) (string, error) {
+		return "", status.Error(codes.Unavailable, "host is non-interactive")
+	}
+
+	ctx, logLines := capturingLogger()
+	_, err := p.interactiveLogin(ctx, sdkplugin.LoginRequest{Timeout: time.Minute}, nil, true, "")
+	require.Error(t, err) // no device code mock response configured
+	assert.Contains(t, err.Error(), "device_code_request")
+	assert.Contains(t, strings.Join(*logLines, "\n"), "falling back to device code")
+}
+
 // TestPasteBackHeadlessDetectAvailableFlowsOrdering covers acceptance
 // criterion 6's host-facing half: with host support, interactive stays
 // first in the flow list even on headless sessions; an explicit device_code

@@ -82,8 +82,28 @@ func (m *cliMode) Logout(ctx context.Context) error {
 }
 
 // GetStatus returns the current authentication status in CLI mode.
+//
+// Credential precedence: a valid stored user session (interactive or
+// device-code login) wins over ambient environment credentials, because an
+// explicit user login is a stronger signal of intent than AZURE_* env vars.
+// `auth logout entra` clears the stored session and restores env-credential
+// behavior.
 func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
-	// Check for workload identity credentials first (highest priority)
+	// Check for a valid stored user session first (highest priority)
+	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
+		return &auth.Status{
+			Authenticated: true,
+			Claims:        metadata.Claims,
+			ExpiresAt:     metadata.ExpiresAt,
+			LastRefresh:   metadata.LastRefresh,
+			TenantID:      metadata.MetaString(MetaKeyTenantID),
+			IdentityType:  auth.IdentityTypeUser,
+			ClientID:      metadata.ClientID,
+			Scopes:        metadata.Scopes,
+		}, nil
+	}
+
+	// Check for workload identity credentials
 	if m.p.hasWorkloadIdentityCredentials() {
 		return m.p.workloadIdentityStatus()
 	}
@@ -126,10 +146,17 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 }
 
 // GetToken returns a valid access token in CLI mode, refreshing if necessary.
+//
+// Credential precedence mirrors GetStatus: a valid stored user session wins
+// over ambient environment credentials, so `auth token` serves the user
+// session after an explicit login even when AZURE_* env vars are set.
 func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
-	lgr := logr.FromContextOrDiscard(ctx)
+	// Use the stored user session first when valid (highest priority)
+	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
+		return m.userSessionToken(ctx, req, metadata.SessionID)
+	}
 
-	// Use workload identity flow if credentials are present (highest priority)
+	// Use workload identity flow if credentials are present
 	if m.p.hasWorkloadIdentityCredentials() {
 		return m.p.getWorkloadIdentityToken(ctx, req)
 	}
@@ -138,6 +165,17 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 	if m.p.hasServicePrincipalCredentials() {
 		return m.p.getServicePrincipalToken(ctx, req)
 	}
+
+	// No environment credentials and no valid session: fall through to the
+	// session path, which reports the relevant error (missing scope, or
+	// not authenticated when refreshing fails).
+	return m.userSessionToken(ctx, req, "")
+}
+
+// userSessionToken serves a token from the user session identified by
+// sessionID: cache lookup first, then minting via the refresh token.
+func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenRequest, sessionID string) (*sdkplugin.TokenResponse, error) {
+	lgr := logr.FromContextOrDiscard(ctx)
 
 	scope := req.Scope
 	if scope == "" {
@@ -161,7 +199,12 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 
 	hostClient := m.p.hostClient(ctx)
 	prefix := m.p.tokenCachePrefix(ctx)
-	fp := fingerprintHash(m.p.config.ClientID + ":" + m.p.config.TenantID + ":" + m.p.config.GetAuthority())
+	// "user:" keeps user-session entries apart from SP/WI entries that share
+	// the same client/tenant/authority, and the trailing sessionID keeps
+	// entries apart across stored sessions: each login gets a new session ID
+	// (refresh-token rotation reuses it), so a token cached for an earlier
+	// session is never served to a later one.
+	fp := fingerprintHash("user:" + m.p.config.ClientID + ":" + m.p.config.TenantID + ":" + m.p.config.GetAuthority() + ":" + sessionID)
 	fullKey := prefix + fp + ":" + qualifiedScope
 
 	// Check cache first (unless force refresh)

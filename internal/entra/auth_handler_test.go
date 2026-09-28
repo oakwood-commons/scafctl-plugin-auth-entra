@@ -91,7 +91,6 @@ func TestConfigureAuthHandler(t *testing.T) {
 		assert.NotNil(t, p.graphClient)
 		assert.NotNil(t, p.clock)
 		assert.NotNil(t, p.openBrowser)
-		assert.NotNil(t, p.oboCache)
 	})
 
 	t.Run("unknown handler", func(t *testing.T) {
@@ -202,10 +201,11 @@ func TestGetStatus(t *testing.T) {
 				Subject: "testuser",
 				Name:    "Test User",
 			},
-			ExpiresAt:   time.Now().Add(24 * time.Hour),
-			LastRefresh: time.Now(),
-			ClientID:    "test-client",
-			Scopes:      []string{"openid"},
+			ExpiresAt:     time.Now().Add(24 * time.Hour),
+			LastRefresh:   time.Now(),
+			ClientID:      "test-client",
+			Scopes:        []string{"openid"},
+			LastLoginFlow: auth.FlowDeviceCode,
 		}
 		metadata.SetMeta(MetaKeyTenantID, "test-tenant")
 		metadataBytes, _ := json.Marshal(metadata)
@@ -217,6 +217,7 @@ func TestGetStatus(t *testing.T) {
 		assert.Equal(t, "testuser", status.Claims.Subject)
 		assert.Equal(t, "test-tenant", status.TenantID)
 		assert.Equal(t, auth.IdentityTypeUser, status.IdentityType)
+		assert.Equal(t, auth.FlowDeviceCode, status.Flow)
 	})
 
 	t.Run("not authenticated with expired refresh token", func(t *testing.T) {
@@ -744,6 +745,14 @@ func TestClaimsChallenge(t *testing.T) {
 	t.Run("error string", func(t *testing.T) {
 		err := &ClaimsChallengeError{Claims: "test", Scope: "test-scope"}
 		assert.Contains(t, err.Error(), "test-scope")
+		assert.NotContains(t, err.Error(), "Hint:")
+	})
+
+	t.Run("error string includes hint when set", func(t *testing.T) {
+		err := &ClaimsChallengeError{Claims: "test", Scope: "test-scope", Hint: "re-run login"}
+		msg := err.Error()
+		assert.Contains(t, msg, "test-scope")
+		assert.Contains(t, msg, "Hint: re-run login")
 	})
 }
 
@@ -985,6 +994,31 @@ func TestWorkloadIdentityCredentials(t *testing.T) {
 		t.Setenv(EnvAzureFederatedTokenFile, "")
 		assert.True(t, HasWorkloadIdentityCredentials())
 	})
+
+	t.Run("trims trailing slash from authority host", func(t *testing.T) {
+		t.Setenv(EnvAzureClientID, "client")
+		t.Setenv(EnvAzureTenantID, "tenant")
+		t.Setenv(EnvAzureFederatedToken, "direct-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureAuthorityHost, "https://login.microsoftonline.com/")
+
+		creds := GetWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "https://login.microsoftonline.com", creds.Authority)
+	})
+
+	t.Run("trims trailing slash from config-resolved authority", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		t.Setenv(EnvAzureClientID, "client")
+		t.Setenv(EnvAzureTenantID, "tenant")
+		t.Setenv(EnvAzureFederatedToken, "direct-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureAuthorityHost, "https://login.microsoftonline.com//")
+
+		creds := p.resolveWorkloadIdentityCredentials()
+		require.NotNil(t, creds)
+		assert.Equal(t, "https://login.microsoftonline.com", creds.Authority)
+	})
 }
 
 func TestMockHTTPClient(t *testing.T) {
@@ -1032,16 +1066,6 @@ func TestMockGraphClient(t *testing.T) {
 
 	require.Len(t, mock.Requests, 1)
 	assert.Equal(t, "bearer-tok", mock.Requests[0].BearerToken)
-}
-
-func TestOBOCacheKey(t *testing.T) {
-	k1 := oboCacheKey("token1", "scope1")
-	k2 := oboCacheKey("token1", "scope2")
-	k3 := oboCacheKey("token1", "scope1")
-
-	assert.Equal(t, k1, k3)
-	assert.NotEqual(t, k1, k2)
-	assert.Len(t, k1, 64)
 }
 
 func TestHostClientFallbackToContext(t *testing.T) {

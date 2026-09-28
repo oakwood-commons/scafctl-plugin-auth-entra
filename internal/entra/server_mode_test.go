@@ -138,11 +138,12 @@ func TestExecuteTokenRequest(t *testing.T) {
 
 		client := newTestHTTPClient(ts)
 		data := url.Values{"grant_type": {"client_credentials"}, "scope": {"https://graph.microsoft.com/.default"}}
-		resp, err := executeTokenRequest(context.Background(), client, ts.URL, data)
+		resp, err := executeTokenRequest(context.Background(), client, ts.URL, data, auth.FlowClientCredentials)
 		require.NoError(t, err)
 		assert.Equal(t, "access-token-123", resp.AccessToken)
 		assert.Equal(t, "Bearer", resp.TokenType)
 		assert.Equal(t, "https://graph.microsoft.com/.default", resp.Scope)
+		assert.Equal(t, auth.FlowClientCredentials, resp.Flow)
 		assert.False(t, resp.ExpiresAt.IsZero())
 	})
 
@@ -159,7 +160,7 @@ func TestExecuteTokenRequest(t *testing.T) {
 
 		client := newTestHTTPClient(ts)
 		data := url.Values{"grant_type": {"client_credentials"}}
-		_, err := executeTokenRequest(context.Background(), client, ts.URL, data)
+		_, err := executeTokenRequest(context.Background(), client, ts.URL, data, auth.FlowClientCredentials)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid_grant")
 		assert.Contains(t, err.Error(), "The provided grant is invalid.")
@@ -174,7 +175,7 @@ func TestExecuteTokenRequest(t *testing.T) {
 
 		client := newTestHTTPClient(ts)
 		data := url.Values{"grant_type": {"client_credentials"}}
-		_, err := executeTokenRequest(context.Background(), client, ts.URL, data)
+		_, err := executeTokenRequest(context.Background(), client, ts.URL, data, auth.FlowClientCredentials)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "token request failed with HTTP 500")
 	})
@@ -192,7 +193,7 @@ func TestExecuteTokenRequest(t *testing.T) {
 
 		client := newTestHTTPClient(ts)
 		data := url.Values{"grant_type": {"client_credentials"}}
-		_, err := executeTokenRequest(context.Background(), client, ts.URL, data)
+		_, err := executeTokenRequest(context.Background(), client, ts.URL, data, auth.FlowClientCredentials)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "token response missing access_token")
 	})
@@ -204,7 +205,7 @@ func TestExecuteTokenRequest(t *testing.T) {
 
 		client := newTestHTTPClient(ts)
 		data := url.Values{"grant_type": {"client_credentials"}}
-		_, err := executeTokenRequest(context.Background(), client, ts.URL, data)
+		_, err := executeTokenRequest(context.Background(), client, ts.URL, data, auth.FlowClientCredentials)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "token request failed")
 	})
@@ -238,6 +239,7 @@ func TestOboFlow(t *testing.T) {
 		assert.Equal(t, "obo-token", resp.AccessToken)
 		assert.Equal(t, "Bearer", resp.TokenType)
 		assert.Equal(t, "api://downstream/.default", resp.Scope)
+		assert.Equal(t, auth.FlowOnBehalfOf, resp.Flow)
 
 		// Assert form params
 		assert.Equal(t, OBOGrantType, receivedForm.Get("grant_type"))
@@ -319,6 +321,7 @@ func TestClientCredentialFlow(t *testing.T) {
 		assert.Equal(t, "cc-token", resp.AccessToken)
 		assert.Equal(t, "Bearer", resp.TokenType)
 		assert.Equal(t, "https://graph.microsoft.com/.default", resp.Scope)
+		assert.Equal(t, auth.FlowClientCredentials, resp.Flow)
 
 		// Assert form params
 		assert.Equal(t, "client_credentials", receivedForm.Get("grant_type"))

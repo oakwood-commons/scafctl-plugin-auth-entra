@@ -98,6 +98,12 @@ func (p *Plugin) servicePrincipalLogin(ctx context.Context, req sdkplugin.LoginR
 
 	// Use a default scope if none provided, qualifying bare names the same way
 	// getServicePrincipalToken does so login validation behaves consistently.
+	// The client credentials grant targets a single resource, so more than one
+	// requested scope is rejected rather than silently dropped after the first.
+	if len(req.Scopes) > 1 {
+		return nil, fmt.Errorf("service principal login accepts a single scope, got %d: %s",
+			len(req.Scopes), strings.Join(req.Scopes, " "))
+	}
 	scope := "https://graph.microsoft.com/.default"
 	if len(req.Scopes) > 0 {
 		scope = QualifyScope(req.Scopes[0])
@@ -278,5 +284,6 @@ func (p *Plugin) servicePrincipalStatus() (*auth.Status, error) {
 		TenantID:     creds.TenantID,
 		IdentityType: auth.IdentityTypeServicePrincipal,
 		ClientID:     creds.ClientID,
+		Flow:         auth.FlowServicePrincipal,
 	}, nil
 }

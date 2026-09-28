@@ -29,7 +29,18 @@ type FlowParams struct {
 	MinValidFor  time.Duration   // skip cached entries expiring sooner than this
 }
 
+// OBO grant type and constants (server-mode OBO flow).
+const (
+	// OBOGrantType is the OAuth 2.0 grant type for On-Behalf-Of flow.
+	OBOGrantType = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+
+	// OBORequestedTokenUse is the required parameter for OBO requests.
+	OBORequestedTokenUse = "on_behalf_of"
+)
+
 // oboFlow returns a FlowFn that performs the On-Behalf-Of token exchange.
+// Responses carry auth.FlowOnBehalfOf so callers can tell how the token
+// was acquired.
 func oboFlow(tokenURL string, cred ServerCredential, httpClient HTTPClient) FlowFn {
 	return func(ctx context.Context, params FlowParams) (*sdkplugin.TokenResponse, error) {
 		data := url.Values{
@@ -42,11 +53,13 @@ func oboFlow(tokenURL string, cred ServerCredential, httpClient HTTPClient) Flow
 		if err := cred.Apply(data); err != nil {
 			return nil, fmt.Errorf("applying server credential: %w", err)
 		}
-		return executeTokenRequest(ctx, httpClient, tokenURL, data)
+		return executeTokenRequest(ctx, httpClient, tokenURL, data, auth.FlowOnBehalfOf)
 	}
 }
 
 // clientCredentialFlow returns a FlowFn that performs the client_credentials grant.
+// Responses carry auth.FlowClientCredentials so callers can tell how the token
+// was acquired.
 func clientCredentialFlow(tokenURL string, cred ServerCredential, httpClient HTTPClient) FlowFn {
 	return func(ctx context.Context, params FlowParams) (*sdkplugin.TokenResponse, error) {
 		data := url.Values{
@@ -57,12 +70,13 @@ func clientCredentialFlow(tokenURL string, cred ServerCredential, httpClient HTT
 		if err := cred.Apply(data); err != nil {
 			return nil, fmt.Errorf("applying server credential: %w", err)
 		}
-		return executeTokenRequest(ctx, httpClient, tokenURL, data)
+		return executeTokenRequest(ctx, httpClient, tokenURL, data, auth.FlowClientCredentials)
 	}
 }
 
-// executeTokenRequest posts form data to the token endpoint and parses the response.
-func executeTokenRequest(ctx context.Context, httpClient HTTPClient, tokenURL string, data url.Values) (*sdkplugin.TokenResponse, error) {
+// executeTokenRequest posts form data to the token endpoint and parses the
+// response. The response is tagged with the flow that acquired it.
+func executeTokenRequest(ctx context.Context, httpClient HTTPClient, tokenURL string, data url.Values, flow auth.Flow) (*sdkplugin.TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	resp, err := httpClient.PostForm(ctx, tokenURL, data)
@@ -103,6 +117,7 @@ func executeTokenRequest(ctx context.Context, httpClient HTTPClient, tokenURL st
 		TokenType:   tokenResp.TokenType,
 		ExpiresAt:   expiresAt,
 		Scope:       data.Get("scope"),
+		Flow:        flow,
 	}, nil
 }
 

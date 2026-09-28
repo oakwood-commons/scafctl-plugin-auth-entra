@@ -100,6 +100,8 @@ func TestMintToken(t *testing.T) {
 		var ccErr *ClaimsChallengeError
 		assert.ErrorAs(t, err, &ccErr)
 		assert.Equal(t, "scope", ccErr.Scope)
+		// Remediation hint names the interactive re-login command.
+		assert.Contains(t, ccErr.Error(), "auth login entra --flow interactive --force")
 	})
 
 	t.Run("invalid_grant triggers logout", func(t *testing.T) {
@@ -493,6 +495,46 @@ func TestServicePrincipalLogin(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "not authorized")
 	})
+
+	t.Run("SP login rejects more than one scope", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		t.Setenv(EnvAzureClientID, "sp-client-id")
+		t.Setenv(EnvAzureTenantID, "sp-tenant-id")
+		t.Setenv(EnvAzureClientSecret, "sp-secret")
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:   auth.FlowServicePrincipal,
+			Scopes: []string{"https://graph.microsoft.com/.default", "https://management.azure.com/.default"},
+		}, nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "single scope")
+		assert.Contains(t, err.Error(), "2")
+	})
+
+	t.Run("SP login accepts single scope", func(t *testing.T) {
+		httpMock := NewMockHTTPClient()
+		httpMock.AddResponse(200, TokenResponse{
+			AccessToken: "sp-at",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+
+		p, _ := newTestPlugin(t, httpMock, nil)
+		t.Setenv(EnvAzureClientID, "sp-client-id")
+		t.Setenv(EnvAzureTenantID, "sp-tenant-id")
+		t.Setenv(EnvAzureClientSecret, "sp-secret")
+
+		resp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:   auth.FlowServicePrincipal,
+			Scopes: []string{"https://management.azure.com/.default"},
+		}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "sp-client-id", resp.Claims.Subject)
+
+		reqs := httpMock.GetRequests()
+		require.Len(t, reqs, 1)
+		assert.Equal(t, "https://management.azure.com/.default", reqs[0].Data.Get("scope"))
+	})
 }
 
 // --- service principal token ---
@@ -633,6 +675,49 @@ func TestWorkloadIdentityLogin(t *testing.T) {
 		require.Len(t, reqs, 1)
 		assert.Equal(t, "direct-federated-token", reqs[0].Data.Get("client_assertion"))
 	})
+
+	t.Run("WI login rejects more than one scope", func(t *testing.T) {
+		p, _ := newTestPlugin(t, nil, nil)
+		t.Setenv(EnvAzureClientID, "wi-client")
+		t.Setenv(EnvAzureTenantID, "wi-tenant")
+		t.Setenv(EnvAzureFederatedToken, "direct-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureClientSecret, "")
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:   auth.FlowWorkloadIdentity,
+			Scopes: []string{"https://management.azure.com/.default", "https://graph.microsoft.com/.default"},
+		}, nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "single scope")
+		assert.Contains(t, err.Error(), "2")
+	})
+
+	t.Run("WI login accepts single scope", func(t *testing.T) {
+		httpMock := NewMockHTTPClient()
+		httpMock.AddResponse(200, TokenResponse{
+			AccessToken: "wi-at",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+
+		p, _ := newTestPlugin(t, httpMock, nil)
+		t.Setenv(EnvAzureClientID, "wi-client")
+		t.Setenv(EnvAzureTenantID, "wi-tenant")
+		t.Setenv(EnvAzureFederatedToken, "direct-token")
+		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureClientSecret, "")
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:   auth.FlowWorkloadIdentity,
+			Scopes: []string{"https://graph.microsoft.com/.default"},
+		}, nil)
+		require.NoError(t, err)
+
+		reqs := httpMock.GetRequests()
+		require.Len(t, reqs, 1)
+		assert.Equal(t, "https://graph.microsoft.com/.default", reqs[0].Data.Get("scope"))
+	})
 }
 
 func TestGetWorkloadIdentityToken(t *testing.T) {
@@ -675,11 +760,15 @@ func TestGetWorkloadIdentityToken(t *testing.T) {
 
 func TestWorkloadIdentityStatus(t *testing.T) {
 	t.Run("authenticated with credentials", func(t *testing.T) {
+		dir := t.TempDir()
+		tokenFile := filepath.Join(dir, "token")
+		require.NoError(t, os.WriteFile(tokenFile, []byte("federated"), 0o600))
+
 		p, _ := newTestPlugin(t, nil, nil)
 		t.Setenv(EnvAzureClientID, "wi-client-id")
 		t.Setenv(EnvAzureTenantID, "wi-tenant-id")
-		t.Setenv(EnvAzureFederatedToken, "tok")
-		t.Setenv(EnvAzureFederatedTokenFile, "")
+		t.Setenv(EnvAzureFederatedTokenFile, tokenFile)
+		t.Setenv(EnvAzureFederatedToken, "")
 		t.Setenv(EnvAzureClientSecret, "")
 
 		status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
@@ -687,149 +776,12 @@ func TestWorkloadIdentityStatus(t *testing.T) {
 		assert.True(t, status.Authenticated)
 		assert.Equal(t, auth.IdentityTypeWorkloadIdentity, status.IdentityType)
 		assert.Equal(t, "wi-client-id", status.ClientID)
+		assert.Equal(t, auth.FlowWorkloadIdentity, status.Flow)
+		assert.Equal(t, tokenFile, status.TokenFile)
 	})
 }
 
-// --- OBO flow tests ---
-
-func TestOBOFlow(t *testing.T) {
-	t.Run("successful OBO token", func(t *testing.T) {
-		httpMock := NewMockHTTPClient()
-		httpMock.AddResponse(200, TokenResponse{
-			AccessToken: "obo-access-token",
-			TokenType:   "Bearer",
-			ExpiresIn:   3600,
-		})
-
-		p, _ := newTestPlugin(t, httpMock, nil)
-
-		token, err := p.GetOBOToken(context.Background(), OBOTokenOptions{
-			Assertion:    "upstream-token",
-			Scope:        "api://downstream/.default",
-			ClientSecret: "client-secret",
-		})
-		require.NoError(t, err)
-		assert.Equal(t, "obo-access-token", token.AccessToken)
-		assert.Equal(t, FlowOnBehalfOf, string(token.Flow))
-
-		// Verify request form data
-		reqs := httpMock.GetRequests()
-		require.Len(t, reqs, 1)
-		assert.Equal(t, OBOGrantType, reqs[0].Data.Get("grant_type"))
-		assert.Equal(t, "upstream-token", reqs[0].Data.Get("assertion"))
-		assert.Equal(t, OBORequestedTokenUse, reqs[0].Data.Get("requested_token_use"))
-	})
-
-	t.Run("OBO uses in-memory cache", func(t *testing.T) {
-		httpMock := NewMockHTTPClient()
-		httpMock.AddResponse(200, TokenResponse{
-			AccessToken: "obo-at",
-			TokenType:   "Bearer",
-			ExpiresIn:   3600,
-		})
-
-		p, _ := newTestPlugin(t, httpMock, nil)
-
-		opts := OBOTokenOptions{
-			Assertion:    "upstream",
-			Scope:        "api://test/.default",
-			ClientSecret: "secret",
-		}
-
-		// First call mints
-		tok1, err := p.GetOBOToken(context.Background(), opts)
-		require.NoError(t, err)
-
-		// Second call hits cache (no additional HTTP request)
-		tok2, err := p.GetOBOToken(context.Background(), opts)
-		require.NoError(t, err)
-
-		assert.Equal(t, tok1.AccessToken, tok2.AccessToken)
-		assert.Len(t, httpMock.GetRequests(), 1, "should only make one HTTP request")
-	})
-
-	t.Run("OBO missing assertion", func(t *testing.T) {
-		p, _ := newTestPlugin(t, nil, nil)
-		_, err := p.GetOBOToken(context.Background(), OBOTokenOptions{
-			Scope:        "scope",
-			ClientSecret: "secret",
-		})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "assertion")
-	})
-
-	t.Run("OBO missing scope", func(t *testing.T) {
-		p, _ := newTestPlugin(t, nil, nil)
-		_, err := p.GetOBOToken(context.Background(), OBOTokenOptions{
-			Assertion:    "tok",
-			ClientSecret: "secret",
-		})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "scope is required")
-	})
-
-	t.Run("OBO missing client secret", func(t *testing.T) {
-		p, _ := newTestPlugin(t, nil, nil)
-		_, err := p.GetOBOToken(context.Background(), OBOTokenOptions{
-			Assertion: "tok",
-			Scope:     "scope",
-		})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "client secret")
-	})
-
-	t.Run("OBO token request fails", func(t *testing.T) {
-		httpMock := NewMockHTTPClient()
-		httpMock.AddResponse(400, TokenErrorResponse{
-			Error:            "invalid_grant",
-			ErrorDescription: "AADSTS500011: API resource not found",
-		})
-
-		p, _ := newTestPlugin(t, httpMock, nil)
-		_, err := p.GetOBOToken(context.Background(), OBOTokenOptions{
-			Assertion:    "tok",
-			Scope:        "bad-scope",
-			ClientSecret: "secret",
-		})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "AADSTS500011")
-	})
-}
-
-// --- oboCache tests ---
-
-func TestOBOCache(t *testing.T) {
-	t.Run("get returns false for missing", func(t *testing.T) {
-		c := newOBOCache()
-		_, ok := c.get("assertion", "scope")
-		assert.False(t, ok)
-	})
-
-	t.Run("get returns token after set", func(t *testing.T) {
-		c := newOBOCache()
-		token := &auth.Token{
-			AccessToken: "cached",
-			ExpiresAt:   time.Now().Add(1 * time.Hour),
-		}
-		c.set("assertion", "scope", token)
-
-		got, ok := c.get("assertion", "scope")
-		assert.True(t, ok)
-		assert.Equal(t, "cached", got.AccessToken)
-	})
-
-	t.Run("get evicts expired entries", func(t *testing.T) {
-		c := newOBOCache()
-		token := &auth.Token{
-			AccessToken: "expired",
-			ExpiresAt:   time.Now().Add(-1 * time.Hour),
-		}
-		c.set("assertion", "scope", token)
-
-		_, ok := c.get("assertion", "scope")
-		assert.False(t, ok)
-	})
-}
+// --- OBO flow tests (server-mode OBO lives in server_mode_test.go) ---
 
 // --- loadRefreshToken tests ---
 
@@ -995,6 +947,7 @@ func TestServicePrincipalStatus(t *testing.T) {
 		assert.True(t, status.Authenticated)
 		assert.Contains(t, status.Claims.Name, "abcdefgh")
 		assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
+		assert.Equal(t, auth.FlowServicePrincipal, status.Flow)
 	})
 }
 
@@ -1032,12 +985,6 @@ func BenchmarkParseJWTClaims(b *testing.B) {
 	})
 	for b.Loop() {
 		_, _ = parseJWTClaims(jwt)
-	}
-}
-
-func BenchmarkOBOCacheKey(b *testing.B) {
-	for b.Loop() {
-		oboCacheKey("upstream-token-value-that-is-fairly-long", "api://downstream-api/.default")
 	}
 }
 

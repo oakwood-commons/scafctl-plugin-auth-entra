@@ -27,8 +27,14 @@ func claimsChallengeFromContext(ctx context.Context) string {
 type ClaimsChallengeError struct {
 	Claims string
 	Scope  string
+	// Hint is the remediation hint appended to the error message.
+	Hint string
 }
 
 func (e *ClaimsChallengeError) Error() string {
-	return "claims challenge required for scope: " + e.Scope
+	msg := "claims challenge required for scope: " + e.Scope
+	if e.Hint != "" {
+		msg += "\nHint: " + e.Hint
+	}
+	return msg
 }

@@ -58,9 +58,6 @@ const (
 	// DefaultRefreshTokenLifetime is the expected lifetime of refresh tokens.
 	// Azure AD refresh tokens are valid for 90 days by default.
 	DefaultRefreshTokenLifetime = 90 * 24 * time.Hour
-
-	// FlowOnBehalfOf identifies the OBO flow.
-	FlowOnBehalfOf = "on_behalf_of"
 )
 
 // BrowserOpenFunc is the signature for a function that opens a URL in the browser.
@@ -75,7 +72,6 @@ type Plugin struct {
 	clock            clock.Clock
 	cachedHostClient *sdkplugin.HostServiceClient
 	openBrowser      BrowserOpenFunc
-	oboCache         *oboCache
 	mode             mode
 }
 
@@ -157,23 +153,26 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 	// Initialize HTTP client only if not already set (e.g. by tests)
 	if p.httpClient == nil {
 		httpLogger := logr.FromContextOrDiscard(ctx).V(5) // high verbosity for auth HTTP
-		p.httpClient = NewDefaultHTTPClient(httpLogger)
+		client, err := NewDefaultHTTPClient(p.config.HTTPClient, httpLogger)
+		if err != nil {
+			return fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
+		}
+		p.httpClient = client
 	}
 
 	// Initialize Graph client only if not already set (e.g. by tests)
 	if p.graphClient == nil {
 		httpLogger := logr.FromContextOrDiscard(ctx).V(5)
-		p.graphClient = NewDefaultGraphClient(httpLogger)
+		client, err := NewDefaultGraphClient(p.config.HTTPClient, httpLogger)
+		if err != nil {
+			return fmt.Errorf("failed to build Graph client from httpClient config: %w", err)
+		}
+		p.graphClient = client
 	}
 
 	// Initialize browser opener (can be overridden for testing)
 	if p.openBrowser == nil {
 		p.openBrowser = defaultBrowserOpener
-	}
-
-	// Initialize OBO cache
-	if p.oboCache == nil {
-		p.oboCache = newOBOCache()
 	}
 
 	// Default to CLI mode

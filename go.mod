@@ -8,7 +8,7 @@ require (
 	github.com/oakwood-commons/go-flight v1.0.1
 	github.com/oakwood-commons/httpc v0.2.0
 	github.com/oakwood-commons/oauth-helpers v0.2.0
-	github.com/oakwood-commons/scafctl-plugin-sdk v0.17.0
+	github.com/oakwood-commons/scafctl-plugin-sdk v0.18.0
 	github.com/stretchr/testify v1.12.1
 	google.golang.org/grpc v1.83.2
 )
@@ -48,6 +48,6 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
 	ivan.dev/httpcache v0.1.1 // indirect
 )

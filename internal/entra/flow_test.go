@@ -1435,7 +1435,7 @@ func TestAuthCodeLoginCallbackPort(t *testing.T) {
 		_, err := p.authCodeLogin(context.Background(), sdkplugin.LoginRequest{
 			Flow:         auth.FlowInteractive,
 			CallbackPort: port,
-		}, nil, false)
+		}, nil, false, false, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no authorization code received")
 		assert.Equal(t, strconv.Itoa(port), gotPort)
@@ -1451,7 +1451,7 @@ func TestAuthCodeLoginCallbackPort(t *testing.T) {
 
 		_, err := p.authCodeLogin(context.Background(), sdkplugin.LoginRequest{
 			Flow: auth.FlowInteractive,
-		}, nil, false)
+		}, nil, false, false, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no authorization code received")
 		assert.NotEmpty(t, gotPort, "OS-assigned ephemeral port should appear in the redirect URI")

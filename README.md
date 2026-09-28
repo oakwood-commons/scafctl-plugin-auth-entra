@@ -7,8 +7,8 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) auth handler plugin for
 
 | Flow | Description |
 | ------ | ------------- |
-| `interactive` | Authorization code + PKCE, opens a browser (default when no flow is given) |
-| `device-code` | Device code polling (headless/SSH; automatic fallback when no browser is available) |
+| `interactive` | Authorization code + PKCE, opens a browser (default when no flow is given; in remote workspaces the redirect URL can be pasted back through the host) |
+| `device-code` | Device code polling (headless/SSH; automatic fallback when no browser is available and the host has no paste-back support) |
 | `service-principal` | Client credentials (CI/CD) |
 | `workload-identity` | Federated token (Kubernetes pods) |
 
@@ -145,6 +145,11 @@ scafctl auth login entra --tenant <tenant-id> --client-id <client-id>
 # pin it so the redirect URI is predictable
 scafctl auth login entra --flow interactive --callback-port 8400
 
+# Remote workspace (DevSpaces/Codespaces) paste-back login: the browser
+# runs on your laptop, the redirect cannot reach the workspace, so paste
+# the URL you landed on back into the prompt
+scafctl auth login entra --scope "https://graph.microsoft.com/.default"
+
 # Non-interactive service principal / workload identity (credentials
 # from env vars or config, see above)
 scafctl auth login entra --flow service-principal
@@ -159,6 +164,47 @@ scafctl auth token entra --scope "https://graph.microsoft.com/.default"
 # Logout
 scafctl auth logout entra
 ~~~
+
+`openid profile offline_access` are always requested for interactive
+login, so the response contains an ID token and a refresh token. `--scope`
+is optional; pass one (e.g. `--scope "https://graph.microsoft.com/.default"`)
+only when the login should also consent to a specific API.
+
+### Remote workspaces (paste-back login)
+
+In OpenShift DevSpaces, GitHub Codespaces, and similar remote workspaces,
+the browser runs on your laptop while this plugin runs inside the
+workspace: the `http://localhost` redirect lands on the laptop and never
+reaches the plugin, and device code may be blocked by Conditional Access
+policies.
+
+On hosts that support paste-back, interactive login works there anyway:
+
+1. The plugin starts its callback server and prints the authorization URL.
+2. Open that URL in any browser (your laptop's) and sign in. After consent,
+   the browser is redirected to `http://localhost:<port>/?code=...&state=...`
+   and will usually show a connection error there -- the callback listener
+   runs inside the workspace and is unreachable from the laptop. That error
+   is expected: authentication already succeeded, and the authorization
+   code is in the address bar.
+3. Copy the address-bar URL and paste it into the prompt the host shows
+   (the scheme may be dropped when copying; it is restored automatically).
+4. The paste is strictly validated -- scheme, host, port, and path must
+   match this login's callback URI and the `state` must match -- and then
+   exchanged exactly like a real redirect. A mismatched paste fails the
+   login with a clear error.
+
+With host paste-back support, a headless no-flag login selects interactive
+instead of device code, and device code is used only via `--flow
+device-code` or a `defaultFlow: device_code` config. On hosts without
+paste-back support the previous behavior is unchanged (device code first on
+headless sessions).
+
+`--callback-port` still works over SSH port forwarding without paste-back:
+forward the port (e.g. `ssh -L 8400:localhost:8400`) and pass
+`--flow interactive --callback-port 8400` so the redirect URI is
+predictable. Devcontainers can forward the port in their `ports`
+configuration the same way.
 
 ### Upgrade Note
 

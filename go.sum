@@ -242,8 +242,8 @@ github.com/oakwood-commons/httpc v0.2.0 h1:VUShxefWQJ2ONXFhe3ty5EVAmUHbZzabN7jiS
 github.com/oakwood-commons/httpc v0.2.0/go.mod h1:TC9Kc/0wyjp2XlNX2BiRKxEcF4ddYy5m3rUG08gBUI4=
 github.com/oakwood-commons/oauth-helpers v0.2.0 h1:IIu8AitRWCNp51oRvfBU0D7JGM3Tt3QXUejLwEFZk+Q=
 github.com/oakwood-commons/oauth-helpers v0.2.0/go.mod h1:+VhuszKORoPc9H0HwvS92I/U0828up8XejsUpXS7FvE=
-github.com/oakwood-commons/scafctl-plugin-sdk v0.17.0 h1:UCle89jbLDQG16TkMKWWh5z9vLf5nR6CQDVgmkuCuK4=
-github.com/oakwood-commons/scafctl-plugin-sdk v0.17.0/go.mod h1:AMyK1Qw2rGsEBohcgIJ0ju2eAgaVXsHExaL7Uha4+00=
+github.com/oakwood-commons/scafctl-plugin-sdk v0.18.0 h1:BdIaqQWr2VAZzJyz03hI/2l3oRoVvMHI22MlJC8O7xI=
+github.com/oakwood-commons/scafctl-plugin-sdk v0.18.0/go.mod h1:8KmqfRbT9S4DZoVl1B6gM5MJD8RuHOzSuBnltVtaYoA=
 github.com/oklog/oklog v0.3.2/go.mod h1:FCV+B7mhrz4o+ueLpx+KqkyXRGMWOYEvfiXtdGtbWGs=
 github.com/oklog/run v1.0.0/go.mod h1:dlhp/R75TPv97u0XWUtDeV/lRKWPKSdTuV0TZvrmrQA=
 github.com/oklog/run v1.1.0 h1:GEenZ1cK0+q0+wsJew9qUg/DyD8k3JzYsZAi5gYi2mA=
@@ -534,8 +534,8 @@ google.golang.org/protobuf v1.21.0/go.mod h1:47Nbq4nVaFHyn7ilMalzfO3qCViNmqZ2kzi
 google.golang.org/protobuf v1.23.0/go.mod h1:EGpADcykh3NcUnDUJcl1+ZksZNG86OlYog2l/sGQquU=
 google.golang.org/protobuf v1.26.0-rc.1/go.mod h1:jlhhOSvTdKEhbULTjvd4ARK9grFBp09yW+WbY/TyQbw=
 google.golang.org/protobuf v1.26.0/go.mod h1:9q0QmTI4eRPtz6boOQmLYwt+qCgq0jsYwAQnmE0givc=
-google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
-google.golang.org/protobuf v1.36.11/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
+google.golang.org/protobuf v1.36.12 h1:pJOKDDOyeXErUroCihFAd5LQuwXBSpVnKGrj5o/fwxc=
+google.golang.org/protobuf v1.36.12/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
 gopkg.in/alecthomas/kingpin.v2 v2.2.6/go.mod h1:FMv+mEhP44yOT+4EoQTLFTRgOQ1FBLkstjWtayDeSgw=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=

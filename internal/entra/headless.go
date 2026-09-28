@@ -18,6 +18,11 @@ import (
 // caller can fall back to device code.
 var errBrowserUnavailable = errors.New("cannot open a browser")
 
+// errPromptUnavailable is returned by the auth-code flow when the host's
+// paste-back prompt failed on a login that depends on it (implicit and
+// headless), so the caller can fall back to device code.
+var errPromptUnavailable = errors.New("host paste-back prompt unavailable")
+
 // defaultHeadlessReason reports why a browser cannot be opened on this
 // machine, or "" when one plausibly can.
 func defaultHeadlessReason() string {
@@ -44,13 +49,29 @@ func browserUnavailableReason(goos string, getenv func(string) string) string {
 // notice instead of waiting out the callback timeout. An explicit
 // --flow interactive keeps the manual-open wait, so SSH/devcontainer
 // port forwarding (--callback-port) keeps working.
+//
+// When the host advertises paste-back support (issue #66), the headless
+// fallbacks are disabled: the user completes the flow by pasting the
+// redirect URL back through the host, which works without a browser on
+// this machine, so interactive stays usable in remote workspaces where
+// device code may be blocked by Conditional Access.
 func (p *Plugin) interactiveLogin(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt), implicit bool, headlessReason string) (*sdkplugin.LoginResponse, error) {
-	if implicit && headlessReason != "" {
+	pasteBack := p.cfg.SupportsPromptAuthResponse()
+	if implicit && headlessReason != "" && !pasteBack {
 		return p.deviceCodeFallback(ctx, req, deviceCodeCb, headlessReason)
 	}
-	resp, err := p.authCodeLogin(ctx, req, deviceCodeCb, implicit)
+	// With paste-back the flow can complete without a local browser, so a
+	// browser-open failure degrades to the prompt + wait instead of an
+	// abort; without it, browserRequired keeps the implicit fallback.
+	browserRequired := implicit && !pasteBack
+	pasteFallback := implicit && pasteBack
+	promptRequired := pasteFallback && headlessReason != ""
+	resp, err := p.authCodeLogin(ctx, req, deviceCodeCb, browserRequired, promptRequired, pasteFallback)
 	if implicit && errors.Is(err, errBrowserUnavailable) {
 		return p.deviceCodeFallback(ctx, req, deviceCodeCb, "opening the browser failed")
+	}
+	if errors.Is(err, errPromptUnavailable) {
+		return p.deviceCodeFallback(ctx, req, deviceCodeCb, "host paste-back prompt failed and no callback can arrive")
 	}
 	return resp, err
 }

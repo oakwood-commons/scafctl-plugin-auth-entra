@@ -95,6 +95,10 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, _ sdkplugin.LoginReq
 		return nil, fmt.Errorf("entra: token_poll: %w", err)
 	}
 
+	// Drop tokens cached for any previous identity before the new session's
+	// credentials land (issue #49).
+	p.clearUserTokenCache(ctx)
+
 	// Step 4: Store credentials
 	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "device_code", ""); err != nil {
 		return nil, fmt.Errorf("entra: store_credentials: %w", err)

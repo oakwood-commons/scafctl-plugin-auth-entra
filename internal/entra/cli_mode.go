@@ -153,7 +153,7 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
 	// Use the stored user session first when valid (highest priority)
 	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
-		return m.userSessionToken(ctx, req, metadata.SessionID)
+		return m.userSessionToken(ctx, req, metadata)
 	}
 
 	// Use workload identity flow if credentials are present
@@ -169,12 +169,41 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 	// No environment credentials and no valid session: fall through to the
 	// session path, which reports the relevant error (missing scope, or
 	// not authenticated when refreshing fails).
-	return m.userSessionToken(ctx, req, "")
+	return m.userSessionToken(ctx, req, nil)
 }
 
-// userSessionToken serves a token from the user session identified by
-// sessionID: cache lookup first, then minting via the refresh token.
-func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenRequest, sessionID string) (*sdkplugin.TokenResponse, error) {
+// userSessionFingerprint derives the user-flow cache-key fingerprint from
+// the effective identity of the stored session -- the metadata's client and
+// tenant (the values mintToken actually sends), the authority, and the
+// user oid claim when present -- rather than the handler config, so the
+// cache key and the credential behind it cannot disagree (issue #49).
+// With no stored session the config values are the only identity available,
+// so they serve as the fallback.
+func (p *Plugin) userSessionFingerprint(metadata *auth.HandlerMetadata) string {
+	clientID := p.config.ClientID
+	tenantID := p.config.TenantID
+	oid := ""
+	sessionID := ""
+	if metadata != nil {
+		clientID = metadata.ClientID
+		tenantID = metadata.MetaString(MetaKeyTenantID)
+		sessionID = metadata.SessionID
+		if metadata.Claims != nil {
+			oid = metadata.Claims.ObjectID
+		}
+	}
+	// "user:" keeps user-session entries apart from SP/WI entries that
+	// share the same client/tenant/authority, and the trailing sessionID
+	// keeps entries apart across stored sessions: each login gets a new
+	// session ID (refresh-token rotation reuses it), so a token cached for
+	// an earlier session is never served to a later one.
+	return fingerprintHash("user:" + clientID + ":" + tenantID + ":" + p.config.GetAuthority() + ":" + oid + ":" + sessionID)
+}
+
+// userSessionToken serves a token from the user session described by
+// metadata (nil when no session is stored): cache lookup first, then
+// minting via the refresh token.
+func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenRequest, metadata *auth.HandlerMetadata) (*sdkplugin.TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	scope := req.Scope
@@ -198,14 +227,7 @@ func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenReque
 	)
 
 	hostClient := m.p.hostClient(ctx)
-	prefix := m.p.tokenCachePrefix(ctx)
-	// "user:" keeps user-session entries apart from SP/WI entries that share
-	// the same client/tenant/authority, and the trailing sessionID keeps
-	// entries apart across stored sessions: each login gets a new session ID
-	// (refresh-token rotation reuses it), so a token cached for an earlier
-	// session is never served to a later one.
-	fp := fingerprintHash("user:" + m.p.config.ClientID + ":" + m.p.config.TenantID + ":" + m.p.config.GetAuthority() + ":" + sessionID)
-	fullKey := prefix + fp + ":" + qualifiedScope
+	fullKey := m.p.tokenCachePrefix(ctx) + m.p.userSessionFingerprint(metadata) + ":" + qualifiedScope
 
 	// Check cache first (unless force refresh)
 	if !req.ForceRefresh && hostClient != nil {

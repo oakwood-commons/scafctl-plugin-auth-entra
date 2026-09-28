@@ -146,7 +146,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	// If we got a new refresh token, store it (token rotation)
 	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
 		lgr.V(1).Info("refresh token rotated, storing new token")
-		if err := p.storeCredentials(ctx, tenantID, &tokenResp, metadata.ClientID, metadata.Scopes, metadata.LastLoginFlow, metadata.SessionID); err != nil {
+		if err := p.storeCredentialsWithClaims(ctx, tenantID, &tokenResp, metadata.ClientID, metadata.Scopes, metadata.LastLoginFlow, metadata.SessionID, metadata.Claims); err != nil {
 			lgr.V(1).Info("warning: failed to update refresh token", "error", err)
 		}
 	}
@@ -172,6 +172,14 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 
 // storeCredentials securely stores the refresh token and metadata.
 func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenResp *TokenResponse, clientID string, scopes []string, loginFlow auth.Flow, sessionID string) error {
+	return p.storeCredentialsWithClaims(ctx, tenantID, tokenResp, clientID, scopes, loginFlow, sessionID, nil)
+}
+
+// storeCredentialsWithClaims is storeCredentials with prevClaims used when
+// the response carries no parsable ID token -- refresh-token rotation often
+// omits it, and dropping the stored claims would lose the user oid that
+// keys the user-flow token cache (issue #49).
+func (p *Plugin) storeCredentialsWithClaims(ctx context.Context, tenantID string, tokenResp *TokenResponse, clientID string, scopes []string, loginFlow auth.Flow, sessionID string, prevClaims *auth.Claims) error {
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return fmt.Errorf("host service not available")
@@ -194,7 +202,13 @@ func (p *Plugin) storeCredentials(ctx context.Context, tenantID string, tokenRes
 
 	// Extract claims and store metadata
 	claims, err := p.extractClaims(tokenResp)
-	if err != nil {
+	switch {
+	case tokenResp.IDToken == "" && prevClaims != nil:
+		claims = prevClaims
+	case err == nil:
+	case prevClaims != nil:
+		claims = prevClaims
+	default:
 		// Use minimal claims if extraction fails
 		claims = &auth.Claims{
 			TenantID: tenantID,

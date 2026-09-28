@@ -100,6 +100,7 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 			IdentityType:  auth.IdentityTypeUser,
 			ClientID:      metadata.ClientID,
 			Scopes:        metadata.Scopes,
+			Flow:          metadata.LastLoginFlow,
 		}, nil
 	}
 

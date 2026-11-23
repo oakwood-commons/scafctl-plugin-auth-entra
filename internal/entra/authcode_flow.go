@@ -19,6 +19,10 @@ import (
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
+// callbackShutdownTimeout bounds graceful draining of the localhost callback
+// HTTP response after a callback result is settled.
+const callbackShutdownTimeout = 5 * time.Second
+
 // defaultBrowserOpener opens a URL in the system browser using the oauth-helpers package.
 func defaultBrowserOpener(ctx context.Context, u string) error {
 	return oauth.OpenBrowser(ctx, u)
@@ -71,17 +75,37 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	// Start local callback server for OAuth redirect. A zero CallbackPort
 	// lets the OS pick an ephemeral port; a specific port keeps the
 	// redirect URI predictable for SSH/devcontainer port forwarding.
-	callbackServer, err := oauth.StartCallbackServer(ctx, req.CallbackPort, state)
+	callbackOpts := []oauth.CallbackOption{oauth.WithDeferredCompletion()}
+	if pages := p.cfg.AuthCallbackPages; pages != nil {
+		callbackOpts = append(callbackOpts, oauth.WithCallbackPages(oauth.CallbackPages{
+			SuccessHTML: pages.SuccessHTML,
+			FailureHTML: pages.FailureHTML,
+		}))
+	}
+	callbackServer, err := oauth.StartCallbackServer(ctx, req.CallbackPort, state, callbackOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("entra: callback_server: %w", err)
 	}
-	defer func() { _ = callbackServer.Close() }()
+	drained := false
+	drainCallbackServer := func() {
+		if drained {
+			return
+		}
+		drained = true
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), callbackShutdownTimeout)
+		defer shutdownCancel()
+		_ = callbackServer.Shutdown(shutdownCtx)
+	}
+	defer drainCallbackServer()
 
 	redirectURI := callbackServer.RedirectURI
 
-	// Build authorization URL
+	// Build authorization URL. Include prompt=select_account so Microsoft
+	// Entra always shows the account chooser ("Pick an account" / "Use
+	// another account") even when only one browser SSO session is active
+	// (issue #71).
 	scopeStr := strings.Join(scopes, " ")
-	authURL := fmt.Sprintf("%s/%s/oauth2/v2.0/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&code_challenge=%s&code_challenge_method=S256&state=%s",
+	authURL := fmt.Sprintf("%s/%s/oauth2/v2.0/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&code_challenge=%s&code_challenge_method=S256&state=%s&prompt=select_account",
 		p.config.GetAuthority(),
 		tenantID,
 		url.QueryEscape(p.config.ClientID),
@@ -106,12 +130,29 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 		lgr.V(0).Info("failed to open browser, please open this URL manually", "url", authURL)
 	}
 
-	// Notify callback so the CLI can show a "Re-open in browser" action
-	if deviceCodeCb != nil {
+	// Notify callback so the CLI can show the kvx status box (with Copy/Open URL
+	// actions) whenever a local browser was launched, or when the host does not
+	// support paste-back (e.g. older hosts or SSH port-forwarding without
+	// PromptAuthResponse, where deviceCodeCb is the only channel carrying the
+	// authorize URL to the CLI). On paste-back-capable hosts when headless or
+	// when opening the browser failed, defer the callback so a working paste
+	// prompt does not flash a browser TUI box first; if the prompt fails and the
+	// flow remains callback-only, emit the suppressed URL notification once.
+	localBrowserLaunched := browserOpenErr == nil && p.headlessReason() == ""
+	pasteBackAvailable := p.cfg.SupportsPromptAuthResponse() && p.hostClient(ctx) != nil
+	notifiedAuthURL := false
+	notifyAuthURL := func() {
+		if notifiedAuthURL || deviceCodeCb == nil {
+			return
+		}
+		notifiedAuthURL = true
 		deviceCodeCb(sdkplugin.DeviceCodePrompt{
 			VerificationURI: authURL,
 			Message:         "Open this URL in your browser to authenticate",
 		})
+	}
+	if localBrowserLaunched || !pasteBackAvailable {
+		notifyAuthURL()
 	}
 
 	// Ask the host to collect a pasted redirect URL in the background
@@ -131,6 +172,7 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	promptRequired = promptRequired || (pasteFallback && browserOpenErr != nil)
 	pasteCh := make(chan string, 1)
 	promptErrCh := make(chan error, 1)
+	promptFallbackNotifyCh := make(chan struct{}, 1)
 	promptCtx, cancelPrompt := context.WithCancel(ctx)
 	defer cancelPrompt()
 	if hostClient := p.hostClient(ctx); hostClient != nil {
@@ -142,6 +184,9 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 					return
 				}
 				logr.FromContextOrDiscard(promptCtx).V(1).Info("host paste-back prompt unavailable, waiting for callback only", "error", err)
+				if promptCtx.Err() == nil {
+					promptFallbackNotifyCh <- struct{}{}
+				}
 				return
 			}
 			select {
@@ -159,52 +204,78 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	defer timer.Stop()
 
 	var authCode string
-	select {
-	case result := <-callbackServer.ResultChan():
-		if result.Err != nil {
-			return nil, authCallbackError(result.Err.Error())
+	var fromCallback bool
+waitForAuthCode:
+	for {
+		select {
+		case result := <-callbackServer.ResultChan():
+			if result.Err != nil {
+				cancelPrompt()
+				drainCallbackServer()
+				return nil, authCallbackError(result.Err.Error())
+			}
+			authCode = result.Code
+			fromCallback = true
+			lgr.V(1).Info("received authorization code")
+			break waitForAuthCode
+		case pasted := <-pasteCh:
+			authCode, err = parsePastedRedirect(pasted, redirectURI, state)
+			if err != nil {
+				return nil, err
+			}
+			lgr.V(1).Info("received pasted authorization response")
+			break waitForAuthCode
+		case promptErr := <-promptErrCh:
+			return nil, fmt.Errorf("entra: auth_code: %w: %w", errPromptUnavailable, promptErr)
+		case <-promptFallbackNotifyCh:
+			promptFallbackNotifyCh = nil
+			if ctx.Err() == nil {
+				notifyAuthURL()
+			}
+		case <-timer.C:
+			return nil, fmt.Errorf("entra: auth_code: no response received from browser within %s; "+
+				"if using a custom --client-id, ensure http://localhost is registered as a redirect URI "+
+				"in the app registration, or use '--flow device-code'", timeout)
+		case <-ctx.Done():
+			return nil, fmt.Errorf("entra: auth_code: authentication cancelled")
 		}
-		authCode = result.Code
-		lgr.V(1).Info("received authorization code")
-	case pasted := <-pasteCh:
-		authCode, err = parsePastedRedirect(pasted, redirectURI, state)
-		if err != nil {
-			return nil, err
-		}
-		lgr.V(1).Info("received pasted authorization response")
-	case promptErr := <-promptErrCh:
-		return nil, fmt.Errorf("entra: auth_code: %w: %w", errPromptUnavailable, promptErr)
-	case <-timer.C:
-		return nil, fmt.Errorf("entra: auth_code: no response received from browser within %s; "+
-			"if using a custom --client-id, ensure http://localhost is registered as a redirect URI "+
-			"in the app registration, or use '--flow device-code'", timeout)
-	case <-ctx.Done():
-		return nil, fmt.Errorf("entra: auth_code: authentication cancelled")
 	}
 	// Release the host prompt now rather than after the token exchange,
 	// so a late paste is not accepted and then discarded.
 	cancelPrompt()
 
+	settleCallback := func(success bool) {
+		callbackServer.Complete(fromCallback && success)
+		drainCallbackServer()
+	}
+
 	// Exchange authorization code for tokens
 	tokenResp, err := p.exchangeAuthCode(ctx, tenantID, authCode, redirectURI, codeVerifier)
 	if err != nil {
+		settleCallback(false)
 		return nil, fmt.Errorf("entra: token_exchange: %w", err)
 	}
 
-	// Drop tokens cached for any previous identity before the new session's
-	// credentials land (issue #49).
-	p.clearUserTokenCache(ctx)
+	// Validate and extract ID token claims before mutating stored credentials
+	// or clearing the previous identity's token cache, so a malformed ID token
+	// never leaves partial session state behind when serving a failure page.
+	claims, err := p.extractClaims(tokenResp)
+	if err != nil {
+		settleCallback(false)
+		return nil, fmt.Errorf("entra: extract_claims: %w", err)
+	}
 
-	// Store refresh token and metadata
+	// Store refresh token and metadata before dropping cached access tokens
+	// from any previous identity, so a credential-write failure leaves a
+	// replaced session intact (issue #49).
 	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "interactive", ""); err != nil {
+		settleCallback(false)
 		return nil, fmt.Errorf("entra: store_credentials: %w", err)
 	}
 
-	// Extract and return claims
-	claims, err := p.extractClaims(tokenResp)
-	if err != nil {
-		return nil, fmt.Errorf("entra: extract_claims: %w", err)
-	}
+	p.clearUserTokenCache(ctx)
+
+	settleCallback(true)
 
 	lgr.V(1).Info("authorization code flow completed successfully",
 		"subject", claims.Subject,
@@ -231,9 +302,9 @@ func sanitizeControlChars(s string) string {
 }
 
 // authCallbackError formats a redirect-supplied error message (from the HTTP
-// callback or a pasted redirect URL): control characters are stripped (issue
-// #49; remove the sanitize call once oakwood-commons/oauth-helpers#17 ships
-// and the dependency is bumped) and a well-known AADSTS code gets a hint.
+// callback or a pasted redirect URL): control characters are stripped for
+// defense-in-depth terminal safety across both paths (issue #49) and a
+// well-known AADSTS code gets a hint.
 func authCallbackError(raw string) error {
 	msg := sanitizeControlChars(raw)
 	if hint := aadstsHint(msg); hint != "" {

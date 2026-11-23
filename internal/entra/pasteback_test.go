@@ -134,15 +134,23 @@ func TestPasteBackCallbackStillWins(t *testing.T) {
 	httpMock := pasteTokenResponse()
 	p, fake := newTestPlugin(t, httpMock, nil)
 	advertisePasteBack(p)
+	browserDone := make(chan int, 1)
 	p.openBrowser = func(_ context.Context, authURL string) error {
-		// The browser (on this machine) completes the redirect locally.
+		// The browser (on this machine) completes the redirect asynchronously
+		// while the server holds the final page until exchange + storage succeed.
 		au, err := url.Parse(authURL)
 		require.NoError(t, err)
 		state := au.Query().Get("state")
 		redirect := au.Query().Get("redirect_uri")
-		resp, err := http.Get(redirect + "/?code=REAL-CODE&state=" + url.QueryEscape(state)) //nolint:noctx // test helper hitting a local server
-		require.NoError(t, err)
-		_ = resp.Body.Close()
+		go func() {
+			resp, getErr := http.Get(redirect + "/?code=REAL-CODE&state=" + url.QueryEscape(state)) //nolint:noctx // test helper hitting a local server
+			if getErr != nil {
+				browserDone <- 0
+				return
+			}
+			_ = resp.Body.Close()
+			browserDone <- resp.StatusCode
+		}()
 		return nil
 	}
 	promptCanceled := make(chan struct{})
@@ -169,6 +177,13 @@ func TestPasteBackCallbackStillWins(t *testing.T) {
 	case <-promptCanceled:
 	case <-time.After(2 * time.Second):
 		t.Fatal("paste prompt goroutine was not canceled after the callback won")
+	}
+
+	select {
+	case code := <-browserDone:
+		assert.Equal(t, http.StatusOK, code)
+	case <-time.After(2 * time.Second):
+		t.Fatal("browser callback response did not drain")
 	}
 }
 

@@ -16,8 +16,13 @@ import (
 
 // fakeHostService implements proto.HostServiceClient backed by an in-memory map.
 type fakeHostService struct {
-	mu      sync.Mutex
-	secrets map[string]string
+	mu               sync.Mutex
+	secrets          map[string]string
+	getSecretFunc    func(ctx context.Context, name string) error
+	setSecretErr     error
+	setSecretKeyErr  map[string]error
+	setSecretFunc    func(ctx context.Context, name, value string) error
+	deleteSecretFunc func(ctx context.Context, name string) error
 	// promptFunc backs PromptAuthResponse; tests use it to deliver pasted
 	// redirect URLs, block until canceled, or return host errors. nil
 	// mimics a pre-paste-back host (gRPC Unimplemented).
@@ -42,21 +47,56 @@ func newFakeHostClient(fake *fakeHostService) *sdkplugin.HostServiceClient {
 	return hc
 }
 
-func (f *fakeHostService) GetSecret(_ context.Context, in *proto.GetSecretRequest, _ ...grpc.CallOption) (*proto.GetSecretResponse, error) {
+func (f *fakeHostService) GetSecret(ctx context.Context, in *proto.GetSecretRequest, _ ...grpc.CallOption) (*proto.GetSecretResponse, error) {
+	f.mu.Lock()
+	fn := f.getSecretFunc
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(ctx, in.Name); err != nil {
+			return nil, err
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	v, ok := f.secrets[in.Name]
 	return &proto.GetSecretResponse{Value: v, Found: ok}, nil
 }
 
-func (f *fakeHostService) SetSecret(_ context.Context, in *proto.SetSecretRequest, _ ...grpc.CallOption) (*proto.SetSecretResponse, error) {
+func (f *fakeHostService) SetSecret(ctx context.Context, in *proto.SetSecretRequest, _ ...grpc.CallOption) (*proto.SetSecretResponse, error) {
+	f.mu.Lock()
+	fn := f.setSecretFunc
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(ctx, in.Name, in.Value); err != nil {
+			return nil, err
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.setSecretKeyErr != nil {
+		if err, ok := f.setSecretKeyErr[in.Name]; ok && err != nil {
+			return nil, err
+		}
+	}
+	if f.setSecretErr != nil {
+		return nil, f.setSecretErr
+	}
 	f.secrets[in.Name] = in.Value
 	return &proto.SetSecretResponse{}, nil
 }
 
-func (f *fakeHostService) DeleteSecret(_ context.Context, in *proto.DeleteSecretRequest, _ ...grpc.CallOption) (*proto.DeleteSecretResponse, error) {
+func (f *fakeHostService) DeleteSecret(ctx context.Context, in *proto.DeleteSecretRequest, _ ...grpc.CallOption) (*proto.DeleteSecretResponse, error) {
+	f.mu.Lock()
+	fn := f.deleteSecretFunc
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(ctx, in.Name); err != nil {
+			return nil, err
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.secrets, in.Name)

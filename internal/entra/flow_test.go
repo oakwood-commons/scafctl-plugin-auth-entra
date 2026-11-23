@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	oauth "github.com/oakwood-commons/oauth-helpers"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
+	"github.com/oakwood-commons/scafctl-plugin-sdk/plugin/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1399,17 +1401,20 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// probeCallback extracts the redirect_uri from the authorization URL, dials it,
-// and returns the port it listened on. A bare GET with no code parameter gets
-// an HTTP 400 response, proving a callback server is listening there.
+// probeCallback extracts the redirect_uri from the authorization URL, dials it
+// with the matching state parameter (and no code), and returns the port it
+// listened on. A GET with valid state and no code parameter gets an HTTP 400
+// response, proving a callback server is listening there.
 func probeCallback(t *testing.T, authURL string) string {
 	t.Helper()
 	u, err := url.Parse(authURL)
 	require.NoError(t, err)
 	redirect := u.Query().Get("redirect_uri")
 	require.NotEmpty(t, redirect, "authorization URL must carry a redirect_uri")
+	state := u.Query().Get("state")
+	require.NotEmpty(t, state, "authorization URL must carry a state")
 
-	resp, err := http.Get(redirect) //nolint:noctx // test helper hitting a local server
+	resp, err := http.Get(redirect + "/?state=" + url.QueryEscape(state)) //nolint:noctx // test helper hitting a local server
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -1419,6 +1424,169 @@ func probeCallback(t *testing.T, authURL string) string {
 	port := ru.Port()
 	require.NotEmpty(t, port)
 	return port
+}
+
+// completeLoopbackCallback simulates the browser completing the redirect back
+// to the loopback server asynchronously with the given authorization code.
+func completeLoopbackCallback(t *testing.T, authURL, code string) {
+	t.Helper()
+	u, err := url.Parse(authURL)
+	require.NoError(t, err)
+	redirect := u.Query().Get("redirect_uri")
+	state := u.Query().Get("state")
+	go func() {
+		resp, getErr := http.Get(redirect + "/?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)) //nolint:noctx // test helper hitting a local server
+		if getErr == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+}
+
+// --- authCodeLogin authorize URL & prompt=select_account tests (Issue #71) ---
+
+func TestAuthCodeLoginAuthorizeURL(t *testing.T) {
+	t.Run("includes prompt=select_account with PKCE and state by default", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		httpMock := pasteTokenResponse()
+		p, _ := newTestPlugin(t, httpMock, nil)
+
+		var capturedAuthURL string
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			capturedAuthURL = authURL
+			completeLoopbackCallback(t, authURL, "SELECT-ACCOUNT-CODE")
+			return nil
+		}
+
+		resp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowInteractive,
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+
+		u, err := url.Parse(capturedAuthURL)
+		require.NoError(t, err)
+		assert.Equal(t, "https", u.Scheme)
+		assert.Equal(t, "login.microsoftonline.com", u.Host)
+		assert.Equal(t, "/common/oauth2/v2.0/authorize", u.Path)
+
+		q := u.Query()
+		assert.Equal(t, "select_account", q.Get("prompt"), "interactive authorize URL must force account picker by default")
+		assert.Equal(t, "code", q.Get("response_type"))
+		assert.Equal(t, DefaultClientID, q.Get("client_id"))
+		assert.Equal(t, "S256", q.Get("code_challenge_method"))
+		assert.NotEmpty(t, q.Get("state"))
+		assert.False(t, q.Has("claims"), "claims parameter should be omitted unless a claims challenge is active")
+		assert.Contains(t, q.Get("scope"), "openid")
+		assert.Contains(t, q.Get("scope"), "profile")
+		assert.Contains(t, q.Get("scope"), "offline_access")
+
+		reqs := httpMock.GetRequests()
+		require.Len(t, reqs, 1)
+		verifier := reqs[0].Data.Get("code_verifier")
+		require.NotEmpty(t, verifier)
+		assert.Equal(t, oauth.GenerateCodeChallenge(verifier), q.Get("code_challenge"), "PKCE challenge on authorize URL must match code_verifier sent during token exchange")
+	})
+
+	t.Run("preserves claims challenge, --tenant override, and custom scopes alongside prompt=select_account", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		httpMock := pasteTokenResponse()
+		p, _ := newTestPlugin(t, httpMock, nil)
+
+		var capturedAuthURL string
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			capturedAuthURL = authURL
+			completeLoopbackCallback(t, authURL, "CLAIMS-CODE")
+			return nil
+		}
+
+		claimsJSON := `{"access_token":{"xms_cc":{"values":["cp1"]}}}`
+		ctx := ContextWithClaimsChallenge(context.Background(), claimsJSON)
+		_, err := p.Login(ctx, HandlerName, sdkplugin.LoginRequest{
+			Flow:     auth.FlowInteractive,
+			TenantID: "override-tenant-id",
+			Scopes:   []string{"https://graph.microsoft.com/.default"},
+		}, nil)
+		require.NoError(t, err)
+
+		u, err := url.Parse(capturedAuthURL)
+		require.NoError(t, err)
+		assert.Equal(t, "/override-tenant-id/oauth2/v2.0/authorize", u.Path)
+
+		q := u.Query()
+		assert.Equal(t, "select_account", q.Get("prompt"))
+		assert.Equal(t, claimsJSON, q.Get("claims"))
+		assert.Contains(t, q.Get("scope"), "https://graph.microsoft.com/.default")
+		assert.Contains(t, q.Get("scope"), "openid")
+		assert.Contains(t, q.Get("scope"), "profile")
+		assert.Contains(t, q.Get("scope"), "offline_access")
+	})
+
+	t.Run("preserves --profile config and profile-scoped credential storage alongside prompt=select_account", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		httpMock := pasteTokenResponse()
+		p, fake := newTestPlugin(t, httpMock, nil)
+		cfgCtx := sdkplugin.WithHostClient(context.Background(), p.cachedHostClient)
+		require.NoError(t, p.ConfigureAuthHandler(cfgCtx, HandlerName, sdkplugin.ProviderConfig{
+			BinaryName: "scafctl",
+			Profile:    "personal",
+			Settings: map[string]json.RawMessage{
+				HandlerName: json.RawMessage(`{"clientId":"personal-client-id","tenantId":"consumers","authority":"https://login.microsoftonline.com"}`),
+			},
+		}))
+		p.httpClient = httpMock
+
+		var capturedAuthURL string
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			capturedAuthURL = authURL
+			completeLoopbackCallback(t, authURL, "PROFILE-CODE")
+			return nil
+		}
+
+		ctxPersonal := auth.WithProfile(context.Background(), "personal")
+		resp, err := p.Login(ctxPersonal, HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowInteractive,
+		}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "paste-subject", resp.Claims.Subject)
+
+		u, err := url.Parse(capturedAuthURL)
+		require.NoError(t, err)
+		assert.Equal(t, "/consumers/oauth2/v2.0/authorize", u.Path)
+
+		q := u.Query()
+		assert.Equal(t, "select_account", q.Get("prompt"))
+		assert.Equal(t, "personal-client-id", q.Get("client_id"))
+
+		assert.Equal(t, "paste-refresh-token", fake.secrets[p.secretKey(ctxPersonal, secretSuffixRefreshToken)])
+		assert.NotContains(t, fake.secrets, SecretKeyRefreshToken, "default unscoped profile must stay untouched")
+	})
+
+	t.Run("paste-back prompt receives authorization URL with prompt=select_account", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		httpMock := pasteTokenResponse()
+		p, fake := newTestPlugin(t, httpMock, nil)
+		advertisePasteBack(p)
+		p.openBrowser = func(_ context.Context, _ string) error { return nil }
+
+		var promptAuthURL string
+		fake.promptFunc = func(_ context.Context, req *proto.PromptAuthResponseRequest) (string, error) {
+			promptAuthURL = req.GetAuthorizationUrl()
+			return validPasteFromRequest(t, req, url.Values{"code": {"PASTE-SELECT-CODE"}}), nil
+		}
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowInteractive,
+		}, nil)
+		require.NoError(t, err)
+
+		u, err := url.Parse(promptAuthURL)
+		require.NoError(t, err)
+		assert.Equal(t, "select_account", u.Query().Get("prompt"))
+	})
 }
 
 func TestAuthCodeLoginCallbackPort(t *testing.T) {

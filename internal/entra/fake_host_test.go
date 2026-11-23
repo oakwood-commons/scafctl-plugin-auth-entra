@@ -16,9 +16,11 @@ import (
 
 // fakeHostService implements proto.HostServiceClient backed by an in-memory map.
 type fakeHostService struct {
-	mu           sync.Mutex
-	secrets      map[string]string
-	setSecretErr error
+	mu              sync.Mutex
+	secrets         map[string]string
+	setSecretErr    error
+	setSecretKeyErr map[string]error
+	setSecretFunc   func(name, value string) error
 	// promptFunc backs PromptAuthResponse; tests use it to deliver pasted
 	// redirect URLs, block until canceled, or return host errors. nil
 	// mimics a pre-paste-back host (gRPC Unimplemented).
@@ -53,6 +55,16 @@ func (f *fakeHostService) GetSecret(_ context.Context, in *proto.GetSecretReques
 func (f *fakeHostService) SetSecret(_ context.Context, in *proto.SetSecretRequest, _ ...grpc.CallOption) (*proto.SetSecretResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.setSecretFunc != nil {
+		if err := f.setSecretFunc(in.Name, in.Value); err != nil {
+			return nil, err
+		}
+	}
+	if f.setSecretKeyErr != nil {
+		if err, ok := f.setSecretKeyErr[in.Name]; ok && err != nil {
+			return nil, err
+		}
+	}
 	if f.setSecretErr != nil {
 		return nil, f.setSecretErr
 	}

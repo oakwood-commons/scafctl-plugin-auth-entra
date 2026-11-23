@@ -265,15 +265,15 @@ waitForAuthCode:
 		return nil, fmt.Errorf("entra: extract_claims: %w", err)
 	}
 
-	// Drop tokens cached for any previous identity before the new session's
-	// credentials land (issue #49).
-	p.clearUserTokenCache(ctx)
-
-	// Store refresh token and metadata
+	// Store refresh token and metadata before dropping cached access tokens
+	// from any previous identity, so a credential-write failure leaves a
+	// replaced session intact (issue #49).
 	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "interactive", ""); err != nil {
 		settleCallback(false)
 		return nil, fmt.Errorf("entra: store_credentials: %w", err)
 	}
+
+	p.clearUserTokenCache(ctx)
 
 	settleCallback(true)
 

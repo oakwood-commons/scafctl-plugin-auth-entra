@@ -192,17 +192,12 @@ func (p *Plugin) storeCredentialsWithClaims(ctx context.Context, tenantID string
 		return fmt.Errorf("no refresh token in response (offline_access scope may be missing)")
 	}
 
-	// Store refresh token
-	if err := hostClient.SetSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken), tokenResp.RefreshToken); err != nil {
-		return fmt.Errorf("failed to store refresh token: %w", err)
-	}
-
 	// Generate a new session ID on initial login; preserve across rotations.
 	if sessionID == "" {
 		sessionID = generateSessionID()
 	}
 
-	// Extract claims and store metadata
+	// Extract claims and marshal metadata before mutating stored secrets.
 	claims, err := p.extractClaims(tokenResp)
 	switch {
 	case tokenResp.IDToken == "" && prevClaims != nil:
@@ -233,7 +228,30 @@ func (p *Plugin) storeCredentialsWithClaims(ctx context.Context, tenantID string
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
-	if err := hostClient.SetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata), string(metadataBytes)); err != nil {
+	refreshKey := p.secretKey(ctx, secretSuffixRefreshToken)
+	metadataKey := p.secretKey(ctx, secretSuffixMetadata)
+
+	// Snapshot the previous refresh token before overwriting so a subsequent
+	// metadata write failure can roll back cleanly instead of pairing the new
+	// refresh token with stale account metadata.
+	prevRefreshToken, hadPrevRefreshToken, prevGetErr := hostClient.GetSecret(ctx, refreshKey)
+
+	// Store refresh token
+	if err := hostClient.SetSecret(ctx, refreshKey, tokenResp.RefreshToken); err != nil {
+		return fmt.Errorf("failed to store refresh token: %w", err)
+	}
+
+	if err := hostClient.SetSecret(ctx, metadataKey, string(metadataBytes)); err != nil {
+		cleanupCtx := context.WithoutCancel(ctx)
+		if prevGetErr == nil && hadPrevRefreshToken {
+			if rbErr := hostClient.SetSecret(cleanupCtx, refreshKey, prevRefreshToken); rbErr != nil {
+				_ = hostClient.DeleteSecret(cleanupCtx, refreshKey)
+				_ = hostClient.DeleteSecret(cleanupCtx, metadataKey)
+			}
+		} else {
+			_ = hostClient.DeleteSecret(cleanupCtx, refreshKey)
+			_ = hostClient.DeleteSecret(cleanupCtx, metadataKey)
+		}
 		return fmt.Errorf("failed to store metadata: %w", err)
 	}
 

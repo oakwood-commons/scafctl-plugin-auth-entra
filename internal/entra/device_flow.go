@@ -90,20 +90,19 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, _ sdkplugin.LoginReq
 		return nil, fmt.Errorf("entra: token_poll: %w", err)
 	}
 
-	// Drop tokens cached for any previous identity before the new session's
-	// credentials land (issue #49).
-	p.clearUserTokenCache(ctx)
-
-	// Step 4: Store credentials
-	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "device_code", ""); err != nil {
-		return nil, fmt.Errorf("entra: store_credentials: %w", err)
-	}
-
-	// Step 5: Extract and return claims
+	// Step 4: Validate and extract claims before mutating stored credentials
 	claims, err := p.extractClaims(tokenResp)
 	if err != nil {
 		return nil, fmt.Errorf("entra: extract_claims: %w", err)
 	}
+
+	// Step 5: Store credentials, then drop tokens cached for any previous
+	// identity (issue #49).
+	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "device_code", ""); err != nil {
+		return nil, fmt.Errorf("entra: store_credentials: %w", err)
+	}
+
+	p.clearUserTokenCache(ctx)
 
 	lgr.V(1).Info("authentication successful",
 		"subject", claims.Subject,

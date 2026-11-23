@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/oakwood-commons/httpc"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 
@@ -77,6 +78,14 @@ type Plugin struct {
 	mode             mode
 	profileLocks     sync.Map
 	cleanupTimeout   time.Duration
+
+	clientCacheMu    sync.Mutex
+	clientCacheSize  int
+	baseLogger       logr.Logger
+	initHTTPKey      effectiveHTTPConfigKey
+	hasInitHTTPKey   bool
+	httpClientCache  *boundedClientCache[effectiveHTTPConfigKey, *DefaultHTTPClient]
+	graphClientCache *boundedClientCache[effectiveHTTPConfigKey, *DefaultGraphClient]
 }
 
 // profileLock returns the profile-scoped RWMutex coordinating in-process
@@ -91,7 +100,212 @@ func (p *Plugin) profileLock(ctx context.Context) *sync.RWMutex {
 	return actual.(*sync.RWMutex)
 }
 
-var _ sdkplugin.ServerMode = (*Plugin)(nil) // compile-time interface check
+var (
+	_ sdkplugin.AuthHandlerPlugin  = (*Plugin)(nil)
+	_ sdkplugin.ServerMode         = (*Plugin)(nil)
+	_ sdkplugin.AuthGroupsProvider = (*Plugin)(nil)
+)
+
+type resolvedConfigKeyType struct{}
+
+func withResolvedConfig(ctx context.Context, cfg *Config) context.Context {
+	return context.WithValue(ctx, resolvedConfigKeyType{}, cfg)
+}
+
+func resolvedConfigFromContext(ctx context.Context) (*Config, bool) {
+	cfg, ok := ctx.Value(resolvedConfigKeyType{}).(*Config)
+	return cfg, ok && cfg != nil
+}
+
+func attachRequestSettings(ctx context.Context, reqSettings map[string]json.RawMessage) context.Context {
+	if _, ok := sdkplugin.RequestSettingsFromContext(ctx); !ok && reqSettings != nil {
+		return sdkplugin.WithRequestSettings(ctx, reqSettings)
+	}
+	return ctx
+}
+
+func parseHandlerConfig(raw []byte) (*Config, error) {
+	cfg := DefaultConfig()
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse handler config: %w", err)
+		}
+	}
+
+	// Restore defaults for fields that were not explicitly set (or were set
+	// to empty) so that Validate succeeds, whether the config came from a
+	// profile or top-level settings. The actual env var fallback happens
+	// later in profileOrEnv during resolve calls.
+	if !cfg.WasSet("clientId") && cfg.ClientID == "" {
+		cfg.ClientID = DefaultClientID
+	}
+	if !cfg.WasSet("tenantId") && cfg.TenantID == "" {
+		cfg.TenantID = DefaultTenantID
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// effectiveConfig returns the handler Config to use for ctx: per-RPC request
+// settings from RequestSettingsFromContext(ctx) when present, falling back to
+// the ConfigureAuthHandler config without mutating p.config.
+func (p *Plugin) effectiveConfig(ctx context.Context) (*Config, error) {
+	if cfg, ok := resolvedConfigFromContext(ctx); ok {
+		return cfg, nil
+	}
+	if settings, ok := sdkplugin.RequestSettingsFromContext(ctx); ok {
+		var raw []byte
+		if nested, hasHandler := settings[HandlerName]; hasHandler {
+			if !bytes.Equal(bytes.TrimSpace(nested), []byte("null")) {
+				raw = nested
+			}
+		} else if len(settings) > 0 {
+			var err error
+			raw, err = json.Marshal(settings)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode request settings: %w", err)
+			}
+		}
+
+		reqCfg, err := parseHandlerConfig(raw)
+		if err != nil {
+			return nil, err
+		}
+		if p.config != nil {
+			reqCfg.MinPollInterval = p.config.MinPollInterval
+			reqCfg.SlowDownIncrement = p.config.SlowDownIncrement
+		}
+		return reqCfg, nil
+	}
+	if p.config != nil {
+		return p.config, nil
+	}
+	return DefaultConfig(), nil
+}
+
+func pickHTTPLogger(ctx context.Context, baseLogger logr.Logger) logr.Logger {
+	if baseLogger.GetSink() != nil {
+		return baseLogger.V(5)
+	}
+	return logr.FromContextOrDiscard(ctx).V(5)
+}
+
+func (p *Plugin) ensureHTTPClientCacheLocked() *boundedClientCache[effectiveHTTPConfigKey, *DefaultHTTPClient] {
+	if p.httpClientCache == nil {
+		p.httpClientCache = newBoundedClientCache[effectiveHTTPConfigKey, *DefaultHTTPClient](p.clientCacheSize)
+	}
+	return p.httpClientCache
+}
+
+func (p *Plugin) ensureGraphClientCacheLocked() *boundedClientCache[effectiveHTTPConfigKey, *DefaultGraphClient] {
+	if p.graphClientCache == nil {
+		p.graphClientCache = newBoundedClientCache[effectiveHTTPConfigKey, *DefaultGraphClient](p.clientCacheSize)
+	}
+	return p.graphClientCache
+}
+
+func (p *Plugin) httpClientForConfig(ctx context.Context, cfg *Config) (HTTPClient, error) {
+	var appCfg *httpc.AppConfig
+	if cfg != nil {
+		appCfg = cfg.HTTPClient
+	}
+
+	key, clientCfg, err := resolveEffectiveHTTPConfig(appCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
+	}
+
+	p.clientCacheMu.Lock()
+	curHTTP := p.httpClient
+	hasInit := p.hasInitHTTPKey
+	initKey := p.initHTTPKey
+	baseLgr := p.baseLogger
+	var cache *boundedClientCache[effectiveHTTPConfigKey, *DefaultHTTPClient]
+	if curHTTP != nil {
+		if _, isDefault := curHTTP.(*DefaultHTTPClient); !isDefault {
+			p.clientCacheMu.Unlock()
+			return curHTTP, nil
+		}
+		if hasInit && key == initKey {
+			p.clientCacheMu.Unlock()
+			return curHTTP, nil
+		}
+	} else if cfg == nil || (p.config != nil && cfg == p.config) {
+		p.clientCacheMu.Unlock()
+		return nil, fmt.Errorf("HTTP client not initialized")
+	}
+	cache = p.ensureHTTPClientCacheLocked()
+	p.clientCacheMu.Unlock()
+
+	return cache.GetOrCreate(key, func() *DefaultHTTPClient {
+		return newDefaultHTTPClientFromResolved(clientCfg, pickHTTPLogger(ctx, baseLgr))
+	}), nil
+}
+
+func (p *Plugin) graphClientForConfig(ctx context.Context, cfg *Config) (GraphClient, error) {
+	var appCfg *httpc.AppConfig
+	if cfg != nil {
+		appCfg = cfg.HTTPClient
+	}
+
+	key, clientCfg, err := resolveEffectiveHTTPConfig(appCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build Graph client from httpClient config: %w", err)
+	}
+
+	p.clientCacheMu.Lock()
+	curGraph := p.graphClient
+	hasInit := p.hasInitHTTPKey
+	initKey := p.initHTTPKey
+	baseLgr := p.baseLogger
+	var cache *boundedClientCache[effectiveHTTPConfigKey, *DefaultGraphClient]
+	if curGraph != nil {
+		if _, isDefault := curGraph.(*DefaultGraphClient); !isDefault {
+			p.clientCacheMu.Unlock()
+			return curGraph, nil
+		}
+		if hasInit && key == initKey {
+			p.clientCacheMu.Unlock()
+			return curGraph, nil
+		}
+	} else if cfg == nil || (p.config != nil && cfg == p.config) {
+		p.clientCacheMu.Unlock()
+		return nil, fmt.Errorf("graph client not initialized")
+	}
+	cache = p.ensureGraphClientCacheLocked()
+	p.clientCacheMu.Unlock()
+
+	return cache.GetOrCreate(key, func() *DefaultGraphClient {
+		return newDefaultGraphClientFromResolved(clientCfg, pickHTTPLogger(ctx, baseLgr))
+	}), nil
+}
+
+func (p *Plugin) closeHTTPClients() {
+	p.clientCacheMu.Lock()
+	httpCache := p.httpClientCache
+	graphCache := p.graphClientCache
+	curHTTP := p.httpClient
+	curGraph := p.graphClient
+	p.httpClientCache = nil
+	p.graphClientCache = nil
+	p.clientCacheMu.Unlock()
+
+	if httpCache != nil {
+		httpCache.CloseAll()
+	}
+	if graphCache != nil {
+		graphCache.CloseAll()
+	}
+	if defHTTP, ok := curHTTP.(*DefaultHTTPClient); ok {
+		_ = defHTTP.Close()
+	}
+	if defGraph, ok := curGraph.(*DefaultGraphClient); ok {
+		_ = defGraph.Close()
+	}
+}
 
 // activeMode returns the current mode. This guard returns an explicit error
 // rather than panicking if the invariant is violated.
@@ -135,30 +349,21 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 
 	p.cfg = cfg
 
-	// Initialize config with defaults
-	p.config = DefaultConfig()
-
-	// Parse handler-specific settings if provided
+	var rawSettings []byte
 	if raw, ok := cfg.Settings[HandlerName]; ok {
-		if err := json.Unmarshal(raw, p.config); err != nil {
-			return fmt.Errorf("failed to parse handler config: %w", err)
-		}
+		rawSettings = raw
 	}
-
-	// Restore defaults for fields that were not explicitly set (or were set
-	// to empty) so that Validate succeeds, whether the config came from a
-	// profile or top-level settings. The actual env var fallback happens
-	// later in profileOrEnv during resolve calls.
-	if !p.config.WasSet("clientId") && p.config.ClientID == "" {
-		p.config.ClientID = DefaultClientID
-	}
-	if !p.config.WasSet("tenantId") && p.config.TenantID == "" {
-		p.config.TenantID = DefaultTenantID
-	}
-
-	if err := p.config.Validate(); err != nil {
+	parsedCfg, err := parseHandlerConfig(rawSettings)
+	if err != nil {
 		return err
 	}
+
+	initKey, initClientCfg, err := resolveEffectiveHTTPConfig(parsedCfg.HTTPClient)
+	if err != nil {
+		return fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
+	}
+
+	p.config = parsedCfg
 
 	// Initialize clock
 	p.clock = clock.Real{}
@@ -166,24 +371,72 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 	// Cache the host client for later use
 	p.cachedHostClient = sdkplugin.HostClientFromContext(ctx)
 
-	// Initialize HTTP client only if not already set (e.g. by tests)
-	if p.httpClient == nil {
-		httpLogger := logr.FromContextOrDiscard(ctx).V(5) // high verbosity for auth HTTP
-		client, err := NewDefaultHTTPClient(p.config.HTTPClient, httpLogger)
-		if err != nil {
-			return fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
-		}
-		p.httpClient = client
+	baseLgr := logr.FromContextOrDiscard(ctx)
+	httpLogger := baseLgr.V(5) // high verbosity for auth HTTP
+
+	p.clientCacheMu.Lock()
+	needHTTP := p.httpClient == nil
+	if !needHTTP {
+		_, needHTTP = p.httpClient.(*DefaultHTTPClient)
+	}
+	needGraph := p.graphClient == nil
+	if !needGraph {
+		_, needGraph = p.graphClient.(*DefaultGraphClient)
+	}
+	p.clientCacheMu.Unlock()
+
+	var nextHTTP *DefaultHTTPClient
+	if needHTTP {
+		nextHTTP = newDefaultHTTPClientFromResolved(initClientCfg, httpLogger)
+	}
+	var nextGraph *DefaultGraphClient
+	if needGraph {
+		nextGraph = newDefaultGraphClientFromResolved(initClientCfg, httpLogger)
 	}
 
-	// Initialize Graph client only if not already set (e.g. by tests)
-	if p.graphClient == nil {
-		httpLogger := logr.FromContextOrDiscard(ctx).V(5)
-		client, err := NewDefaultGraphClient(p.config.HTTPClient, httpLogger)
-		if err != nil {
-			return fmt.Errorf("failed to build Graph client from httpClient config: %w", err)
+	var prevHTTP *DefaultHTTPClient
+	var prevGraph *DefaultGraphClient
+	p.clientCacheMu.Lock()
+	if nextHTTP != nil {
+		if defHTTP, isDefault := p.httpClient.(*DefaultHTTPClient); isDefault {
+			prevHTTP = defHTTP
 		}
-		p.graphClient = client
+		if p.httpClient == nil || prevHTTP != nil {
+			p.httpClient = nextHTTP
+		} else {
+			prevHTTP = nextHTTP
+		}
+	}
+	if nextGraph != nil {
+		if defGraph, isDefault := p.graphClient.(*DefaultGraphClient); isDefault {
+			prevGraph = defGraph
+		}
+		if p.graphClient == nil || prevGraph != nil {
+			p.graphClient = nextGraph
+		} else {
+			prevGraph = nextGraph
+		}
+	}
+	oldHTTPCache := p.httpClientCache
+	oldGraphCache := p.graphClientCache
+	p.baseLogger = baseLgr
+	p.initHTTPKey = initKey
+	p.hasInitHTTPKey = true
+	p.httpClientCache = newBoundedClientCache[effectiveHTTPConfigKey, *DefaultHTTPClient](p.clientCacheSize)
+	p.graphClientCache = newBoundedClientCache[effectiveHTTPConfigKey, *DefaultGraphClient](p.clientCacheSize)
+	p.clientCacheMu.Unlock()
+
+	if oldHTTPCache != nil {
+		oldHTTPCache.CloseAll()
+	}
+	if oldGraphCache != nil {
+		oldGraphCache.CloseAll()
+	}
+	if prevHTTP != nil {
+		_ = prevHTTP.Close()
+	}
+	if prevGraph != nil {
+		_ = prevGraph.Close()
 	}
 
 	// Initialize browser opener (can be overridden for testing)
@@ -224,6 +477,7 @@ func (p *Plugin) Login(ctx context.Context, handlerName string, req sdkplugin.Lo
 	if err != nil {
 		return nil, err
 	}
+	ctx = attachRequestSettings(ctx, req.Settings)
 	return m.Login(ctx, req, deviceCodeCb)
 }
 
@@ -317,7 +571,7 @@ func (p *Plugin) clearUserTokenCache(ctx context.Context) {
 
 // GetStatus returns the current authentication status.
 // Delegates to the active mode (CLI mode by default).
-func (p *Plugin) GetStatus(ctx context.Context, handlerName string, _ sdkplugin.StatusRequest) (*auth.Status, error) {
+func (p *Plugin) GetStatus(ctx context.Context, handlerName string, req sdkplugin.StatusRequest) (*auth.Status, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
 	}
@@ -325,6 +579,7 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string, _ sdkplugin.
 	if err != nil {
 		return nil, err
 	}
+	ctx = attachRequestSettings(ctx, req.Settings)
 	return m.GetStatus(ctx)
 }
 
@@ -338,7 +593,22 @@ func (p *Plugin) GetToken(ctx context.Context, handlerName string, req sdkplugin
 	if err != nil {
 		return nil, err
 	}
+	ctx = attachRequestSettings(ctx, req.Settings)
 	return m.GetToken(ctx, req)
+}
+
+// GetGroups returns the ObjectIDs of all Microsoft Entra groups the authenticated
+// user belongs to, satisfying sdkplugin.AuthGroupsProvider for the GetGroups RPC.
+// Delegates to the active mode (CLI mode by default).
+func (p *Plugin) GetGroups(ctx context.Context, handlerName string) ([]string, error) {
+	if handlerName != HandlerName {
+		return nil, fmt.Errorf("unknown handler: %s", handlerName)
+	}
+	m, err := p.activeMode()
+	if err != nil {
+		return nil, err
+	}
+	return m.GetGroups(ctx)
 }
 
 // ListCachedTokens returns metadata for all tokens stored by the Entra handler.
@@ -385,10 +655,17 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 // workload identity credentials are not available, using the same
 // config-then-env resolution as the resolver.
 func (p *Plugin) detectWorkloadIdentityUnavailableReason() string {
-	tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
-	directToken := p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
-	clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
-	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
+	return p.detectWorkloadIdentityUnavailableReasonForConfig(p.config)
+}
+
+func (p *Plugin) detectWorkloadIdentityUnavailableReasonForConfig(cfg *Config) string {
+	if cfg == nil {
+		cfg = p.config
+	}
+	tokenFile := cfg.profileOrEnv(cfg.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+	directToken := cfg.profileOrEnv(cfg.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+	clientID := cfg.profileOrEnv(cfg.ClientID, "clientId", EnvAzureClientID)
+	tenantID := cfg.profileOrEnv(cfg.TenantID, "tenantId", EnvAzureTenantID)
 
 	hasTokenSource := directToken != ""
 	if tokenFile != "" {
@@ -397,7 +674,7 @@ func (p *Plugin) detectWorkloadIdentityUnavailableReason() string {
 		} else if !hasTokenSource {
 			// Token file is set but inaccessible, and no direct token either.
 			source := EnvAzureFederatedTokenFile
-			if p.config.WasSet("federatedTokenFile") {
+			if cfg.WasSet("federatedTokenFile") {
 				source = "federatedTokenFile (config)"
 			}
 			return fmt.Sprintf("%s is set but the file is missing or inaccessible: %v", source, err)
@@ -438,6 +715,7 @@ func (p *Plugin) StopAuthHandler(_ context.Context, handlerName string) error {
 	if s, ok := m.(stopper); ok {
 		s.Stop()
 	}
+	p.closeHTTPClients()
 	return nil
 }
 
@@ -504,8 +782,8 @@ func (p *Plugin) secretKey(ctx context.Context, suffix string) string {
 // variable. This ensures that a profile intentionally setting a value equal
 // to the default (e.g. tenantId = "common") is honored rather than overridden
 // by an env var.
-func (p *Plugin) profileOrEnv(configVal, jsonField, envVar string) string {
-	if p.config.WasSet(jsonField) {
+func (c *Config) profileOrEnv(configVal, jsonField, envVar string) string {
+	if c != nil && c.WasSet(jsonField) {
 		return configVal
 	}
 	return os.Getenv(envVar)

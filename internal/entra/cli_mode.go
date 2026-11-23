@@ -34,7 +34,14 @@ const defaultLoginFlow = auth.FlowInteractive
 // identity, service principal) are reached via credential detection, so a
 // DefaultFlow naming them without credentials falls back to the default.
 func (p *Plugin) preferredFlow() auth.Flow {
-	switch f := auth.Flow(p.config.DefaultFlow); f { //nolint:exhaustive // only user flows are valid preferences
+	return p.preferredFlowForConfig(p.config)
+}
+
+func (p *Plugin) preferredFlowForConfig(cfg *Config) auth.Flow {
+	if cfg == nil {
+		return defaultLoginFlow
+	}
+	switch f := auth.Flow(cfg.DefaultFlow); f { //nolint:exhaustive // only user flows are valid preferences
 	case auth.FlowInteractive, auth.FlowDeviceCode:
 		return f
 	default:
@@ -55,15 +62,21 @@ func (p *Plugin) preferredFlow() auth.Flow {
 //     interactive or device_code, otherwise the handler default (interactive;
 //     falls back to device code when no browser is available).
 func (m *cliMode) Login(ctx context.Context, req sdkplugin.LoginRequest, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	// Determine which flow to use with credential detection.
 	flow := req.Flow
 	if flow == "" {
-		if m.p.hasWorkloadIdentityCredentials() {
+		if m.p.hasWorkloadIdentityCredentialsForConfig(cfg) {
 			flow = auth.FlowWorkloadIdentity
-		} else if m.p.hasServicePrincipalCredentials() {
+		} else if m.p.hasServicePrincipalCredentialsForConfig(cfg) {
 			flow = auth.FlowServicePrincipal
 		} else {
-			flow = m.p.preferredFlow()
+			flow = m.p.preferredFlowForConfig(cfg)
 		}
 	}
 
@@ -111,6 +124,12 @@ func (m *cliMode) Logout(ctx context.Context) error {
 // `auth logout entra` clears the stored session and restores env-credential
 // behavior.
 func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	// Check for a valid stored user session first (highest priority)
 	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
 		return &auth.Status{
@@ -127,13 +146,13 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 	}
 
 	// Check for workload identity credentials
-	if m.p.hasWorkloadIdentityCredentials() {
-		return m.p.workloadIdentityStatus()
+	if m.p.hasWorkloadIdentityCredentialsForConfig(cfg) {
+		return m.p.workloadIdentityStatusForConfig(cfg)
 	}
 
 	// Check for service principal credentials
-	if m.p.hasServicePrincipalCredentials() {
-		return m.p.servicePrincipalStatus()
+	if m.p.hasServicePrincipalCredentialsForConfig(cfg) {
+		return m.p.servicePrincipalStatusForConfig(cfg)
 	}
 
 	// Load and validate stored session credentials under profile read lock
@@ -170,25 +189,37 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 // over ambient environment credentials, so `auth token` serves the user
 // session after an explicit login even when AZURE_* env vars are set.
 func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error) {
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	// Use the stored user session first when valid (highest priority)
 	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
-		return m.userSessionToken(ctx, req, metadata)
+		return m.userSessionToken(ctx, req, cfg, metadata)
 	}
 
 	// Use workload identity flow if credentials are present
-	if m.p.hasWorkloadIdentityCredentials() {
+	if m.p.hasWorkloadIdentityCredentialsForConfig(cfg) {
 		return m.p.getWorkloadIdentityToken(ctx, req)
 	}
 
 	// Use service principal flow if credentials are present
-	if m.p.hasServicePrincipalCredentials() {
+	if m.p.hasServicePrincipalCredentialsForConfig(cfg) {
 		return m.p.getServicePrincipalToken(ctx, req)
 	}
 
 	// No environment credentials and no valid session: fall through to the
 	// session path, which reports the relevant error (missing scope, or
 	// not authenticated when refreshing fails).
-	return m.userSessionToken(ctx, req, nil)
+	return m.userSessionToken(ctx, req, cfg, nil)
+}
+
+// GetGroups returns the ObjectIDs of all Microsoft Entra groups the authenticated
+// user belongs to in CLI mode.
+func (m *cliMode) GetGroups(ctx context.Context) ([]string, error) {
+	return m.p.getGroups(ctx)
 }
 
 // userSessionFingerprint derives the user-flow cache-key fingerprint from
@@ -199,8 +230,15 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 // With no stored session the config values are the only identity available,
 // so they serve as the fallback.
 func (p *Plugin) userSessionFingerprint(metadata *auth.HandlerMetadata) string {
-	clientID := p.config.ClientID
-	tenantID := p.config.TenantID
+	return p.userSessionFingerprintWithConfig(p.config, metadata)
+}
+
+func (p *Plugin) userSessionFingerprintWithConfig(cfg *Config, metadata *auth.HandlerMetadata) string {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
+	clientID := cfg.ClientID
+	tenantID := cfg.TenantID
 	oid := ""
 	sessionID := ""
 	if metadata != nil {
@@ -216,13 +254,13 @@ func (p *Plugin) userSessionFingerprint(metadata *auth.HandlerMetadata) string {
 	// keeps entries apart across stored sessions: each login gets a new
 	// session ID (refresh-token rotation reuses it), so a token cached for
 	// an earlier session is never served to a later one.
-	return fingerprintHash("user:" + clientID + ":" + tenantID + ":" + p.config.GetAuthority() + ":" + oid + ":" + sessionID)
+	return fingerprintHash("user:" + clientID + ":" + tenantID + ":" + cfg.GetAuthority() + ":" + oid + ":" + sessionID)
 }
 
 // userSessionToken serves a token from the user session described by
 // metadata (nil when no session is stored): cache lookup first, then
 // minting via the refresh token.
-func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenRequest, metadata *auth.HandlerMetadata) (*sdkplugin.TokenResponse, error) {
+func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenRequest, cfg *Config, metadata *auth.HandlerMetadata) (*sdkplugin.TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	scope := req.Scope
@@ -246,7 +284,7 @@ func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenReque
 	)
 
 	hostClient := m.p.hostClient(ctx)
-	fullKey := m.p.tokenCachePrefix(ctx) + m.p.userSessionFingerprint(metadata) + ":" + qualifiedScope
+	fullKey := m.p.tokenCachePrefix(ctx) + m.p.userSessionFingerprintWithConfig(cfg, metadata) + ":" + qualifiedScope
 
 	// Check cache first (unless force refresh)
 	if !req.ForceRefresh && hostClient != nil {
@@ -347,18 +385,23 @@ func (m *cliMode) PurgeExpiredTokens(ctx context.Context) (int, error) {
 
 // DetectAvailableFlows reports which auth flows are available based on
 // environment credentials or configuration in CLI mode.
-func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvailability, error) {
+func (m *cliMode) DetectAvailableFlows(ctx context.Context) ([]sdkplugin.FlowAvailability, error) {
+	cfg, err := m.p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var flows []sdkplugin.FlowAvailability
 
 	// Workload identity flow -- check config and environment variables
-	if m.p.hasWorkloadIdentityCredentials() {
+	if m.p.hasWorkloadIdentityCredentialsForConfig(cfg) {
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowWorkloadIdentity,
 			Available: true,
 			Reason:    "workload identity credentials configured",
 		})
 	} else {
-		reason := m.p.detectWorkloadIdentityUnavailableReason()
+		reason := m.p.detectWorkloadIdentityUnavailableReasonForConfig(cfg)
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowWorkloadIdentity,
 			Available: false,
@@ -367,7 +410,7 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 	}
 
 	// Service principal flow -- check config and environment variables
-	if m.p.hasServicePrincipalCredentials() {
+	if m.p.hasServicePrincipalCredentialsForConfig(cfg) {
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowServicePrincipal,
 			Available: true,
@@ -376,9 +419,9 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 	} else {
 		reason := "service principal credentials not configured"
 		var missing []string
-		clientID := m.p.profileOrEnv(m.p.config.ClientID, "clientId", EnvAzureClientID)
-		clientSecret := m.p.profileOrEnv(m.p.config.ClientSecret, "clientSecret", EnvAzureClientSecret)
-		tenantID := m.p.profileOrEnv(m.p.config.TenantID, "tenantId", EnvAzureTenantID)
+		clientID := cfg.profileOrEnv(cfg.ClientID, "clientId", EnvAzureClientID)
+		clientSecret := cfg.profileOrEnv(cfg.ClientSecret, "clientSecret", EnvAzureClientSecret)
+		tenantID := cfg.profileOrEnv(cfg.TenantID, "tenantId", EnvAzureTenantID)
 		if clientID == "" {
 			missing = append(missing, EnvAzureClientID)
 		}
@@ -425,7 +468,7 @@ func (m *cliMode) DetectAvailableFlows(_ context.Context) ([]sdkplugin.FlowAvail
 		Reason:    "interactive flow is always available",
 	}
 	headlessReason := m.p.headlessReason()
-	if m.p.preferredFlow() == auth.FlowInteractive &&
+	if m.p.preferredFlowForConfig(cfg) == auth.FlowInteractive &&
 		(headlessReason == "" || m.p.cfg.SupportsPromptAuthResponse()) {
 		flows = append(flows, interactiveFlow, deviceCodeFlow)
 	} else {

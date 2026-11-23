@@ -31,16 +31,22 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting device code authentication flow")
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	// Determine tenant
 	tenantID := req.TenantID
 	if tenantID == "" {
-		tenantID = p.config.TenantID
+		tenantID = cfg.TenantID
 	}
 
 	// Determine scopes
 	scopes := req.Scopes
 	if len(scopes) == 0 {
-		scopes = p.config.DefaultScopes
+		scopes = cfg.DefaultScopes
 	}
 
 	// Ensure OIDC scopes are included so the response contains an ID token
@@ -57,15 +63,15 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return p.performDeviceCodeFlow(ctx, req, tenantID, scopes, deviceCodeCb)
+	return p.performDeviceCodeFlow(ctx, cfg, req, tenantID, scopes, deviceCodeCb)
 }
 
 // performDeviceCodeFlow executes the device code authentication flow.
-func (p *Plugin) performDeviceCodeFlow(ctx context.Context, _ sdkplugin.LoginRequest, tenantID string, scopes []string, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
+func (p *Plugin) performDeviceCodeFlow(ctx context.Context, cfg *Config, _ sdkplugin.LoginRequest, tenantID string, scopes []string, deviceCodeCb func(sdkplugin.DeviceCodePrompt)) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	// Step 1: Request device code
-	deviceCode, err := p.requestDeviceCode(ctx, tenantID, scopes)
+	deviceCode, err := p.requestDeviceCode(ctx, cfg, tenantID, scopes)
 	if err != nil {
 		return nil, fmt.Errorf("entra: device_code_request: %w", err)
 	}
@@ -85,7 +91,7 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, _ sdkplugin.LoginReq
 	}
 
 	// Step 3: Poll for token
-	tokenResp, err := p.pollForToken(ctx, tenantID, deviceCode)
+	tokenResp, err := p.pollForToken(ctx, cfg, tenantID, deviceCode)
 	if err != nil {
 		return nil, fmt.Errorf("entra: token_poll: %w", err)
 	}
@@ -98,7 +104,7 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, _ sdkplugin.LoginReq
 
 	// Step 5: Store credentials, then drop tokens cached for any previous
 	// identity (issue #49).
-	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "device_code", ""); err != nil {
+	if err := p.storeCredentials(ctx, tenantID, tokenResp, cfg.ClientID, scopes, "device_code", ""); err != nil {
 		return nil, fmt.Errorf("entra: store_credentials: %w", err)
 	}
 
@@ -115,15 +121,20 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, _ sdkplugin.LoginReq
 	}, nil
 }
 
-func (p *Plugin) requestDeviceCode(ctx context.Context, tenantID string, scopes []string) (*DeviceCodeResponse, error) {
-	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/devicecode", p.config.GetAuthority(), tenantID)
+func (p *Plugin) requestDeviceCode(ctx context.Context, cfg *Config, tenantID string, scopes []string) (*DeviceCodeResponse, error) {
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/devicecode", cfg.GetAuthority(), tenantID)
 
 	data := makeFormData(map[string]string{
-		"client_id": p.config.ClientID,
+		"client_id": cfg.ClientID,
 		"scope":     strings.Join(scopes, " "),
 	})
 
-	resp, err := p.httpClient.PostForm(ctx, endpoint, data)
+	resp, err := httpClient.PostForm(ctx, endpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("device code request failed: %w", err)
 	}
@@ -149,11 +160,16 @@ func (p *Plugin) requestDeviceCode(ctx context.Context, tenantID string, scopes 
 	return &deviceCode, nil
 }
 
-func (p *Plugin) pollForToken(ctx context.Context, tenantID string, deviceCode *DeviceCodeResponse) (*TokenResponse, error) {
+func (p *Plugin) pollForToken(ctx context.Context, cfg *Config, tenantID string, deviceCode *DeviceCodeResponse) (*TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
-	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", p.config.GetAuthority(), tenantID)
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
 
-	minPollInterval := p.config.MinPollInterval
+	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", cfg.GetAuthority(), tenantID)
+
+	minPollInterval := cfg.MinPollInterval
 	if minPollInterval == 0 {
 		minPollInterval = DefaultMinPollInterval
 	}
@@ -173,11 +189,11 @@ func (p *Plugin) pollForToken(ctx context.Context, tenantID string, deviceCode *
 		case <-ticker.C():
 			data := makeFormData(map[string]string{
 				"grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
-				"client_id":   p.config.ClientID,
+				"client_id":   cfg.ClientID,
 				"device_code": deviceCode.DeviceCode,
 			})
 
-			resp, err := p.httpClient.PostForm(ctx, endpoint, data)
+			resp, err := httpClient.PostForm(ctx, endpoint, data)
 			if err != nil {
 				// Network error, log and continue polling
 				lgr.V(1).Info("transient network error during token poll, continuing", "error", err)
@@ -205,7 +221,7 @@ func (p *Plugin) pollForToken(ctx context.Context, tenantID string, deviceCode *
 			case "authorization_pending":
 				continue
 			case "slow_down":
-				slowDownIncr := p.config.SlowDownIncrement
+				slowDownIncr := cfg.SlowDownIncrement
 				if slowDownIncr == 0 {
 					slowDownIncr = 5 * time.Second
 				}

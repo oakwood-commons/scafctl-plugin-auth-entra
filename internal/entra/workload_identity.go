@@ -93,15 +93,22 @@ func HasWorkloadIdentityCredentials() bool {
 // explicitly configured values (profile or top-level config) over environment
 // variables.
 func (p *Plugin) resolveWorkloadIdentityCredentials() *WorkloadIdentityCredentials {
+	return p.resolveWorkloadIdentityCredentialsForConfig(p.config)
+}
+
+func (p *Plugin) resolveWorkloadIdentityCredentialsForConfig(cfg *Config) *WorkloadIdentityCredentials {
+	if cfg == nil {
+		cfg = p.config
+	}
 	// Prefer explicitly configured values, fall back to env vars. Fields not
 	// provided in the config fall through to the environment variable.
-	clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
-	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
-	tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
-	directToken := p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+	clientID := cfg.profileOrEnv(cfg.ClientID, "clientId", EnvAzureClientID)
+	tenantID := cfg.profileOrEnv(cfg.TenantID, "tenantId", EnvAzureTenantID)
+	tokenFile := cfg.profileOrEnv(cfg.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+	directToken := cfg.profileOrEnv(cfg.FederatedToken, "federatedToken", EnvAzureFederatedToken)
 	// See GetWorkloadIdentityCredentials: trim trailing slash from the
 	// authority so injected values do not yield a double slash downstream.
-	authority := strings.TrimRight(p.profileOrEnv(p.config.Authority, "authority", EnvAzureAuthorityHost), "/")
+	authority := strings.TrimRight(cfg.profileOrEnv(cfg.Authority, "authority", EnvAzureAuthorityHost), "/")
 	if authority == "" {
 		authority = DefaultAuthority
 	}
@@ -137,6 +144,10 @@ func (p *Plugin) hasWorkloadIdentityCredentials() bool {
 	return p.resolveWorkloadIdentityCredentials() != nil
 }
 
+func (p *Plugin) hasWorkloadIdentityCredentialsForConfig(cfg *Config) bool {
+	return p.resolveWorkloadIdentityCredentialsForConfig(cfg) != nil
+}
+
 // GetFederatedToken returns the federated token.
 func (c *WorkloadIdentityCredentials) GetFederatedToken() (string, error) {
 	if c.Token != "" {
@@ -164,13 +175,18 @@ func (c *WorkloadIdentityCredentials) GetFederatedToken() (string, error) {
 func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	creds := p.resolveWorkloadIdentityCredentials()
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	creds := p.resolveWorkloadIdentityCredentialsForConfig(cfg)
 	if creds == nil {
 		// Diagnose with the same config-then-env resolution the resolver used.
-		directToken := p.profileOrEnv(p.config.FederatedToken, "federatedToken", EnvAzureFederatedToken)
-		tokenFile := p.profileOrEnv(p.config.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
-		clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
-		tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
+		directToken := cfg.profileOrEnv(cfg.FederatedToken, "federatedToken", EnvAzureFederatedToken)
+		tokenFile := cfg.profileOrEnv(cfg.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
+		clientID := cfg.profileOrEnv(cfg.ClientID, "clientId", EnvAzureClientID)
+		tenantID := cfg.profileOrEnv(cfg.TenantID, "tenantId", EnvAzureTenantID)
 
 		if directToken == "" && tokenFile == "" {
 			return nil, fmt.Errorf("workload identity not configured: set federatedToken or federatedTokenFile in config, or the %s or %s environment variables",
@@ -209,7 +225,7 @@ func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginR
 		scope = QualifyScope(req.Scopes[0])
 	}
 
-	_, err := p.acquireWorkloadIdentityToken(ctx, creds, scope)
+	_, err = p.acquireWorkloadIdentityToken(ctx, cfg, creds, scope)
 	if err != nil {
 		return nil, fmt.Errorf("workload identity authentication failed: %w", err)
 	}
@@ -230,8 +246,13 @@ func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginR
 }
 
 // acquireWorkloadIdentityToken exchanges the federated token for an Azure AD access token.
-func (p *Plugin) acquireWorkloadIdentityToken(ctx context.Context, creds *WorkloadIdentityCredentials, scope string) (*auth.Token, error) {
+func (p *Plugin) acquireWorkloadIdentityToken(ctx context.Context, cfg *Config, creds *WorkloadIdentityCredentials, scope string) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
+
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	federatedToken, err := creds.GetFederatedToken()
 	if err != nil {
@@ -253,7 +274,7 @@ func (p *Plugin) acquireWorkloadIdentityToken(ctx context.Context, creds *Worklo
 		"scope":                 scope,
 	})
 
-	resp, err := p.httpClient.PostForm(ctx, tokenURL, data)
+	resp, err := httpClient.PostForm(ctx, tokenURL, data)
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
@@ -315,7 +336,12 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 
 	qualifiedScope := QualifyScope(req.Scope)
 
-	creds := p.resolveWorkloadIdentityCredentials()
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	creds := p.resolveWorkloadIdentityCredentialsForConfig(cfg)
 	if creds == nil {
 		return nil, fmt.Errorf("workload identity credentials not configured")
 	}
@@ -348,7 +374,7 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 	}
 
 	// Acquire new token
-	token, err := p.acquireWorkloadIdentityToken(ctx, creds, qualifiedScope)
+	token, err := p.acquireWorkloadIdentityToken(ctx, cfg, creds, qualifiedScope)
 	if err != nil {
 		return nil, err
 	}
@@ -369,9 +395,9 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 	}, nil
 }
 
-// workloadIdentityStatus returns the status for workload identity authentication.
-func (p *Plugin) workloadIdentityStatus() (*auth.Status, error) {
-	creds := p.resolveWorkloadIdentityCredentials()
+// workloadIdentityStatusForConfig returns the status for workload identity authentication.
+func (p *Plugin) workloadIdentityStatusForConfig(cfg *Config) (*auth.Status, error) {
+	creds := p.resolveWorkloadIdentityCredentialsForConfig(cfg)
 	if creds == nil {
 		return &auth.Status{Authenticated: false}, nil
 	}

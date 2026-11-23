@@ -31,6 +31,10 @@ func (unimplementedServerMode) GetStatus(context.Context) (*auth.Status, error) 
 	return nil, fmt.Errorf("get status is not supported in server mode")
 }
 
+func (unimplementedServerMode) GetGroups(context.Context) ([]string, error) {
+	return nil, fmt.Errorf("get groups is not supported in server mode")
+}
+
 func (unimplementedServerMode) ListCachedTokens(context.Context) ([]*auth.CachedTokenInfo, error) {
 	return nil, fmt.Errorf("list cached tokens is not supported in server mode")
 }

@@ -23,9 +23,29 @@ import (
 // HTTP response after a callback result is settled.
 const callbackShutdownTimeout = 5 * time.Second
 
-// defaultBrowserOpener opens a URL in the system browser using the oauth-helpers package.
+type browserPreferenceKeyType struct{}
+
+func withBrowserPreference(ctx context.Context, browser string) context.Context {
+	return context.WithValue(ctx, browserPreferenceKeyType{}, browser)
+}
+
+func browserPreferenceFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(browserPreferenceKeyType{}).(string)
+	return v
+}
+
+// defaultBrowserOpener opens a URL in the user's preferred or system browser
+// using the oauth-helpers package, logging fallback warnings when a configured
+// browser preference or $BROWSER cannot be launched.
 func defaultBrowserOpener(ctx context.Context, u string) error {
-	return oauth.OpenBrowser(ctx, u)
+	return oauth.OpenBrowserWithPreference(
+		ctx,
+		u,
+		browserPreferenceFromContext(ctx),
+		oauth.WithWarningHandler(func(msg string) {
+			logr.FromContextOrDiscard(ctx).V(0).Info(msg)
+		}),
+	)
 }
 
 // authCodeLogin performs the authorization code + PKCE authentication flow.
@@ -37,16 +57,22 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting authorization code + PKCE flow")
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
 	// Determine tenant
 	tenantID := req.TenantID
 	if tenantID == "" {
-		tenantID = p.config.TenantID
+		tenantID = cfg.TenantID
 	}
 
 	// Determine scopes
 	scopes := req.Scopes
 	if len(scopes) == 0 {
-		scopes = p.config.DefaultScopes
+		scopes = cfg.DefaultScopes
 	}
 
 	// Ensure OIDC scopes are included so the response contains an ID token
@@ -106,9 +132,9 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 	// (issue #71).
 	scopeStr := strings.Join(scopes, " ")
 	authURL := fmt.Sprintf("%s/%s/oauth2/v2.0/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&code_challenge=%s&code_challenge_method=S256&state=%s&prompt=select_account",
-		p.config.GetAuthority(),
+		cfg.GetAuthority(),
 		tenantID,
-		url.QueryEscape(p.config.ClientID),
+		url.QueryEscape(cfg.ClientID),
 		url.QueryEscape(redirectURI),
 		url.QueryEscape(scopeStr),
 		url.QueryEscape(codeChallenge),
@@ -120,9 +146,13 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 		authURL += "&claims=" + url.QueryEscape(claims)
 	}
 
-	// Open browser
-	lgr.V(1).Info("opening browser for authentication", "url", authURL)
-	browserOpenErr := p.openBrowser(ctx, authURL)
+	// Open browser, forwarding any caller-requested browser preference.
+	lgr.V(1).Info("opening browser for authentication", "url", authURL, "browser", req.Browser)
+	opener := p.openBrowser
+	if opener == nil {
+		opener = defaultBrowserOpener
+	}
+	browserOpenErr := opener(withBrowserPreference(ctx, req.Browser), authURL)
 	if browserOpenErr != nil {
 		if browserRequired {
 			return nil, fmt.Errorf("entra: auth_code: %w: %w", errBrowserUnavailable, browserOpenErr)
@@ -268,7 +298,7 @@ waitForAuthCode:
 	// Store refresh token and metadata before dropping cached access tokens
 	// from any previous identity, so a credential-write failure leaves a
 	// replaced session intact (issue #49).
-	if err := p.storeCredentials(ctx, tenantID, tokenResp, p.config.ClientID, scopes, "interactive", ""); err != nil {
+	if err := p.storeCredentials(ctx, tenantID, tokenResp, cfg.ClientID, scopes, "interactive", ""); err != nil {
 		settleCallback(false)
 		return nil, fmt.Errorf("entra: store_credentials: %w", err)
 	}
@@ -373,17 +403,26 @@ func parsePastedRedirect(pasted, redirectURI, expectedState string) (string, err
 // token endpoint. This is a public client flow (PKCE) so no client_secret
 // is sent.
 func (p *Plugin) exchangeAuthCode(ctx context.Context, tenantID, code, redirectURI, codeVerifier string) (*TokenResponse, error) {
-	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", p.config.GetAuthority(), tenantID)
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", cfg.GetAuthority(), tenantID)
 
 	data := makeFormData(map[string]string{
 		"grant_type":    "authorization_code",
-		"client_id":     p.config.ClientID,
+		"client_id":     cfg.ClientID,
 		"code":          code,
 		"redirect_uri":  redirectURI,
 		"code_verifier": codeVerifier,
 	})
 
-	resp, err := p.httpClient.PostForm(ctx, endpoint, data)
+	resp, err := httpClient.PostForm(ctx, endpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("token exchange request failed: %w", err)
 	}

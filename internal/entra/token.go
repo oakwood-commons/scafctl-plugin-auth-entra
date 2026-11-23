@@ -63,6 +63,15 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("minting access token", "scope", scope)
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	// Load paired refresh token and metadata under profile read lock.
 	refreshToken, metadata, err := p.loadSessionCredentials(ctx)
 	if err != nil {
@@ -72,7 +81,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	tenantID := metadata.MetaString(MetaKeyTenantID)
 
 	// Request new access token using refresh token
-	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", p.config.GetAuthority(), tenantID)
+	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", cfg.GetAuthority(), tenantID)
 
 	if metadata.ClientID == "" {
 		return nil, fmt.Errorf("stored credentials are missing client ID, please re-authenticate with '%s auth login entra'", p.binaryName())
@@ -85,7 +94,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		"scope":         ensureOfflineAccess(scope),
 	})
 
-	resp, err := p.httpClient.PostForm(ctx, endpoint, data)
+	resp, err := httpClient.PostForm(ctx, endpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
@@ -351,24 +360,35 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 // precedence over ambient service principal / workload identity environment
 // credentials in CLI mode (see cli_mode.go).
 func (p *Plugin) validStoredUserSession(ctx context.Context) (*auth.HandlerMetadata, bool) {
+	metadata, isUserSession, _ := p.inspectStoredSession(ctx)
+	if !isUserSession {
+		return nil, false
+	}
+	return metadata, true
+}
+
+// inspectStoredSession loads stored session credentials once and reports both
+// the parsed metadata (when loadable) and whether it qualifies as an active
+// interactive or device_code user session.
+func (p *Plugin) inspectStoredSession(ctx context.Context) (*auth.HandlerMetadata, bool, error) {
 	_, metadata, err := p.loadSessionCredentials(ctx)
 	if err != nil || metadata == nil {
-		return nil, false
+		return nil, false, err
 	}
 
 	if !metadata.ExpiresAt.IsZero() && time.Now().After(metadata.ExpiresAt) {
-		return nil, false
+		return metadata, false, nil
 	}
 
 	if metadata.ClientID == "" {
-		return nil, false
+		return metadata, false, nil
 	}
 
 	switch metadata.LastLoginFlow {
 	case auth.FlowInteractive, auth.FlowDeviceCode:
-		return metadata, true
+		return metadata, true, nil
 	default:
-		return nil, false
+		return metadata, false, nil
 	}
 }
 
@@ -568,10 +588,9 @@ func ensureOIDCScopes(scopes []string) []string {
 	for _, s := range scopes {
 		have[s] = true
 	}
-	required := requiredOIDCScopes()
-	result := make([]string, len(scopes), len(scopes)+len(required))
+	result := make([]string, len(scopes))
 	copy(result, scopes)
-	for _, s := range required {
+	for _, s := range requiredOIDCScopes() {
 		if !have[s] {
 			result = append(result, s)
 		}

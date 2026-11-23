@@ -255,8 +255,11 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 	return nil
 }
 
-// logoutIfSessionMatches clears stored credentials only if no concurrent login
-// has replaced expectedSessionID since the caller loaded it.
+// logoutIfSessionMatches clears stored credentials only when the stored
+// session metadata can be read and parsed and its SessionID still matches
+// expectedSessionID. Returning without deleting on GetSecret errors, absent
+// metadata, or parse failures ensures a transient read error during an old
+// refresh's invalid_grant cannot wipe a newer session.
 func (p *Plugin) logoutIfSessionMatches(ctx context.Context, expectedSessionID string) {
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
@@ -267,10 +270,13 @@ func (p *Plugin) logoutIfSessionMatches(ctx context.Context, expectedSessionID s
 	mu.Lock()
 	defer mu.Unlock()
 
-	if metaRaw, found, err := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); err == nil && found {
-		if curMeta, pErr := p.parseMetadata(metaRaw); pErr == nil && curMeta.SessionID != expectedSessionID {
-			return
-		}
+	metaRaw, found, err := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
+	if err != nil || !found || metaRaw == "" {
+		return
+	}
+	curMeta, parseErr := p.parseMetadata(metaRaw)
+	if parseErr != nil || curMeta.SessionID != expectedSessionID {
+		return
 	}
 
 	p.logoutLocked(ctx, hostClient)

@@ -175,9 +175,7 @@ func TestAuthCodeLogin_PostCallbackFailuresServeSafeFailurePage(t *testing.T) {
 					ExpiresIn:    3600,
 					IDToken:      validJWT,
 				})
-				fake.setSecretKeyErr = map[string]error{
-					SecretKeyRefreshToken: errors.New("keyring locked"),
-				}
+				fake.setSecretErr = errors.New("keyring locked")
 			},
 			wantTermErr:  "store_credentials",
 			forbidInHTML: "keyring locked",
@@ -855,7 +853,7 @@ func TestAuthCodeLogin_MetadataWriteFailureAccountReplacement(t *testing.T) {
 		assert.Contains(t, reqs[2].Endpoint, "/alice-tid/oauth2/v2.0/token")
 	})
 
-	t.Run("legacy mirror write failure when metadata rollback also fails clears secrets so no mismatched session remains usable", func(t *testing.T) {
+	t.Run("legacy mirror write failure after metadata commits keeps committed session intact without rewriting metadata", func(t *testing.T) {
 		httpMock := NewMockHTTPClient()
 		httpMock.AddResponse(http.StatusOK, TokenResponse{
 			AccessToken:  "alice-at-1",
@@ -866,6 +864,13 @@ func TestAuthCodeLogin_MetadataWriteFailureAccountReplacement(t *testing.T) {
 		})
 		httpMock.AddResponse(http.StatusOK, TokenResponse{
 			AccessToken:  "bob-at-1",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      bobJWT,
+		})
+		httpMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at-2",
 			RefreshToken: "bob-rt",
 			TokenType:    "Bearer",
 			ExpiresIn:    3600,
@@ -883,54 +888,161 @@ func TestAuthCodeLogin_MetadataWriteFailureAccountReplacement(t *testing.T) {
 		require.NoError(t, err)
 		<-aliceBrowserCh
 
-		// Allow Bob's versioned refresh-token write and initial metadata commit,
-		// then fail legacy refresh_token mirror AND fail metadata rollback so
-		// storeCredentials must purge all keys rather than leaving a mismatch.
+		// Allow Bob's versioned refresh-token write and metadata commit, then
+		// fail the legacy SecretKeyRefreshToken mirror write. Because metadataKey
+		// is the single forward commit point, storeCredentials must keep Bob's
+		// committed session intact and never rewrite or delete SecretKeyMetadata.
 		bobMetaWrites := 0
+		bobMetaDeletes := 0
 		var fnMu sync.Mutex
 		fake.mu.Lock()
-		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+		fake.setSecretFunc = func(_ context.Context, name, _ string) error {
 			fnMu.Lock()
 			defer fnMu.Unlock()
-			if strings.HasPrefix(name, SecretKeyRefreshToken+".") && value == "bob-rt" {
-				return nil
-			}
-			if name == SecretKeyMetadata && bobMetaWrites == 0 {
+			if name == SecretKeyMetadata {
 				bobMetaWrites++
-				return nil
 			}
-			return errors.New("keyring permanently unavailable")
+			if name == SecretKeyRefreshToken {
+				return errors.New("legacy refresh_token mirror failed")
+			}
+			return nil
+		}
+		fake.deleteSecretFunc = func(_ context.Context, name string) error {
+			fnMu.Lock()
+			defer fnMu.Unlock()
+			if name == SecretKeyMetadata {
+				bobMetaDeletes++
+			}
+			return nil
 		}
 		fake.mu.Unlock()
 
 		bobBrowserCh := runBrowserCallback(p)
-		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+		resp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
 			Flow:     auth.FlowInteractive,
 			TenantID: "bob-tid",
 		}, nil)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "store_credentials")
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.Equal(t, "bob-sub", resp.Claims.Subject)
 
 		bobOut := <-bobBrowserCh
 		require.NoError(t, bobOut.err)
-		assert.Equal(t, http.StatusServiceUnavailable, bobOut.status)
-		assert.Equal(t, wantFailure, bobOut.body)
-		assert.NotEqual(t, wantSuccess, bobOut.body)
-		assert.NotContains(t, bobOut.body, "keyring permanently unavailable")
+		assert.Equal(t, http.StatusOK, bobOut.status)
+		assert.Equal(t, wantSuccess, bobOut.body)
+		assert.NotEqual(t, wantFailure, bobOut.body)
+
+		fnMu.Lock()
+		assert.Equal(t, 1, bobMetaWrites, "metadataKey must be written once to commit and never rewritten on legacy mirror failure")
+		assert.Equal(t, 0, bobMetaDeletes, "metadataKey must never be deleted on legacy mirror failure")
+		fnMu.Unlock()
+
+		st, statusErr := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, statusErr)
+		require.True(t, st.Authenticated)
+		require.NotNil(t, st.Claims)
+		assert.Equal(t, "bob-sub", st.Claims.Subject)
+		assert.Equal(t, "bob@example.com", st.Claims.Username)
+		assert.Equal(t, "bob-tid", st.TenantID)
+
+		tokResp, tokErr := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://graph.microsoft.com/.default",
+			ForceRefresh: true,
+		})
+		require.NoError(t, tokErr)
+		assert.Equal(t, "bob-at-2", tokResp.AccessToken)
+
+		reqs := httpMock.GetRequests()
+		require.Len(t, reqs, 3)
+		assert.Equal(t, "bob-rt", reqs[2].Data.Get("refresh_token"), "versioned refresh token must serve committed session even when legacy mirror fails")
+	})
+}
+
+func TestLogoutIfSessionMatches_RequiresPositiveSessionProof(t *testing.T) {
+	clearCredentialEnv(t)
+
+	seedBobSession := func(t *testing.T) (*Plugin, *fakeHostService, string) {
+		t.Helper()
+		p, fake := newTestPlugin(t, nil, nil)
+		bobToken := &TokenResponse{
+			AccessToken:  "bob-at",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken: makeTestJWT(map[string]any{
+				"sub":                "bob-sub",
+				"oid":                "bob-oid",
+				"tid":                "bob-tid",
+				"preferred_username": "bob@example.com",
+			}),
+		}
+		require.NoError(t, p.storeCredentials(context.Background(), "bob-tid", bobToken, p.config.ClientID, []string{"openid", "profile", "offline_access"}, auth.FlowInteractive, "bob-session-id"))
+		fake.secrets[SecretKeyTokenPrefix+"cached-graph"] = `{"accessToken":"bob-cached-at"}`
+		return p, fake, "bob-session-id"
+	}
+
+	t.Run("GetSecret RPC error on metadata does not delete stored session", func(t *testing.T) {
+		p, fake, sessionID := seedBobSession(t)
+		fake.mu.Lock()
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyMetadata {
+				return errors.New("transient secret store RPC failure")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		p.logoutIfSessionMatches(context.Background(), sessionID)
+
+		// Restore healthy reads and confirm Bob's session and cached token remain intact.
+		fake.mu.Lock()
+		fake.getSecretFunc = nil
+		_, hasCached := fake.secrets[SecretKeyTokenPrefix+"cached-graph"]
+		fake.mu.Unlock()
+		assert.True(t, hasCached, "cached token must not be cleared on metadata GetSecret error")
+
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.True(t, st.Authenticated, "session must remain authenticated when metadata read fails")
+		assert.Equal(t, "bob-sub", st.Claims.Subject)
+	})
+
+	t.Run("corrupted or unparseable metadata does not delete stored secrets", func(t *testing.T) {
+		p, fake, sessionID := seedBobSession(t)
+		fake.mu.Lock()
+		fake.secrets[SecretKeyMetadata] = "{corrupt-json"
+		fake.mu.Unlock()
+
+		p.logoutIfSessionMatches(context.Background(), sessionID)
+
+		fake.mu.Lock()
+		assert.Equal(t, "bob-rt", fake.secrets[SecretKeyRefreshToken])
+		assert.Contains(t, fake.secrets, SecretKeyTokenPrefix+"cached-graph")
+		fake.mu.Unlock()
+	})
+
+	t.Run("empty or absent metadata does not delete stored secrets", func(t *testing.T) {
+		p, fake, sessionID := seedBobSession(t)
+		fake.mu.Lock()
+		delete(fake.secrets, SecretKeyMetadata)
+		fake.mu.Unlock()
+
+		p.logoutIfSessionMatches(context.Background(), sessionID)
+
+		fake.mu.Lock()
+		assert.Equal(t, "bob-rt", fake.secrets[SecretKeyRefreshToken])
+		assert.Contains(t, fake.secrets, SecretKeyTokenPrefix+"cached-graph")
+		fake.mu.Unlock()
+	})
+
+	t.Run("matching SessionID deletes session when metadata is readable and valid", func(t *testing.T) {
+		p, fake, sessionID := seedBobSession(t)
+
+		p.logoutIfSessionMatches(context.Background(), sessionID)
 
 		fake.mu.Lock()
 		assert.Empty(t, fake.secrets)
 		fake.mu.Unlock()
-
-		st, statusErr := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
-		require.NoError(t, statusErr)
-		assert.False(t, st.Authenticated, "no mismatched session may remain usable when rollback fails")
-
-		_, tokErr := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
-			Scope: "https://graph.microsoft.com/.default",
-		})
-		require.Error(t, tokErr)
-		assert.Contains(t, tokErr.Error(), "not authenticated")
 	})
 }
 

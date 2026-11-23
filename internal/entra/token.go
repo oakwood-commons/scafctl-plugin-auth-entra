@@ -302,7 +302,6 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 			prevRevID = prevMeta.MetaString(metaKeyRefreshTokenID)
 		}
 	}
-	_, hadPrevLegacyRT, prevLegacyErr := hostClient.GetSecret(ctx, legacyRefreshKey)
 
 	// 1. Write the new refresh token under a unique revision key first so no
 	// existing or concurrent login's refresh token is overwritten before
@@ -311,10 +310,10 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 		return fmt.Errorf("failed to store refresh token: %w", err)
 	}
 
-	// 2. Commit metadata pointing at verRefreshKey (and its SHA-256 digest).
-	// If this fails, neither metadataKey nor legacyRefreshKey nor any other
-	// writer's versioned key was modified; simply remove our unreferenced
-	// verRefreshKey under a bounded cleanup timeout.
+	// 2. Single forward commit point: write metadata pointing at verRefreshKey
+	// (and its SHA-256 digest). If this fails, neither metadataKey nor
+	// legacyRefreshKey nor any other writer's versioned key was modified;
+	// simply remove our unreferenced verRefreshKey under a bounded timeout.
 	if err := hostClient.SetSecret(ctx, metadataKey, metadataRaw); err != nil {
 		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
 		defer cleanupCancel()
@@ -322,29 +321,12 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 		return fmt.Errorf("failed to store metadata: %w", err)
 	}
 
-	// 3. Mirror to legacyRefreshKey for backward compatibility. Only update or
-	// roll back if no concurrent process superseded metadataKey after step 2.
+	// 3. Best-effort mirror to legacyRefreshKey for backward compatibility.
+	// Once metadataKey has committed above, loadSessionCredentials resolves the
+	// refresh token from verRefreshKey via refreshTokenId, so a mirror failure
+	// must never roll back, rewrite, or delete metadataKey or verRefreshKey.
 	if err := hostClient.SetSecret(ctx, legacyRefreshKey, tokenResp.RefreshToken); err != nil {
-		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
-		defer cleanupCancel()
-
-		curMetaRaw, curMetaFound, curMetaErr := hostClient.GetSecret(cleanupCtx, metadataKey)
-		if curMetaErr == nil && curMetaFound && curMetaRaw == metadataRaw {
-			if prevMetaErr == nil && hadPrevMeta && prevLegacyErr == nil && hadPrevLegacyRT {
-				if rbErr := hostClient.SetSecret(cleanupCtx, metadataKey, prevMetaRaw); rbErr != nil {
-					_ = hostClient.DeleteSecret(cleanupCtx, metadataKey)
-					_ = hostClient.DeleteSecret(cleanupCtx, legacyRefreshKey)
-					if prevRevID != "" {
-						_ = hostClient.DeleteSecret(cleanupCtx, p.versionedRefreshKey(ctx, prevRevID))
-					}
-				}
-			} else {
-				_ = hostClient.DeleteSecret(cleanupCtx, metadataKey)
-				_ = hostClient.DeleteSecret(cleanupCtx, legacyRefreshKey)
-			}
-		}
-		_ = hostClient.DeleteSecret(cleanupCtx, verRefreshKey)
-		return fmt.Errorf("failed to store refresh token: %w", err)
+		logr.FromContextOrDiscard(ctx).V(1).Info("warning: failed to mirror refresh token to legacy secret key", "error", err)
 	}
 
 	// 4. Garbage-collect the specific revision superseded by this write if it

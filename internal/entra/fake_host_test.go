@@ -18,6 +18,7 @@ import (
 type fakeHostService struct {
 	mu               sync.Mutex
 	secrets          map[string]string
+	getSecretFunc    func(ctx context.Context, name string) error
 	setSecretErr     error
 	setSecretKeyErr  map[string]error
 	setSecretFunc    func(ctx context.Context, name, value string) error
@@ -46,7 +47,16 @@ func newFakeHostClient(fake *fakeHostService) *sdkplugin.HostServiceClient {
 	return hc
 }
 
-func (f *fakeHostService) GetSecret(_ context.Context, in *proto.GetSecretRequest, _ ...grpc.CallOption) (*proto.GetSecretResponse, error) {
+func (f *fakeHostService) GetSecret(ctx context.Context, in *proto.GetSecretRequest, _ ...grpc.CallOption) (*proto.GetSecretResponse, error) {
+	f.mu.Lock()
+	fn := f.getSecretFunc
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(ctx, in.Name); err != nil {
+			return nil, err
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	v, ok := f.secrets[in.Name]

@@ -961,7 +961,7 @@ func TestGetGroups(t *testing.T) {
 		entryBytes, _ := json.Marshal(entry)
 		fake.secrets[SecretKeyTokenPrefix+cacheKey] = string(entryBytes)
 
-		groups, err := p.GetGroups(ctx)
+		groups, err := p.GetGroups(ctx, HandlerName)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"group1", "group2"}, groups)
 
@@ -977,7 +977,7 @@ func TestGetGroups(t *testing.T) {
 		t.Setenv(EnvAzureTenantID, "sp-tenant")
 		t.Setenv(EnvAzureClientSecret, "sp-secret")
 
-		_, err := p.GetGroups(context.Background())
+		_, err := p.GetGroups(context.Background(), HandlerName)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "service principal")
 	})
@@ -1008,7 +1008,7 @@ func TestGetGroups(t *testing.T) {
 		entryBytes, _ := json.Marshal(entry)
 		fake.secrets[SecretKeyTokenPrefix+cacheKey] = string(entryBytes)
 
-		_, err := p.GetGroups(ctx)
+		_, err := p.GetGroups(ctx, HandlerName)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "network error")
 	})

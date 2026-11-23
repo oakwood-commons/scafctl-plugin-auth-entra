@@ -17,6 +17,7 @@ type mode interface {
 	Logout(ctx context.Context) error
 	GetStatus(ctx context.Context) (*auth.Status, error)
 	GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sdkplugin.TokenResponse, error)
+	GetGroups(ctx context.Context) ([]string, error)
 	ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo, error)
 	PurgeExpiredTokens(ctx context.Context) (int, error)
 	DetectAvailableFlows(ctx context.Context) ([]sdkplugin.FlowAvailability, error)

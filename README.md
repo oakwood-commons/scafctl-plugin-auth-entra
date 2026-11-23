@@ -92,6 +92,7 @@ built-in trusted list for `entra` is `login.microsoftonline.com` and
 | `AZURE_FEDERATED_TOKEN_FILE` | Path to projected SA token (workload identity) |
 | `AZURE_FEDERATED_TOKEN` | Raw federated token (workload identity, testing) |
 | `AZURE_AUTHORITY_HOST` | Authority URL for the workload identity flow only (defaults to `https://login.microsoftonline.com`); other flows use the `authority` config key |
+| `BROWSER` | Preferred browser executable or fallback list for interactive login when `--browser` is not passed; falls back to the OS default browser with a warning if unavailable |
 
 Setting the matching config key (`clientId`, `tenantId`, `authority`,
 `clientSecret`, `federatedTokenFile`, `federatedToken`) takes precedence
@@ -110,13 +111,29 @@ In CLI mode, credentials are resolved in this order:
 
 An explicit user login is a stronger signal of intent than ambient
 environment variables: once a user session is stored, `auth status`, `auth
-token`, and every provider call use the logged-in user even on machines where
-the `AZURE_*` service principal / workload identity variables are set (common
-for Terraform and the Azure SDKs).
+token`, group membership queries (`GetGroups`), and every provider call use
+the logged-in user even on machines where the `AZURE_*` service principal /
+workload identity variables are set (common for Terraform and the Azure SDKs).
 
 `scafctl auth logout entra` clears the stored session and restores
 environment-credential behavior. An expired or corrupted session is ignored
 and falls back to environment credentials the same way.
+
+### Group Membership Queries
+
+The plugin implements `plugin.AuthGroupsProvider` (`AuthHandlerService.GetGroups`),
+resolving group ObjectIDs from Microsoft Graph
+(`/v1.0/me/memberOf/microsoft.graph.group?$select=id&$top=999`) with automatic
+pagination so users in more than 200 groups (JWT group-claim overage) and
+provider `GetAuthGroups("entra")` calls receive the full membership list.
+
+Because `/me/memberOf` requires a delegated user token, group queries are
+supported only for `interactive` and `device-code` user sessions in CLI mode.
+When a valid user session is stored for the requested profile, it is used even
+when ambient `AZURE_*` service-principal or workload-identity variables are
+set; when only `service-principal` or `workload-identity` credentials exist (or
+the plugin runs in server mode), `GetGroups` returns a clear unsupported-flow
+error.
 
 Note: `scafctl auth login entra --flow interactive` consults the resulting
 status before running the flow. On a machine with SP/WI env variables set and
@@ -143,6 +160,9 @@ scafctl auth login entra --tenant <tenant-id> --client-id <client-id>
 
 # Login to a named profile (always shows the Entra account picker)
 scafctl auth login entra --profile personal
+
+# Open a specific browser (e.g., managed Edge for Conditional Access policies)
+scafctl auth login entra --flow interactive --browser msedge
 
 # Interactive login over SSH or in a devcontainer: forward the port and
 # pin it so the redirect URI is predictable

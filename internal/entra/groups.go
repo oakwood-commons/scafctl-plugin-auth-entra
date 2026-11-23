@@ -11,6 +11,7 @@ import (
 	"net/http"
 
 	"github.com/go-logr/logr"
+	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
@@ -33,18 +34,46 @@ type graphGroupEntry struct {
 	ID string `json:"id"`
 }
 
-// GetGroups returns the ObjectIDs of all Microsoft Entra groups the authenticated
+// getGroups returns the ObjectIDs of all Microsoft Entra groups the authenticated
 // user belongs to. It always calls the Microsoft Graph API (bypassing the 200-group
 // JWT token limit) and handles pagination transparently.
-func (p *Plugin) GetGroups(ctx context.Context) ([]string, error) {
+//
+// Credential precedence mirrors GetStatus and GetToken: a valid stored user
+// session (interactive or device_code) takes precedence over ambient
+// service-principal or workload-identity credentials, so developers with
+// AZURE_* environment variables set can still resolve group memberships after
+// logging in interactively. Non-user flows are rejected only when no valid user
+// session is stored for the target profile (or when the stored/resolved token
+// belongs to a non-user flow).
+func (p *Plugin) getGroups(ctx context.Context) ([]string, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	// /me/memberOf requires a delegated (user) token
-	if p.hasWorkloadIdentityCredentials() {
-		return nil, fmt.Errorf("group membership queries are not supported for workload identity flows")
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if p.hasServicePrincipalCredentials() {
-		return nil, fmt.Errorf("group membership queries are not supported for service principal flows")
+	ctx = withResolvedConfig(ctx, cfg)
+
+	graphClient, err := p.graphClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// /me/memberOf requires a delegated (user) token. Honor a valid stored
+	// interactive/device-code user session first before rejecting ambient or
+	// configured non-user flows, inspecting stored session credentials once.
+	if metadata, hasUserSession, loadErr := p.inspectStoredSession(ctx); !hasUserSession {
+		if p.hasWorkloadIdentityCredentialsForConfig(cfg) {
+			return nil, fmt.Errorf("group membership queries are not supported for workload identity flows")
+		}
+		if p.hasServicePrincipalCredentialsForConfig(cfg) {
+			return nil, fmt.Errorf("group membership queries are not supported for service principal flows")
+		}
+		if loadErr == nil && metadata != nil {
+			if flowErr := rejectNonUserGroupFlow(metadata.LastLoginFlow); flowErr != nil {
+				return nil, flowErr
+			}
+		}
 	}
 
 	// Acquire a Graph access token via the existing token machinery.
@@ -52,15 +81,18 @@ func (p *Plugin) GetGroups(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire Graph token for group lookup: %w", err)
 	}
+	if flowErr := rejectNonUserGroupFlow(tokenResp.Flow); flowErr != nil {
+		return nil, flowErr
+	}
 
 	// Paginate through all group memberships.
-	var groups []string
+	groups := make([]string, 0)
 	nextURL := graphGroupsMemberOfURL
 
 	for nextURL != "" {
 		lgr.V(1).Info("fetching group memberships from Graph", "url", nextURL)
 
-		resp, err := p.graphClient.Get(ctx, nextURL, tokenResp.AccessToken)
+		resp, err := graphClient.Get(ctx, nextURL, tokenResp.AccessToken)
 		if err != nil {
 			return nil, fmt.Errorf("graph memberOf request failed: %w", err)
 		}
@@ -92,6 +124,19 @@ func (p *Plugin) GetGroups(ctx context.Context) ([]string, error) {
 
 	lgr.V(1).Info("fetched all group memberships", "count", len(groups))
 	return groups, nil
+}
+
+// rejectNonUserGroupFlow returns an error when flow represents a non-delegated
+// machine identity that cannot call Microsoft Graph /me/memberOf.
+func rejectNonUserGroupFlow(flow auth.Flow) error {
+	switch flow { //nolint:exhaustive // only machine flows are rejected here
+	case auth.FlowWorkloadIdentity:
+		return fmt.Errorf("group membership queries are not supported for workload identity flows")
+	case auth.FlowServicePrincipal, auth.FlowClientCredentials:
+		return fmt.Errorf("group membership queries are not supported for service principal flows")
+	default:
+		return nil
+	}
 }
 
 // truncate limits s to at most n bytes for safe error message embedding.

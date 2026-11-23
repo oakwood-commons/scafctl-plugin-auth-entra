@@ -62,11 +62,18 @@ func HasServicePrincipalCredentials() bool {
 // explicitly configured values (profile or top-level config) over environment
 // variables.
 func (p *Plugin) resolveServicePrincipalCredentials() *ServicePrincipalCredentials {
+	return p.resolveServicePrincipalCredentialsForConfig(p.config)
+}
+
+func (p *Plugin) resolveServicePrincipalCredentialsForConfig(cfg *Config) *ServicePrincipalCredentials {
+	if cfg == nil {
+		cfg = p.config
+	}
 	// Prefer explicitly configured values, fall back to env vars. Fields not
 	// provided in the config fall through to the environment variable.
-	clientID := p.profileOrEnv(p.config.ClientID, "clientId", EnvAzureClientID)
-	tenantID := p.profileOrEnv(p.config.TenantID, "tenantId", EnvAzureTenantID)
-	clientSecret := p.profileOrEnv(p.config.ClientSecret, "clientSecret", EnvAzureClientSecret)
+	clientID := cfg.profileOrEnv(cfg.ClientID, "clientId", EnvAzureClientID)
+	tenantID := cfg.profileOrEnv(cfg.TenantID, "tenantId", EnvAzureTenantID)
+	clientSecret := cfg.profileOrEnv(cfg.ClientSecret, "clientSecret", EnvAzureClientSecret)
 
 	if clientID == "" || tenantID == "" || clientSecret == "" {
 		return nil
@@ -85,12 +92,21 @@ func (p *Plugin) hasServicePrincipalCredentials() bool {
 	return p.resolveServicePrincipalCredentials() != nil
 }
 
+func (p *Plugin) hasServicePrincipalCredentialsForConfig(cfg *Config) bool {
+	return p.resolveServicePrincipalCredentialsForConfig(cfg) != nil
+}
+
 // servicePrincipalLogin validates SP credentials by acquiring a token.
 func (p *Plugin) servicePrincipalLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting service principal login", "handler", HandlerName)
 
-	creds := p.resolveServicePrincipalCredentials()
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	creds := p.resolveServicePrincipalCredentialsForConfig(cfg)
 	if creds == nil {
 		return nil, fmt.Errorf("service principal credentials not configured: set %s, %s, and %s environment variables or configure clientId, tenantId, and clientSecret in config",
 			EnvAzureClientID, EnvAzureTenantID, EnvAzureClientSecret)
@@ -110,7 +126,7 @@ func (p *Plugin) servicePrincipalLogin(ctx context.Context, req sdkplugin.LoginR
 	}
 
 	// Acquire a token to validate credentials
-	token, err := p.acquireServicePrincipalToken(ctx, creds, scope)
+	token, err := p.acquireServicePrincipalToken(ctx, cfg, creds, scope)
 	if err != nil {
 		return nil, fmt.Errorf("service principal authentication failed: %w", err)
 	}
@@ -131,10 +147,18 @@ func (p *Plugin) servicePrincipalLogin(ctx context.Context, req sdkplugin.LoginR
 }
 
 // acquireServicePrincipalToken acquires a token using the client credentials flow.
-func (p *Plugin) acquireServicePrincipalToken(ctx context.Context, creds *ServicePrincipalCredentials, scope string) (*auth.Token, error) {
+func (p *Plugin) acquireServicePrincipalToken(ctx context.Context, cfg *Config, creds *ServicePrincipalCredentials, scope string) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
+	if cfg == nil {
+		cfg = p.config
+	}
 
-	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", p.config.GetAuthority(), creds.TenantID)
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", cfg.GetAuthority(), creds.TenantID)
 
 	data := makeFormData(map[string]string{
 		"grant_type":    "client_credentials",
@@ -148,7 +172,7 @@ func (p *Plugin) acquireServicePrincipalToken(ctx context.Context, creds *Servic
 		"scope", scope,
 	)
 
-	resp, err := p.httpClient.PostForm(ctx, endpoint, data)
+	resp, err := httpClient.PostForm(ctx, endpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
@@ -212,7 +236,12 @@ func (p *Plugin) getServicePrincipalToken(ctx context.Context, req sdkplugin.Tok
 
 	qualifiedScope := QualifyScope(req.Scope)
 
-	creds := p.resolveServicePrincipalCredentials()
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	creds := p.resolveServicePrincipalCredentialsForConfig(cfg)
 	if creds == nil {
 		return nil, fmt.Errorf("service principal credentials not configured")
 	}
@@ -224,7 +253,7 @@ func (p *Plugin) getServicePrincipalToken(ctx context.Context, req sdkplugin.Tok
 
 	hostClient := p.hostClient(ctx)
 	prefix := p.tokenCachePrefix(ctx)
-	fp := fingerprintHash(creds.ClientID + ":" + creds.TenantID + ":" + p.config.GetAuthority())
+	fp := fingerprintHash(creds.ClientID + ":" + creds.TenantID + ":" + cfg.GetAuthority())
 	fullKey := prefix + fp + ":" + qualifiedScope
 
 	// Check cache first
@@ -245,7 +274,7 @@ func (p *Plugin) getServicePrincipalToken(ctx context.Context, req sdkplugin.Tok
 	}
 
 	// Acquire new token
-	token, err := p.acquireServicePrincipalToken(ctx, creds, qualifiedScope)
+	token, err := p.acquireServicePrincipalToken(ctx, cfg, creds, qualifiedScope)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +297,11 @@ func (p *Plugin) getServicePrincipalToken(ctx context.Context, req sdkplugin.Tok
 
 // servicePrincipalStatus returns the status for SP authentication.
 func (p *Plugin) servicePrincipalStatus() (*auth.Status, error) {
-	creds := p.resolveServicePrincipalCredentials()
+	return p.servicePrincipalStatusForConfig(p.config)
+}
+
+func (p *Plugin) servicePrincipalStatusForConfig(cfg *Config) (*auth.Status, error) {
+	creds := p.resolveServicePrincipalCredentialsForConfig(cfg)
 	if creds == nil {
 		return &auth.Status{Authenticated: false}, nil
 	}

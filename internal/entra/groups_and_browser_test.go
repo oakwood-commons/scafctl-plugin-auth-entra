@@ -18,9 +18,11 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/oakwood-commons/httpc"
 	"github.com/oakwood-commons/scafctl-plugin-auth-entra/internal/clock"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
@@ -806,6 +808,7 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 				HandlerName: json.RawMessage(`{"httpClient":{"timeout":"1ns","retryMax":0}}`),
 			},
 		}))
+		t.Cleanup(func() { _ = p.StopAuthHandler(context.Background(), HandlerName) })
 		initHTTPClient := p.httpClient
 		initGraphClient := p.graphClient
 
@@ -820,33 +823,223 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		assert.Same(t, initGraphClient, gotGraph)
 
 		// A per-RPC config omitting httpClient (cfg.HTTPClient == nil) must NOT
-		// inherit the initial profile's 1ns timeout; it builds clean default clients.
+		// inherit the initial profile's 1ns timeout; it builds clean default clients
+		// and reuses those cached instances across subsequent calls.
 		cleanCfg, err := parseHandlerConfig([]byte(`{"tenantId":"other-tenant"}`))
 		require.NoError(t, err)
 		cleanHTTP, err := p.httpClientForConfig(context.Background(), cleanCfg)
 		require.NoError(t, err)
 		assert.NotSame(t, initHTTPClient, cleanHTTP)
+		cleanHTTP2, err := p.httpClientForConfig(context.Background(), cleanCfg)
+		require.NoError(t, err)
+		assert.Same(t, cleanHTTP, cleanHTTP2, "repeated calls with identical effective httpClient config must reuse the cached HTTPClient")
+
 		cleanGraph, err := p.graphClientForConfig(context.Background(), cleanCfg)
 		require.NoError(t, err)
 		assert.NotSame(t, initGraphClient, cleanGraph)
+		cleanGraph2, err := p.graphClientForConfig(context.Background(), cleanCfg)
+		require.NoError(t, err)
+		assert.Same(t, cleanGraph, cleanGraph2, "repeated calls with identical effective httpClient config must reuse the cached GraphClient")
 
-		// Verify the clean default Graph client actually succeeds against a real HTTP test server
-		// while the init-time 1ns client times out.
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Verify a per-RPC Graph client succeeds against a real HTTP test server
+		// while reusing a single keep-alive TCP connection across repeated calls.
+		var newConns atomic.Int32
+		ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			time.Sleep(5 * time.Millisecond)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"value":[{"id":"g1"}]}`))
 		}))
+		ts.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				newConns.Add(1)
+			}
+		}
+		ts.Start()
 		defer ts.Close()
 
-		// Enable private loopback IPs explicitly on a per-RPC config to verify real HTTP round-trip.
-		loopbackCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","retryMax":0,"allowPrivateIPs":true}}`))
+		// Semantically equivalent durations ("5s" vs "5000ms") resolve to the same cache entry.
+		loopbackCfgA, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","allowPrivateIPs":true}}`))
 		require.NoError(t, err)
-		loopbackGraph, err := p.graphClientForConfig(context.Background(), loopbackCfg)
+		loopbackCfgB, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5000ms","allowPrivateIPs":true,"enableCache":false}}`))
 		require.NoError(t, err)
-		resp, err := loopbackGraph.Get(context.Background(), ts.URL, "bearer-test")
+		loopbackGraphA, err := p.graphClientForConfig(context.Background(), loopbackCfgA)
 		require.NoError(t, err)
-		_ = resp.Body.Close()
-		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		loopbackGraphB, err := p.graphClientForConfig(context.Background(), loopbackCfgB)
+		require.NoError(t, err)
+		assert.Same(t, loopbackGraphA, loopbackGraphB)
+
+		for range 4 {
+			resp, reqErr := loopbackGraphA.Get(context.Background(), ts.URL, "bearer-test")
+			require.NoError(t, reqErr)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		}
+		assert.Equal(t, int32(1), newConns.Load(), "cached per-RPC GraphClient must reuse keep-alive connections across calls")
+	})
+
+	t.Run("per-RPC HTTP and Graph client caches preserve circuit breaker state across RPCs, isolate distinct configs, and close idle connections on LRU eviction and shutdown", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		// 1. Circuit breaker state persists across repeated RPCs sharing custom per-RPC httpClient settings.
+		var plainHits atomic.Int32
+		plainFailingTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			plainHits.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"server_error"}`))
+		}))
+		defer plainFailingTS.Close()
+
+		p := &Plugin{clientCacheSize: 2}
+		require.NoError(t, p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			BinaryName: "scafctl",
+		}))
+
+		cbCfgJSON := `{"httpClient":{"timeout":"2s","retryMax":1,"retryWaitMin":"1ms","retryWaitMax":"2ms","allowPrivateIPs":true,"enableCircuitBreaker":true,"circuitBreakerMaxFailures":2,"circuitBreakerOpenTimeout":"1m"}}`
+		cbCfg1, err := parseHandlerConfig([]byte(cbCfgJSON))
+		require.NoError(t, err)
+		cbCfg2, err := parseHandlerConfig([]byte(cbCfgJSON))
+		require.NoError(t, err)
+
+		// Call #1 and #2 build separate *Config instances (simulating two separate RPCs)
+		// that resolve to the SAME cached *DefaultHTTPClient, accumulating 2 failures to open the breaker.
+		hc1, err := p.httpClientForConfig(context.Background(), cbCfg1)
+		require.NoError(t, err)
+		resp1, err1 := hc1.PostForm(context.Background(), plainFailingTS.URL, url.Values{"grant_type": {"client_credentials"}})
+		if resp1 != nil {
+			_ = resp1.Body.Close()
+		}
+		require.Error(t, err1)
+
+		hc2, err := p.httpClientForConfig(context.Background(), cbCfg2)
+		require.NoError(t, err)
+		assert.Same(t, hc1, hc2)
+		resp2, err2 := hc2.PostForm(context.Background(), plainFailingTS.URL, url.Values{"grant_type": {"client_credentials"}})
+		if resp2 != nil {
+			_ = resp2.Body.Close()
+		}
+		require.Error(t, err2)
+		hitsBeforeOpen := plainHits.Load()
+		assert.GreaterOrEqual(t, hitsBeforeOpen, int32(2))
+
+		// Call #3 with the same per-RPC HTTP config MUST fail fast with ErrCircuitBreakerOpen
+		// without making any network request to plainFailingTS.
+		cbCfg3, err := parseHandlerConfig([]byte(cbCfgJSON))
+		require.NoError(t, err)
+		hc3, err := p.httpClientForConfig(context.Background(), cbCfg3)
+		require.NoError(t, err)
+		_, err3 := hc3.PostForm(context.Background(), plainFailingTS.URL, url.Values{"grant_type": {"client_credentials"}})
+		require.Error(t, err3)
+		assert.ErrorIs(t, err3, httpc.ErrCircuitBreakerOpen)
+		assert.Equal(t, hitsBeforeOpen, plainHits.Load(), "open circuit breaker must short-circuit before hitting upstream")
+
+		// A distinct per-RPC HTTP config gets its own isolated client whose breaker is still closed.
+		otherCBCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"3s","retryMax":1,"retryWaitMin":"1ms","retryWaitMax":"2ms","allowPrivateIPs":true,"enableCircuitBreaker":true,"circuitBreakerMaxFailures":2,"circuitBreakerOpenTimeout":"1m"}}`))
+		require.NoError(t, err)
+		hcOther, err := p.httpClientForConfig(context.Background(), otherCBCfg)
+		require.NoError(t, err)
+		assert.NotSame(t, hc1, hcOther)
+
+		// 2. Bounded LRU eviction & StopAuthHandler close idle transport connections.
+		var closedConns atomic.Int32
+		keepAliveTS := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"value":[{"id":"grp-1"}]}`))
+		}))
+		keepAliveTS.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				closedConns.Add(1)
+			}
+		}
+		keepAliveTS.Start()
+		defer keepAliveTS.Close()
+
+		evictPlugin := &Plugin{clientCacheSize: 2}
+		require.NoError(t, evictPlugin.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			BinaryName: "scafctl",
+		}))
+
+		cfgK1, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"4s","allowPrivateIPs":true}}`))
+		require.NoError(t, err)
+		cfgK2, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","allowPrivateIPs":true}}`))
+		require.NoError(t, err)
+		cfgK3, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"6s","allowPrivateIPs":true}}`))
+		require.NoError(t, err)
+
+		gc1, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
+		require.NoError(t, err)
+		gc2, err := evictPlugin.graphClientForConfig(context.Background(), cfgK2)
+		require.NoError(t, err)
+		assert.Equal(t, 2, evictPlugin.graphClientCache.Len())
+
+		// Open one idle keep-alive connection on both gc1 and gc2.
+		for _, gc := range []GraphClient{gc1, gc2} {
+			r, getErr := gc.Get(context.Background(), keepAliveTS.URL, "tok")
+			require.NoError(t, getErr)
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+		}
+		assert.Equal(t, int32(0), closedConns.Load(), "keep-alive connections remain idle before eviction")
+
+		// Touch K1 so K2 becomes the least-recently-used entry, then insert K3.
+		gc1Again, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
+		require.NoError(t, err)
+		assert.Same(t, gc1, gc1Again)
+
+		_, err = evictPlugin.graphClientForConfig(context.Background(), cfgK3)
+		require.NoError(t, err)
+		assert.Equal(t, 2, evictPlugin.graphClientCache.Len(), "cache must stay bounded at clientCacheSize")
+
+		// Evicting K2 must close K2's idle keep-alive socket promptly while keeping K1's open.
+		require.Eventually(t, func() bool {
+			return closedConns.Load() == 1
+		}, 2*time.Second, 10*time.Millisecond, "LRU eviction must close evicted client's idle connections")
+
+		gc1StillCached, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
+		require.NoError(t, err)
+		assert.Same(t, gc1, gc1StillCached, "promoted MRU entry K1 must survive eviction")
+
+		// StopAuthHandler closes all remaining cached clients (closing K1's idle connection).
+		require.NoError(t, evictPlugin.StopAuthHandler(context.Background(), HandlerName))
+		require.Eventually(t, func() bool {
+			return closedConns.Load() == 2
+		}, 2*time.Second, 10*time.Millisecond, "StopAuthHandler must close remaining cached idle connections")
+	})
+
+	t.Run("concurrent -race stress over bounded HTTP and Graph client caches", func(t *testing.T) {
+		p := &Plugin{clientCacheSize: 4}
+		require.NoError(t, p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			BinaryName: "scafctl",
+		}))
+
+		const goroutines = 24
+		const iterations = 20
+		var wg sync.WaitGroup
+		for g := range goroutines {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for i := range iterations {
+					sec := ((id + i) % 8) + 1 // 8 distinct configs > cache size 4 -> continuous hits, misses, promotions, evictions
+					raw := fmt.Sprintf(`{"httpClient":{"timeout":"%ds","allowPrivateIPs":true}}`, sec)
+					cfg, parseErr := parseHandlerConfig([]byte(raw))
+					assert.NoError(t, parseErr)
+
+					hc, hErr := p.httpClientForConfig(context.Background(), cfg)
+					assert.NoError(t, hErr)
+					assert.NotNil(t, hc)
+
+					gc, gErr := p.graphClientForConfig(context.Background(), cfg)
+					assert.NoError(t, gErr)
+					assert.NotNil(t, gc)
+				}
+			}(g)
+		}
+		wg.Wait()
+
+		assert.LessOrEqual(t, p.httpClientCache.Len(), 4)
+		assert.LessOrEqual(t, p.graphClientCache.Len(), 4)
+		assert.Equal(t, DefaultClientID, p.config.ClientID, "p.config must never be mutated")
+		require.NoError(t, p.StopAuthHandler(context.Background(), HandlerName))
 	})
 }

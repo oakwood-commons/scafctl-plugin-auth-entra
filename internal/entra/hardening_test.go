@@ -336,6 +336,7 @@ func TestAuthCodeLoginCallbackErrorSanitized(t *testing.T) {
 			q := cb.Query()
 			q.Set("error", "access_denied")
 			q.Set("error_description", "\x1b[31mred\x1b[0m user denied consent")
+			q.Set("state", u.Query().Get("state"))
 			cb.RawQuery = q.Encode()
 			resp, err := http.Get(cb.String()) //nolint:noctx // test helper hitting a local callback server
 			if err == nil {

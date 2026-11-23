@@ -7,7 +7,7 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) auth handler plugin for
 
 | Flow | Description |
 | ------ | ------------- |
-| `interactive` | Authorization code + PKCE, opens a browser (default when no flow is given; in remote workspaces the redirect URL can be pasted back through the host) |
+| `interactive` | Authorization code + PKCE, opens a browser with the Microsoft Entra account picker (`prompt=select_account`; default when no flow is given; in remote workspaces the redirect URL can be pasted back through the host) |
 | `device-code` | Device code polling (headless/SSH; automatic fallback when no browser is available and the host has no paste-back support) |
 | `service-principal` | Client credentials (CI/CD) |
 | `workload-identity` | Federated token (Kubernetes pods) |
@@ -55,7 +55,7 @@ Keys under `auth.entra`:
 | Key | Default | Notes |
 | --- | --- | --- |
 | `clientId` | Azure CLI public client ID | App registration client ID |
-| `tenantId` | `common` | Tenant GUID, `organizations`, or `common` |
+| `tenantId` | `common` | Tenant GUID, `organizations`, `consumers`, or `common` |
 | `authority` | `https://login.microsoftonline.com` | Authority URL; must be `https://` with a host. See the sovereign-cloud note |
 | `defaultScopes` | `openid profile` | Scopes requested at interactive/device-code login when no `--scope` is given; service-principal and workload-identity logins ignore it and default to a fixed `https://graph.microsoft.com/.default` / `https://management.azure.com/.default` unless `--scope` is passed |
 | `defaultFlow` | `interactive` | `interactive` or `device_code`; used when no flow is requested and no service-principal/workload-identity credentials are detected (in config or environment). `interactive` still falls back to device code on headless machines |
@@ -101,11 +101,11 @@ over the environment variable.
 
 In CLI mode, credentials are resolved in this order:
 
-1. **Stored user session** — a refresh token from an earlier `interactive` or
+1. **Stored user session** -- a refresh token from an earlier `interactive` or
    `device-code` login that has not expired.
-2. **Workload identity** — `AZURE_FEDERATED_TOKEN_FILE` / `AZURE_FEDERATED_TOKEN`
+2. **Workload identity** -- `AZURE_FEDERATED_TOKEN_FILE` / `AZURE_FEDERATED_TOKEN`
    (or config `federatedToken`/`federatedTokenFile`) plus client and tenant IDs.
-3. **Service principal** — `AZURE_CLIENT_SECRET` (or config `clientSecret`)
+3. **Service principal** -- `AZURE_CLIENT_SECRET` (or config `clientSecret`)
    plus client and tenant IDs.
 
 An explicit user login is a stronger signal of intent than ambient
@@ -141,6 +141,9 @@ scafctl auth login entra --flow device-code
 # Login with a specific tenant and/or custom app registration
 scafctl auth login entra --tenant <tenant-id> --client-id <client-id>
 
+# Login to a named profile (always shows the Entra account picker)
+scafctl auth login entra --profile personal
+
 # Interactive login over SSH or in a devcontainer: forward the port and
 # pin it so the redirect URI is predictable
 scafctl auth login entra --flow interactive --callback-port 8400
@@ -169,6 +172,11 @@ scafctl auth logout entra
 login, so the response contains an ID token and a refresh token. `--scope`
 is optional; pass one (e.g. `--scope "https://graph.microsoft.com/.default"`)
 only when the login should also consent to a specific API.
+
+Interactive authorization requests include `prompt=select_account` by
+default, so Microsoft Entra always presents the **Pick an account** /
+**Use another account** chooser even when only one browser SSO session is
+active.
 
 ### Remote workspaces (paste-back login)
 
@@ -221,6 +229,36 @@ per-request context -- an empty profile always means the **default
 (unscoped)** session (`scafctl.auth.entra.*` keys), never the configured
 `activeProfile`. The host resolves the active profile before the call when
 the active session is intended.
+
+### Multi-Account Interactive Login
+
+Because interactive logins include `prompt=select_account` on the
+`/oauth2/v2.0/authorize` URL by default, Microsoft Entra always shows the
+account picker (**Pick an account** / **Use another account**) instead of
+silently reusing a single active browser SSO session. You can sign into
+multiple Entra identities or tenants side-by-side in your default browser
+without opening an InPrivate window or switching browser profiles:
+
+~~~yaml
+auth:
+  entra:
+    activeProfile: work
+    profiles:
+      work:
+        tenantId: "<work-tenant-id>"
+      personal:
+        tenantId: "consumers"
+~~~
+
+~~~bash
+# Sign in to each profile and pick or add the desired Microsoft account
+scafctl auth login entra --profile work
+scafctl auth login entra --profile personal
+
+# Inspect or mint tokens against a specific profile
+scafctl auth status entra --profile personal
+scafctl auth token entra --profile work --scope "https://graph.microsoft.com/.default"
+~~~
 
 **Breaking change:** the secret-key profile is no longer back-filled from
 the `activeProfile` the host applied when configuring the plugin. A host

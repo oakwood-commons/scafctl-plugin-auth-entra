@@ -588,10 +588,9 @@ func ensureOIDCScopes(scopes []string) []string {
 	for _, s := range scopes {
 		have[s] = true
 	}
-	required := requiredOIDCScopes()
-	result := make([]string, len(scopes), len(scopes)+len(required))
+	result := make([]string, len(scopes))
 	copy(result, scopes)
-	for _, s := range required {
+	for _, s := range requiredOIDCScopes() {
 		if !have[s] {
 			result = append(result, s)
 		}

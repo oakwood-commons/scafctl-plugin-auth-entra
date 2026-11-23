@@ -10,7 +10,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,8 @@ import (
 	"github.com/oakwood-commons/scafctl-plugin-sdk/plugin/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func configureCustomPages(t *testing.T, p *Plugin) (*sdkplugin.AuthCallbackPages, string, string) {
@@ -242,10 +246,15 @@ func TestAuthCodeLogin_PostCallbackFailuresServeSafeFailurePage(t *testing.T) {
 }
 
 type blockingPostFormClient struct {
-	onPost func() (*http.Response, error)
+	mu       sync.Mutex
+	lastData url.Values
+	onPost   func() (*http.Response, error)
 }
 
-func (b *blockingPostFormClient) PostForm(_ context.Context, _ string, _ url.Values) (*http.Response, error) {
+func (b *blockingPostFormClient) PostForm(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+	b.mu.Lock()
+	b.lastData = data
+	b.mu.Unlock()
 	return b.onPost()
 }
 
@@ -433,5 +442,240 @@ func TestAuthCodeLogin_DeviceCodeCallbackGating(t *testing.T) {
 		u, parseErr := url.Parse(prompts[0].VerificationURI)
 		require.NoError(t, parseErr)
 		assert.Equal(t, "select_account", u.Query().Get("prompt"))
+	})
+
+	t.Run("desktop browser open error plus unavailable or unimplemented paste prompt emits suppressed deviceCodeCb once", func(t *testing.T) {
+		for name, promptErr := range map[string]error{
+			"unavailable":   status.Error(codes.Unavailable, "host is non-interactive"),
+			"unimplemented": status.Error(codes.Unimplemented, "PromptAuthResponse not implemented"),
+		} {
+			t.Run(name, func(t *testing.T) {
+				httpMock := pasteTokenResponse()
+				p, fake := newTestPlugin(t, httpMock, nil)
+				advertisePasteBack(p)
+				p.headlessReason = func() string { return "" }
+				p.openBrowser = func(_ context.Context, _ string) error {
+					return errors.New("browser opener failed")
+				}
+				fake.promptFunc = func(_ context.Context, _ *proto.PromptAuthResponseRequest) (string, error) {
+					return "", promptErr
+				}
+
+				var prompts []sdkplugin.DeviceCodePrompt
+				_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+					Flow: auth.FlowInteractive,
+				}, func(prompt sdkplugin.DeviceCodePrompt) {
+					prompts = append(prompts, prompt)
+					completeLoopbackCallback(t, prompt.VerificationURI, "MANUAL-CALLBACK-CODE")
+				})
+				require.NoError(t, err)
+				require.Len(t, prompts, 1, "suppressed URL notification must be emitted once when paste prompt fails")
+				u, parseErr := url.Parse(prompts[0].VerificationURI)
+				require.NoError(t, parseErr)
+				assert.Equal(t, "select_account", u.Query().Get("prompt"))
+
+				reqs := httpMock.GetRequests()
+				require.Len(t, reqs, 1)
+				assert.Equal(t, "MANUAL-CALLBACK-CODE", reqs[0].Data.Get("code"))
+			})
+		}
+	})
+
+	t.Run("desktop browser launch plus unavailable paste prompt does not duplicate deviceCodeCb", func(t *testing.T) {
+		httpMock := pasteTokenResponse()
+		p, fake := newTestPlugin(t, httpMock, nil)
+		advertisePasteBack(p)
+		p.headlessReason = func() string { return "" }
+		promptFailed := make(chan struct{})
+		fake.promptFunc = func(_ context.Context, _ *proto.PromptAuthResponseRequest) (string, error) {
+			defer close(promptFailed)
+			return "", status.Error(codes.Unavailable, "host is non-interactive")
+		}
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			go func() {
+				<-promptFailed
+				time.Sleep(15 * time.Millisecond)
+				completeLoopbackCallback(t, authURL, "DESKTOP-AFTER-PROMPT-ERR")
+			}()
+			return nil
+		}
+
+		var prompts []sdkplugin.DeviceCodePrompt
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowInteractive,
+		}, func(prompt sdkplugin.DeviceCodePrompt) {
+			prompts = append(prompts, prompt)
+		})
+		require.NoError(t, err)
+		require.Len(t, prompts, 1, "URL notification already sent on browser launch must not fire twice")
+	})
+}
+
+func TestAuthCodeLogin_PasteBackCompetingCallbackDrainsFailurePage(t *testing.T) {
+	clearCredentialEnv(t)
+
+	validJWT := makeTestJWT(map[string]any{
+		"sub":                "sub-123",
+		"oid":                "oid-123",
+		"tid":                "tid-123",
+		"preferred_username": "alice@example.com",
+	})
+
+	t.Run("competing callback arriving during paste-back exchange drains 503 FailureHTML cleanly", func(t *testing.T) {
+		exchangeEntered := make(chan struct{})
+		releaseExchange := make(chan struct{})
+
+		blocker := &blockingPostFormClient{
+			onPost: func() (*http.Response, error) {
+				close(exchangeEntered)
+				<-releaseExchange
+				return jsonTestResponse(http.StatusOK, TokenResponse{
+					AccessToken:  "entra-at",
+					RefreshToken: "entra-rt",
+					TokenType:    "Bearer",
+					ExpiresIn:    3600,
+					IDToken:      validJWT,
+				}), nil
+			},
+		}
+
+		p, fake := newTestPlugin(t, nil, nil)
+		p.httpClient = blocker
+		_, wantSuccess, wantFailure := configureCustomPages(t, p)
+		advertisePasteBack(p)
+		p.headlessReason = func() string { return "" }
+
+		var capturedAuthURL string
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			capturedAuthURL = authURL
+			return nil
+		}
+		fake.promptFunc = func(_ context.Context, req *proto.PromptAuthResponseRequest) (string, error) {
+			return validPasteFromRequest(t, req, url.Values{"code": {"PASTED-CODE"}}), nil
+		}
+
+		loginDone := make(chan error, 1)
+		go func() {
+			_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+				Flow: auth.FlowInteractive,
+			}, nil)
+			loginDone <- err
+		}()
+
+		<-exchangeEntered
+
+		u, err := url.Parse(capturedAuthURL)
+		require.NoError(t, err)
+		redirectURI := u.Query().Get("redirect_uri")
+		state := u.Query().Get("state")
+
+		type browserOutcome struct {
+			status int
+			body   string
+			err    error
+		}
+		browserCh := make(chan browserOutcome, 1)
+		competingSent := make(chan struct{})
+		var sentOnce sync.Once
+		go func() {
+			traceCtx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+				WroteRequest: func(httptrace.WroteRequestInfo) {
+					sentOnce.Do(func() { close(competingSent) })
+				},
+			})
+			req, reqErr := http.NewRequestWithContext(traceCtx, http.MethodGet, redirectURI+"/?code=COMPETING-CODE&state="+url.QueryEscape(state), nil)
+			if reqErr != nil {
+				browserCh <- browserOutcome{err: reqErr}
+				return
+			}
+			resp, doErr := http.DefaultClient.Do(req)
+			if doErr != nil {
+				browserCh <- browserOutcome{err: doErr}
+				return
+			}
+			b, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			browserCh <- browserOutcome{status: resp.StatusCode, body: string(b), err: readErr}
+		}()
+
+		<-competingSent
+		// Give the loopback server handler a moment to park in resolveDeferred
+		// before releasing the paste-back exchange.
+		select {
+		case out := <-browserCh:
+			t.Fatalf("competing callback completed prematurely before settle: %+v", out)
+		case <-time.After(25 * time.Millisecond):
+		}
+
+		close(releaseExchange)
+		require.NoError(t, <-loginDone)
+
+		blocker.mu.Lock()
+		exchangedCode := blocker.lastData.Get("code")
+		blocker.mu.Unlock()
+		assert.Equal(t, "PASTED-CODE", exchangedCode)
+
+		out := <-browserCh
+		require.NoError(t, out.err, "competing callback must drain cleanly without socket reset")
+		assert.Equal(t, http.StatusServiceUnavailable, out.status, "unexchanged competing callback must receive failure status")
+		assert.Equal(t, wantFailure, out.body)
+		assert.NotEqual(t, wantSuccess, out.body)
+	})
+
+	t.Run("in-flight callback during context cancellation drains 503 FailureHTML cleanly", func(t *testing.T) {
+		exchangeEntered := make(chan struct{})
+		releaseExchange := make(chan struct{})
+
+		p, _ := newTestPlugin(t, nil, nil)
+		p.httpClient = &blockingPostFormClient{
+			onPost: func() (*http.Response, error) {
+				close(exchangeEntered)
+				<-releaseExchange
+				return nil, context.Canceled
+			},
+		}
+		_, _, wantFailure := configureCustomPages(t, p)
+
+		type browserOutcome struct {
+			status int
+			body   string
+			err    error
+		}
+		browserCh := make(chan browserOutcome, 1)
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			u, _ := url.Parse(authURL)
+			redirectURI := u.Query().Get("redirect_uri")
+			state := u.Query().Get("state")
+			go func() {
+				resp, getErr := http.Get(redirectURI + "/?code=CANCEL-CODE&state=" + url.QueryEscape(state)) //nolint:noctx
+				if getErr != nil {
+					browserCh <- browserOutcome{err: getErr}
+					return
+				}
+				b, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				browserCh <- browserOutcome{status: resp.StatusCode, body: string(b), err: readErr}
+			}()
+			return nil
+		}
+
+		loginCtx, cancelLogin := context.WithCancel(context.Background())
+		loginDone := make(chan error, 1)
+		go func() {
+			_, err := p.Login(loginCtx, HandlerName, sdkplugin.LoginRequest{
+				Flow: auth.FlowInteractive,
+			}, nil)
+			loginDone <- err
+		}()
+
+		<-exchangeEntered
+		cancelLogin()
+		close(releaseExchange)
+
+		require.Error(t, <-loginDone)
+		out := <-browserCh
+		require.NoError(t, out.err, "cancelled callback must drain cleanly without socket reset")
+		assert.Equal(t, http.StatusServiceUnavailable, out.status)
+		assert.Equal(t, wantFailure, out.body)
 	})
 }

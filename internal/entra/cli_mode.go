@@ -136,15 +136,10 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 		return m.p.servicePrincipalStatus()
 	}
 
-	// Check if we have stored credentials
-	if !m.p.secretExists(ctx, m.p.secretKey(ctx, secretSuffixRefreshToken)) {
-		return &auth.Status{Authenticated: false}, nil
-	}
-
-	// Load and validate metadata
-	metadata, err := m.p.loadMetadata(ctx)
+	// Load and validate stored session credentials under profile read lock
+	_, metadata, err := m.p.loadSessionCredentials(ctx)
 	if err != nil {
-		return &auth.Status{Authenticated: false}, nil //nolint:nilerr // corrupted metadata = not authenticated
+		return &auth.Status{Authenticated: false}, nil //nolint:nilerr // missing/corrupted/mismatched credentials = not authenticated
 	}
 
 	// Check if refresh token is expired
@@ -316,12 +311,12 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 	var results []*auth.CachedTokenInfo
 
 	// Refresh token
-	if m.p.secretExists(ctx, m.p.secretKey(ctx, secretSuffixRefreshToken)) {
+	if hasRefresh, metadata := m.p.loadRefreshTokenStatus(ctx); hasRefresh {
 		info := &auth.CachedTokenInfo{
 			Handler:   HandlerName,
 			TokenKind: "refresh",
 		}
-		if metadata, err := m.p.loadMetadata(ctx); err == nil && metadata != nil {
+		if metadata != nil {
 			info.ExpiresAt = metadata.ExpiresAt
 			info.CachedAt = metadata.LastRefresh
 			info.Flow = metadata.LastLoginFlow

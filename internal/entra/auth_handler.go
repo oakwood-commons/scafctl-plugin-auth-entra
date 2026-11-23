@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -74,6 +75,20 @@ type Plugin struct {
 	openBrowser      BrowserOpenFunc
 	headlessReason   func() string
 	mode             mode
+	profileLocks     sync.Map
+	cleanupTimeout   time.Duration
+}
+
+// profileLock returns the profile-scoped RWMutex coordinating in-process
+// credential snapshots, writes, rollbacks, logouts, and session reads.
+func (p *Plugin) profileLock(ctx context.Context) *sync.RWMutex {
+	profile := auth.ProfileFromContext(ctx)
+	if v, ok := p.profileLocks.Load(profile); ok {
+		return v.(*sync.RWMutex)
+	}
+	mu := &sync.RWMutex{}
+	actual, _ := p.profileLocks.LoadOrStore(profile, mu)
+	return actual.(*sync.RWMutex)
 }
 
 var _ sdkplugin.ServerMode = (*Plugin)(nil) // compile-time interface check
@@ -227,19 +242,51 @@ func (p *Plugin) Logout(ctx context.Context, handlerName string, _ sdkplugin.Log
 
 // logoutInternal clears stored credentials and cached tokens.
 func (p *Plugin) logoutInternal(ctx context.Context) error {
-	lgr := logr.FromContextOrDiscard(ctx)
-	lgr.V(1).Info("logging out", "handler", HandlerName)
-
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return fmt.Errorf("host service not available")
 	}
 
+	mu := p.profileLock(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+
+	p.logoutLocked(ctx, hostClient)
+	return nil
+}
+
+// logoutIfSessionMatches clears stored credentials only if no concurrent login
+// has replaced expectedSessionID since the caller loaded it.
+func (p *Plugin) logoutIfSessionMatches(ctx context.Context, expectedSessionID string) {
+	hostClient := p.hostClient(ctx)
+	if hostClient == nil {
+		return
+	}
+
+	mu := p.profileLock(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if metaRaw, found, err := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); err == nil && found {
+		if curMeta, pErr := p.parseMetadata(metaRaw); pErr == nil && curMeta.SessionID != expectedSessionID {
+			return
+		}
+	}
+
+	p.logoutLocked(ctx, hostClient)
+}
+
+func (p *Plugin) logoutLocked(ctx context.Context, hostClient *sdkplugin.HostServiceClient) {
+	lgr := logr.FromContextOrDiscard(ctx)
+	lgr.V(1).Info("logging out", "handler", HandlerName)
+
 	// Clear all cached tokens
 	cacheClear(ctx, lgr, hostClient, p.tokenCachePrefix(ctx))
 
-	// Delete refresh token
-	if err := hostClient.DeleteSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken)); err != nil {
+	// Delete versioned refresh tokens and legacy refresh token
+	refreshKey := p.secretKey(ctx, secretSuffixRefreshToken)
+	cacheClear(ctx, lgr, hostClient, refreshKey+".")
+	if err := hostClient.DeleteSecret(ctx, refreshKey); err != nil {
 		lgr.V(1).Info("failed to delete refresh token (may not exist)", "error", err)
 	}
 
@@ -247,8 +294,6 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 	if err := hostClient.DeleteSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); err != nil {
 		lgr.V(1).Info("failed to delete metadata (may not exist)", "error", err)
 	}
-
-	return nil
 }
 
 // clearUserTokenCache removes all cached access tokens for the active

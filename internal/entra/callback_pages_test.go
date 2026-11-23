@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -281,6 +282,14 @@ func (b *blockingPostFormClient) PostForm(_ context.Context, _ string, data url.
 	b.lastData = data
 	b.mu.Unlock()
 	return b.onPost()
+}
+
+type funcPostFormClient struct {
+	fn func(ctx context.Context, endpoint string, data url.Values) (*http.Response, error)
+}
+
+func (f *funcPostFormClient) PostForm(ctx context.Context, endpoint string, data url.Values) (*http.Response, error) {
+	return f.fn(ctx, endpoint, data)
 }
 
 func TestAuthCodeLogin_NilCallbackPagesAndDirectErrorDrain(t *testing.T) {
@@ -846,7 +855,7 @@ func TestAuthCodeLogin_MetadataWriteFailureAccountReplacement(t *testing.T) {
 		assert.Contains(t, reqs[2].Endpoint, "/alice-tid/oauth2/v2.0/token")
 	})
 
-	t.Run("metadata write failure when rollback also fails clears both secrets so no mismatched session remains usable", func(t *testing.T) {
+	t.Run("legacy mirror write failure when metadata rollback also fails clears secrets so no mismatched session remains usable", func(t *testing.T) {
 		httpMock := NewMockHTTPClient()
 		httpMock.AddResponse(http.StatusOK, TokenResponse{
 			AccessToken:  "alice-at-1",
@@ -874,13 +883,20 @@ func TestAuthCodeLogin_MetadataWriteFailureAccountReplacement(t *testing.T) {
 		require.NoError(t, err)
 		<-aliceBrowserCh
 
-		// Allow Bob's initial refresh-token write, then fail metadata write AND
-		// fail the rollback refresh-token write so storeCredentials must purge both.
-		bobRTWrites := 0
+		// Allow Bob's versioned refresh-token write and initial metadata commit,
+		// then fail legacy refresh_token mirror AND fail metadata rollback so
+		// storeCredentials must purge all keys rather than leaving a mismatch.
+		bobMetaWrites := 0
+		var fnMu sync.Mutex
 		fake.mu.Lock()
-		fake.setSecretFunc = func(name, value string) error {
-			if name == SecretKeyRefreshToken && value == "bob-rt" && bobRTWrites == 0 {
-				bobRTWrites++
+		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+			fnMu.Lock()
+			defer fnMu.Unlock()
+			if strings.HasPrefix(name, SecretKeyRefreshToken+".") && value == "bob-rt" {
+				return nil
+			}
+			if name == SecretKeyMetadata && bobMetaWrites == 0 {
+				bobMetaWrites++
 				return nil
 			}
 			return errors.New("keyring permanently unavailable")
@@ -902,8 +918,9 @@ func TestAuthCodeLogin_MetadataWriteFailureAccountReplacement(t *testing.T) {
 		assert.NotEqual(t, wantSuccess, bobOut.body)
 		assert.NotContains(t, bobOut.body, "keyring permanently unavailable")
 
-		assert.NotContains(t, fake.secrets, SecretKeyRefreshToken)
-		assert.NotContains(t, fake.secrets, SecretKeyMetadata)
+		fake.mu.Lock()
+		assert.Empty(t, fake.secrets)
+		fake.mu.Unlock()
 
 		st, statusErr := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 		require.NoError(t, statusErr)
@@ -914,5 +931,373 @@ func TestAuthCodeLogin_MetadataWriteFailureAccountReplacement(t *testing.T) {
 		})
 		require.Error(t, tokErr)
 		assert.Contains(t, tokErr.Error(), "not authenticated")
+	})
+}
+
+func TestAuthCodeLogin_OverlappingLoginsAndBoundedCleanup(t *testing.T) {
+	clearCredentialEnv(t)
+
+	aliceJWT := makeTestJWT(map[string]any{
+		"sub":                "alice-sub",
+		"oid":                "alice-oid",
+		"tid":                "alice-tid",
+		"preferred_username": "alice@example.com",
+	})
+	charlieJWT := makeTestJWT(map[string]any{
+		"sub":                "charlie-sub",
+		"oid":                "charlie-oid",
+		"tid":                "charlie-tid",
+		"preferred_username": "charlie@example.com",
+	})
+	bobJWT := makeTestJWT(map[string]any{
+		"sub":                "bob-sub",
+		"oid":                "bob-oid",
+		"tid":                "bob-tid",
+		"preferred_username": "bob@example.com",
+	})
+
+	newSharedStorePlugin := func(t *testing.T, fake *fakeHostService, httpMock *MockHTTPClient) (*Plugin, string, string) {
+		t.Helper()
+		p := &Plugin{
+			cachedHostClient: newFakeHostClient(fake),
+			httpClient:       httpMock,
+			graphClient:      NewMockGraphClient(),
+		}
+		cfgCtx := sdkplugin.WithHostClient(context.Background(), p.cachedHostClient)
+		require.NoError(t, p.ConfigureAuthHandler(cfgCtx, HandlerName, sdkplugin.ProviderConfig{
+			BinaryName: "scafctl",
+		}))
+		p.httpClient = httpMock
+		_, wantSuccess, wantFailure := configureCustomPages(t, p)
+		return p, wantSuccess, wantFailure
+	}
+
+	attachBrowserCallback := func(p *Plugin, code string) <-chan struct {
+		status int
+		body   string
+		err    error
+	} {
+		ch := make(chan struct {
+			status int
+			body   string
+			err    error
+		}, 1)
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			u, parseErr := url.Parse(authURL)
+			if parseErr != nil {
+				return parseErr
+			}
+			redirectURI := u.Query().Get("redirect_uri")
+			state := u.Query().Get("state")
+			go func() {
+				resp, getErr := http.Get(redirectURI + "/?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)) //nolint:noctx
+				if getErr != nil {
+					ch <- struct {
+						status int
+						body   string
+						err    error
+					}{err: getErr}
+					return
+				}
+				b, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				ch <- struct {
+					status int
+					body   string
+					err    error
+				}{status: resp.StatusCode, body: string(b), err: readErr}
+			}()
+			return nil
+		}
+		return ch
+	}
+
+	t.Run("overlapping cross-process login committing while first login fails metadata write keeps committed session consistent", func(t *testing.T) {
+		fake := newFakeHostService()
+
+		// Seed initial Alice session.
+		initMock := NewMockHTTPClient()
+		initMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at",
+			RefreshToken: "alice-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+		pluginInit, _, _ := newSharedStorePlugin(t, fake, initMock)
+		initBrowser := attachBrowserCallback(pluginInit, "ALICE-CODE")
+		_, err := pluginInit.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:     auth.FlowInteractive,
+			TenantID: "alice-tid",
+		}, nil)
+		require.NoError(t, err)
+		<-initBrowser
+
+		// Process A (Charlie) and Process B (Bob) share the host secret store.
+		mockA := NewMockHTTPClient()
+		mockA.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "charlie-at",
+			RefreshToken: "charlie-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      charlieJWT,
+		})
+		pluginA, _, wantFailureA := newSharedStorePlugin(t, fake, mockA)
+		browserA := attachBrowserCallback(pluginA, "CHARLIE-CODE")
+
+		mockB := NewMockHTTPClient()
+		mockB.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at-1",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      bobJWT,
+		})
+		mockB.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at-2",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      bobJWT,
+		})
+		pluginB, wantSuccessB, _ := newSharedStorePlugin(t, fake, mockB)
+		browserB := attachBrowserCallback(pluginB, "BOB-CODE")
+
+		// Block Login A (Charlie) inside SetSecret(SecretKeyMetadata) until
+		// Login B (Bob) commits, then fail Login A's metadata write.
+		loginAMetadataBlocked := make(chan struct{})
+		releaseLoginAFailure := make(chan struct{})
+		var blockedOnce sync.Once
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+			if name == SecretKeyMetadata && strings.Contains(value, "charlie-sub") {
+				blockedOnce.Do(func() { close(loginAMetadataBlocked) })
+				<-releaseLoginAFailure
+				return errors.New("charlie metadata write failed")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		loginADone := make(chan error, 1)
+		go func() {
+			_, aErr := pluginA.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+				Flow:     auth.FlowInteractive,
+				TenantID: "charlie-tid",
+			}, nil)
+			loginADone <- aErr
+		}()
+
+		<-loginAMetadataBlocked
+
+		// While Login A is waiting on its failing metadata write, Login B commits.
+		_, err = pluginB.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:     auth.FlowInteractive,
+			TenantID: "bob-tid",
+		}, nil)
+		require.NoError(t, err)
+		outB := <-browserB
+		require.NoError(t, outB.err)
+		assert.Equal(t, http.StatusOK, outB.status)
+		assert.Equal(t, wantSuccessB, outB.body)
+
+		// Now let Login A's metadata write fail and run its rollback/cleanup.
+		close(releaseLoginAFailure)
+		errA := <-loginADone
+		require.Error(t, errA)
+		assert.Contains(t, errA.Error(), "store_credentials")
+		outA := <-browserA
+		require.NoError(t, outA.err)
+		assert.Equal(t, http.StatusServiceUnavailable, outA.status)
+		assert.Equal(t, wantFailureA, outA.body)
+
+		// Verify Login B's committed session was NOT clobbered by Login A's rollback.
+		st, statusErr := pluginB.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, statusErr)
+		require.True(t, st.Authenticated)
+		require.NotNil(t, st.Claims)
+		assert.Equal(t, "bob-sub", st.Claims.Subject)
+		assert.Equal(t, "bob@example.com", st.Claims.Username)
+		assert.Equal(t, "bob-tid", st.TenantID)
+
+		tokResp, tokErr := pluginB.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://graph.microsoft.com/.default",
+			ForceRefresh: true,
+		})
+		require.NoError(t, tokErr)
+		assert.Equal(t, "bob-at-2", tokResp.AccessToken)
+
+		reqsB := mockB.GetRequests()
+		require.Len(t, reqsB, 2)
+		assert.Equal(t, "bob-rt", reqsB[1].Data.Get("refresh_token"), "refresh must use Bob's refresh token, never Alice's or Charlie's")
+		assert.Contains(t, reqsB[1].Endpoint, "/bob-tid/oauth2/v2.0/token")
+
+		// Verify Charlie's unreferenced versioned secret was deleted.
+		fake.mu.Lock()
+		for k, v := range fake.secrets {
+			assert.NotEqual(t, "charlie-rt", v, "failed login A's refresh token must not remain in %s", k)
+			assert.NotEqual(t, "alice-rt", v, "superseded Alice refresh token must not overwrite Bob in %s", k)
+		}
+		fake.mu.Unlock()
+	})
+
+	t.Run("same-process overlapping login and refresh rotation remain serialized and consistent", func(t *testing.T) {
+		aliceRefreshEntered := make(chan struct{})
+		releaseAliceRefresh := make(chan struct{})
+		var refreshOnce sync.Once
+
+		routingClient := &funcPostFormClient{
+			fn: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+				switch data.Get("grant_type") {
+				case "authorization_code":
+					if data.Get("code") == "ALICE-CODE" {
+						return jsonTestResponse(http.StatusOK, TokenResponse{
+							AccessToken:  "alice-at",
+							RefreshToken: "alice-rt",
+							TokenType:    "Bearer",
+							ExpiresIn:    3600,
+							IDToken:      aliceJWT,
+						}), nil
+					}
+					return jsonTestResponse(http.StatusOK, TokenResponse{
+						AccessToken:  "bob-at-1",
+						RefreshToken: "bob-rt",
+						TokenType:    "Bearer",
+						ExpiresIn:    3600,
+						IDToken:      bobJWT,
+					}), nil
+				case "refresh_token":
+					if data.Get("refresh_token") == "alice-rt" {
+						refreshOnce.Do(func() { close(aliceRefreshEntered) })
+						<-releaseAliceRefresh
+						return jsonTestResponse(http.StatusOK, TokenResponse{
+							AccessToken:  "alice-rotated-at",
+							RefreshToken: "alice-rotated-rt",
+							TokenType:    "Bearer",
+							ExpiresIn:    3600,
+						}), nil
+					}
+					return jsonTestResponse(http.StatusOK, TokenResponse{
+						AccessToken:  "bob-at-2",
+						RefreshToken: "bob-rt",
+						TokenType:    "Bearer",
+						ExpiresIn:    3600,
+						IDToken:      bobJWT,
+					}), nil
+				default:
+					return nil, errors.New("unexpected grant_type")
+				}
+			},
+		}
+
+		p, fake := newTestPlugin(t, nil, nil)
+		p.httpClient = routingClient
+		configureCustomPages(t, p)
+
+		// 1. Log in as Alice.
+		aliceBrowser := attachBrowserCallback(p, "ALICE-CODE")
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:     auth.FlowInteractive,
+			TenantID: "alice-tid",
+		}, nil)
+		require.NoError(t, err)
+		<-aliceBrowser
+
+		// 2. Start an in-flight GetToken refresh for Alice (which will rotate
+		// alice-rt -> alice-rotated-rt) alongside concurrent status reads, and
+		// commit Bob's Login while Alice's HTTP refresh is in flight.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+				Scope:        "https://graph.microsoft.com/.default",
+				ForceRefresh: true,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			for range 5 {
+				_, _ = p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			}
+		}()
+
+		<-aliceRefreshEntered
+
+		bobBrowser := attachBrowserCallback(p, "BOB-CODE")
+		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:     auth.FlowInteractive,
+			TenantID: "bob-tid",
+		}, nil)
+		require.NoError(t, err)
+		<-bobBrowser
+
+		// Release Alice's late refresh response; storeRotatedCredentials must
+		// see that SessionID changed to Bob and leave Bob's credentials intact.
+		close(releaseAliceRefresh)
+		wg.Wait()
+
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		require.True(t, st.Authenticated)
+		assert.Equal(t, "bob-sub", st.Claims.Subject)
+		assert.Equal(t, "bob-rt", fake.secrets[SecretKeyRefreshToken])
+
+		tokResp, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://graph.microsoft.com/.default",
+			ForceRefresh: true,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "bob-at-2", tokResp.AccessToken)
+	})
+
+	t.Run("detached cleanup RPCs carry a bounded timeout so stalled cleanup never hangs login", func(t *testing.T) {
+		httpMock := NewMockHTTPClient()
+		httpMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      bobJWT,
+		})
+
+		p, fake := newTestPlugin(t, httpMock, nil)
+		p.cleanupTimeout = 45 * time.Millisecond
+		_, _, wantFailure := configureCustomPages(t, p)
+
+		deleteCalled := make(chan bool, 1)
+		fake.mu.Lock()
+		fake.setSecretKeyErr = map[string]error{
+			SecretKeyMetadata: errors.New("metadata write failed"),
+		}
+		fake.deleteSecretFunc = func(ctx context.Context, _ string) error {
+			_, hasDeadline := ctx.Deadline()
+			select {
+			case deleteCalled <- hasDeadline:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		fake.mu.Unlock()
+
+		browserCh := attachBrowserCallback(p, "STALLED-CLEANUP-CODE")
+		started := time.Now()
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowInteractive,
+		}, nil)
+		elapsed := time.Since(started)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "store_credentials")
+		assert.Less(t, elapsed, 2*time.Second, "bounded cleanup timeout must prevent stalled DeleteSecret from hanging Login")
+
+		hasDeadline := <-deleteCalled
+		assert.True(t, hasDeadline, "detached cleanup context must carry an explicit timeout deadline")
+
+		out := <-browserCh
+		require.NoError(t, out.err)
+		assert.Equal(t, http.StatusServiceUnavailable, out.status)
+		assert.Equal(t, wantFailure, out.body)
 	})
 }

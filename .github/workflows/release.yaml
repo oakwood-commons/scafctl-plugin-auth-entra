@@ -127,10 +127,9 @@ jobs:
             --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe" \
             --platform "windows/arm64=dist/${BINARY}-windows-arm64.exe"
 
-          scafctl catalog push \
+          scafctl catalog push auth-handler \
             "${NAME}@${VERSION}" \
             --catalog "oci://${CATALOG}" \
-            --kind "auth-handler" \
             --force
 
           # Resolve the pushed manifest digest for cosign signing

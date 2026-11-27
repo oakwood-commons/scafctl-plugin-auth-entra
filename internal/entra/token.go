@@ -7,15 +7,18 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
+	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
 // MetaKeyTenantID is the Metadata map key under which the entra handler
@@ -37,7 +40,34 @@ const (
 	// on the host secret store so a stalled host never blocks Login or callback
 	// settlement indefinitely.
 	defaultCredentialCleanupTimeout = 5 * time.Second
+
+	// defaultOrphanRefreshGracePeriod is the minimum age a timestamped refresh
+	// revision must reach before unreferenced-orphan sweeps may delete it, so a
+	// concurrent writer's pending revision is never removed before its metadata
+	// commit completes.
+	defaultOrphanRefreshGracePeriod = 15 * time.Minute
+
+	// maxSessionCredentialReadAttempts bounds optimistic retries when cross-process
+	// credential rotation updates session metadata while a reader is resolving the
+	// paired refresh token.
+	maxSessionCredentialReadAttempts = 4
 )
+
+// errSessionCredentialsChangedConcurrently indicates that stored session
+// metadata changed across plugin processes on every bounded read attempt.
+// Callers propagate this transient contention error instead of falling back to
+// ambient machine credentials or reporting an unauthenticated user session.
+var errSessionCredentialsChangedConcurrently = errors.New("not authenticated: stored session credentials changed concurrently, please retry")
+
+func isTransientSessionLoadErr(ctx context.Context, err error) error {
+	if cErr := contextErr(ctx, err); cErr != nil {
+		return cErr
+	}
+	if errors.Is(err, errSessionCredentialsChangedConcurrently) {
+		return err
+	}
+	return nil
+}
 
 // TokenResponse represents the response from the token endpoint.
 type TokenResponse struct {
@@ -67,10 +97,11 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	if err != nil {
 		return nil, err
 	}
-	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	httpClient, releaseHTTP, err := p.httpClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseHTTP()
 
 	// Load paired refresh token and metadata under profile read lock.
 	refreshToken, metadata, err := p.loadSessionCredentials(ctx)
@@ -146,7 +177,11 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 
 			// For genuine token expiry / revocation, clear stored credentials
 			// unless a newer login has already replaced this session.
-			p.logoutIfSessionMatches(ctx, metadata.SessionID)
+			if err := p.logoutIfSessionMatches(ctx, metadata.SessionID); err != nil {
+				if cErr := contextErr(ctx, err); cErr != nil {
+					return nil, cErr
+				}
+			}
 			if errResp.ErrorDescription != "" {
 				return nil, fmt.Errorf("%s: token expired", errResp.ErrorDescription)
 			}
@@ -170,6 +205,9 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
 		lgr.V(1).Info("refresh token rotated, storing new token")
 		if err := p.storeRotatedCredentials(ctx, tenantID, &tokenResp, metadata); err != nil {
+			if cErr := contextErr(ctx, err); cErr != nil {
+				return nil, cErr
+			}
 			lgr.V(1).Info("warning: failed to update refresh token", "error", err)
 		}
 	}
@@ -191,6 +229,29 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		Flow:        metadata.LastLoginFlow,
 		SessionID:   metadata.SessionID,
 	}, nil
+}
+
+func (p *Plugin) now() time.Time {
+	if p != nil && p.nowFunc != nil {
+		return p.nowFunc()
+	}
+	return time.Now()
+}
+
+func (p *Plugin) formatRefreshRevisionID() string {
+	return strconv.FormatInt(p.now().UnixMilli(), 10) + "-" + generateSessionID()
+}
+
+func parseRefreshRevisionTime(revID string) (time.Time, bool) {
+	tsStr, rest, ok := strings.Cut(revID, "-")
+	if !ok || tsStr == "" || uuid.Validate(rest) != nil {
+		return time.Time{}, false
+	}
+	ms, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil || ms <= 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
 
 func (p *Plugin) newCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -219,7 +280,9 @@ func (p *Plugin) storeRotatedCredentials(ctx context.Context, tenantID string, t
 	}
 
 	mu := p.profileLock(ctx)
-	mu.Lock()
+	if err := mu.Lock(ctx); err != nil {
+		return err
+	}
 	defer mu.Unlock()
 
 	curMetaRaw, found, err := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
@@ -240,16 +303,21 @@ func (p *Plugin) storeRotatedCredentials(ctx context.Context, tenantID string, t
 // storeCredentialsWithClaims is storeCredentials with prevClaims used when
 // the response carries no parsable ID token -- refresh-token rotation often
 // omits it, and dropping the stored claims would lose the user oid that
-// keys the user-flow token cache (issue #49).
+// keys the user-flow token cache.
 func (p *Plugin) storeCredentialsWithClaims(ctx context.Context, tenantID string, tokenResp *TokenResponse, clientID string, scopes []string, loginFlow auth.Flow, sessionID string, prevClaims *auth.Claims) error {
 	mu := p.profileLock(ctx)
-	mu.Lock()
+	if err := mu.Lock(ctx); err != nil {
+		return err
+	}
 	defer mu.Unlock()
 
 	return p.storeCredentialsLocked(ctx, tenantID, tokenResp, clientID, scopes, loginFlow, sessionID, prevClaims)
 }
 
 func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, tokenResp *TokenResponse, clientID string, scopes []string, loginFlow auth.Flow, sessionID string, prevClaims *auth.Claims) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return fmt.Errorf("host service not available")
@@ -261,10 +329,11 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 	}
 
 	// Generate a new session ID on initial login; preserve across rotations.
-	if sessionID == "" {
+	isNewSession := sessionID == ""
+	if isNewSession {
 		sessionID = generateSessionID()
 	}
-	revID := generateSessionID()
+	revID := p.formatRefreshRevisionID()
 
 	// Extract claims and marshal metadata before mutating stored secrets.
 	claims, err := p.extractClaims(tokenResp)
@@ -281,10 +350,11 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 		}
 	}
 
+	now := p.now()
 	metadata := auth.HandlerMetadata{
 		Claims:        claims,
-		ExpiresAt:     time.Now().Add(DefaultRefreshTokenLifetime),
-		LastRefresh:   time.Now(),
+		ExpiresAt:     now.Add(DefaultRefreshTokenLifetime),
+		LastRefresh:   now,
 		Scopes:        scopes,
 		LastLoginFlow: loginFlow,
 		SessionID:     sessionID,
@@ -305,6 +375,9 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 	verRefreshKey := p.versionedRefreshKey(ctx, revID)
 
 	prevMetaRaw, hadPrevMeta, prevMetaErr := hostClient.GetSecret(ctx, metadataKey)
+	if cErr := contextErr(ctx, prevMetaErr); cErr != nil {
+		return cErr
+	}
 	var prevRevID string
 	if prevMetaErr == nil && hadPrevMeta {
 		if prevMeta, pErr := p.parseMetadata(prevMetaRaw); pErr == nil {
@@ -316,67 +389,179 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, tenantID string, to
 	// existing or concurrent login's refresh token is overwritten before
 	// metadata commits.
 	if err := hostClient.SetSecret(ctx, verRefreshKey, tokenResp.RefreshToken); err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return cErr
+		}
 		return fmt.Errorf("failed to store refresh token: %w", err)
 	}
 
 	// 2. Single forward commit point: write metadata pointing at verRefreshKey
-	// (and its SHA-256 digest). If this fails, neither metadataKey nor
-	// legacyRefreshKey nor any other writer's versioned key was modified;
-	// simply remove our unreferenced verRefreshKey under a bounded timeout.
+	// (and its SHA-256 digest). A SetSecret error can arrive after the host has
+	// already persisted metadataKey (e.g. deadline exceeded on the response leg),
+	// so delete verRefreshKey only on positive proof that metadataKey does not
+	// reference revID; preserve verRefreshKey whenever the commit outcome is
+	// uncertain or metadataKey already points to revID.
 	if err := hostClient.SetSecret(ctx, metadataKey, metadataRaw); err != nil {
 		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
 		defer cleanupCancel()
-		_ = hostClient.DeleteSecret(cleanupCtx, verRefreshKey)
+		if curMetaRaw, curFound, curErr := hostClient.GetSecret(cleanupCtx, metadataKey); curErr == nil {
+			canDelete := !curFound
+			if curFound {
+				if curMeta, pErr := p.parseMetadata(curMetaRaw); pErr == nil && curMeta.MetaString(metaKeyRefreshTokenID) != revID {
+					canDelete = true
+				}
+			}
+			if canDelete {
+				_ = hostClient.DeleteSecret(cleanupCtx, verRefreshKey)
+			}
+		}
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return cErr
+		}
 		return fmt.Errorf("failed to store metadata: %w", err)
+	}
+
+	cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
+	defer cleanupCancel()
+
+	// Drop cached access tokens from any prior identity on initial login while
+	// still holding profileLock so concurrent GetToken calls on the new session
+	// never race with post-login cache eviction.
+	if isNewSession {
+		_ = cacheClear(cleanupCtx, logr.FromContextOrDiscard(ctx), hostClient, p.tokenCachePrefix(ctx))
 	}
 
 	// 3. Best-effort mirror to legacyRefreshKey for backward compatibility.
 	// Once metadataKey has committed above, loadSessionCredentials resolves the
 	// refresh token from verRefreshKey via refreshTokenId, so a mirror failure
 	// must never roll back, rewrite, or delete metadataKey or verRefreshKey.
-	if err := hostClient.SetSecret(ctx, legacyRefreshKey, tokenResp.RefreshToken); err != nil {
-		logr.FromContextOrDiscard(ctx).V(1).Info("warning: failed to mirror refresh token to legacy secret key", "error", err)
+	mirrorErr := hostClient.SetSecret(ctx, legacyRefreshKey, tokenResp.RefreshToken)
+	mirrorCtxErr := contextErr(ctx, mirrorErr)
+	if mirrorErr != nil && mirrorCtxErr == nil {
+		logr.FromContextOrDiscard(ctx).V(1).Info("warning: failed to mirror refresh token to legacy secret key", "error", mirrorErr)
 	}
 
 	// 4. Garbage-collect the specific revision superseded by this write if it
-	// is no longer referenced by metadataKey.
+	// is no longer referenced by metadataKey, then sweep any aged orphaned
+	// revisions left behind by earlier overlapping writes or uncertain commits.
 	if prevRevID != "" && prevRevID != revID {
-		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
-		defer cleanupCancel()
 		if curMetaRaw, curFound, curErr := hostClient.GetSecret(cleanupCtx, metadataKey); curErr == nil && curFound {
 			if curMeta, pErr := p.parseMetadata(curMetaRaw); pErr == nil && curMeta.MetaString(metaKeyRefreshTokenID) != prevRevID {
 				_ = hostClient.DeleteSecret(cleanupCtx, p.versionedRefreshKey(ctx, prevRevID))
 			}
 		}
 	}
+	_, _ = p.sweepOrphanedRefreshRevisions(cleanupCtx, hostClient, revID)
 
-	return nil
+	if mirrorCtxErr != nil {
+		return mirrorCtxErr
+	}
+	return ctx.Err()
 }
 
-// validStoredUserSession reports whether a usable user session is stored:
-// a consistent refresh token and loadable metadata with a not-yet-expired
-// refresh token, a client ID (the refresh-token request requires it), and a
-// last login flow of interactive or device_code. Such a session takes
-// precedence over ambient service principal / workload identity environment
-// credentials in CLI mode (see cli_mode.go).
-func (p *Plugin) validStoredUserSession(ctx context.Context) (*auth.HandlerMetadata, bool) {
-	metadata, isUserSession, _ := p.inspectStoredSession(ctx)
-	if !isUserSession {
-		return nil, false
+// sweepOrphanedRefreshRevisions removes unreferenced timestamped refresh-token
+// revisions older than orphanGracePeriod while leaving recent pending revisions
+// and the active metadata-referenced revision untouched.
+func (p *Plugin) sweepOrphanedRefreshRevisions(ctx context.Context, hostClient *sdkplugin.HostServiceClient, keepRevID string) (int, error) {
+	if hostClient == nil {
+		return 0, nil
 	}
-	return metadata, true
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	prefix := p.secretKey(ctx, secretSuffixRefreshToken) + "."
+	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	if err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return 0, cErr
+		}
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+
+	now := p.now()
+	grace := p.orphanGracePeriod
+	if grace <= 0 {
+		grace = defaultOrphanRefreshGracePeriod
+	}
+
+	var candidates []string
+	for _, fullKey := range keys {
+		candRevID, hasPrefix := strings.CutPrefix(fullKey, prefix)
+		if !hasPrefix || candRevID == "" || candRevID == keepRevID {
+			continue
+		}
+		createdAt, ok := parseRefreshRevisionTime(candRevID)
+		if !ok || now.Sub(createdAt) < grace {
+			continue
+		}
+		candidates = append(candidates, candRevID)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	// Re-read metadataKey after enumerating aged candidates so any revision
+	// committed before or during ListSecrets is observed as active and never
+	// deleted; abort without deleting if metadata cannot be read or parsed.
+	metadataKey := p.secretKey(ctx, secretSuffixMetadata)
+	curMetaRaw, curFound, curErr := hostClient.GetSecret(ctx, metadataKey)
+	if curErr != nil {
+		if cErr := contextErr(ctx, curErr); cErr != nil {
+			return 0, cErr
+		}
+		return 0, ctx.Err()
+	}
+	var activeRevID string
+	if curFound {
+		curMeta, pErr := p.parseMetadata(curMetaRaw)
+		if pErr != nil {
+			return 0, ctx.Err()
+		}
+		activeRevID = curMeta.MetaString(metaKeyRefreshTokenID)
+	}
+
+	deleted := 0
+	for _, candRevID := range candidates {
+		if candRevID == activeRevID || candRevID == keepRevID {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		if delErr := hostClient.DeleteSecret(ctx, prefix+candRevID); delErr != nil {
+			if cErr := contextErr(ctx, delErr); cErr != nil {
+				return deleted, cErr
+			}
+			continue
+		}
+		deleted++
+	}
+	if err := ctx.Err(); err != nil {
+		return deleted, err
+	}
+	return deleted, nil
 }
 
 // inspectStoredSession loads stored session credentials once and reports both
 // the parsed metadata (when loadable) and whether it qualifies as an active
-// interactive or device_code user session.
+// interactive or device_code user session (a consistent not-yet-expired refresh
+// token, a client ID, and a last login flow of interactive or device_code).
 func (p *Plugin) inspectStoredSession(ctx context.Context) (*auth.HandlerMetadata, bool, error) {
 	_, metadata, err := p.loadSessionCredentials(ctx)
 	if err != nil || metadata == nil {
 		return nil, false, err
 	}
 
-	if !metadata.ExpiresAt.IsZero() && time.Now().After(metadata.ExpiresAt) {
+	if !metadata.ExpiresAt.IsZero() && p.now().After(metadata.ExpiresAt) {
 		return metadata, false, nil
 	}
 
@@ -396,98 +581,207 @@ func (p *Plugin) inspectStoredSession(ctx context.Context) (*auth.HandlerMetadat
 // refresh token and metadata under the profile read lock.
 func (p *Plugin) loadSessionCredentials(ctx context.Context) (string, *auth.HandlerMetadata, error) {
 	mu := p.profileLock(ctx)
-	mu.RLock()
+	if err := mu.RLock(ctx); err != nil {
+		return "", nil, err
+	}
 	defer mu.RUnlock()
 	return p.loadSessionCredentialsUnlocked(ctx)
 }
 
 func (p *Plugin) loadSessionCredentialsUnlocked(ctx context.Context) (string, *auth.HandlerMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return "", nil, fmt.Errorf("not authenticated: host service not available")
 	}
 
-	metaRaw, metaFound, metaErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
+	metadataKey := p.secretKey(ctx, secretSuffixMetadata)
+	legacyRefreshKey := p.secretKey(ctx, secretSuffixRefreshToken)
+
+	metaRaw, metaFound, metaErr := hostClient.GetSecret(ctx, metadataKey)
 	if metaErr != nil {
+		if cErr := contextErr(ctx, metaErr); cErr != nil {
+			return "", nil, cErr
+		}
 		return "", nil, fmt.Errorf("failed to load metadata: %w", metaErr)
 	}
 	if !metaFound {
 		return "", nil, fmt.Errorf("not authenticated: session metadata not found")
 	}
 
-	metadata, err := p.parseMetadata(metaRaw)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to load metadata: %w", err)
+	// reloadIfMetadataChanged re-reads metadataKey when a paired secret lookup
+	// misses, fails hash verification, or lacks a stored hash because another
+	// plugin process rotated or replaced the session while this read was in flight.
+	reloadIfMetadataChanged := func(curRaw string) (string, bool, error) {
+		nextRaw, nextFound, nextErr := hostClient.GetSecret(ctx, metadataKey)
+		if nextErr != nil {
+			if cErr := contextErr(ctx, nextErr); cErr != nil {
+				return "", false, cErr
+			}
+			return "", false, fmt.Errorf("failed to load metadata: %w", nextErr)
+		}
+		if !nextFound {
+			return "", false, fmt.Errorf("not authenticated: session metadata not found")
+		}
+		if nextRaw == curRaw {
+			return "", false, nil
+		}
+		return nextRaw, true, nil
 	}
 
-	revID := metadata.MetaString(metaKeyRefreshTokenID)
-	wantHash := metadata.MetaString(metaKeyRefreshTokenHash)
+	for range maxSessionCredentialReadAttempts {
+		metadata, err := p.parseMetadata(metaRaw)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to load metadata: %w", err)
+		}
 
-	var refreshToken string
-	if revID != "" {
-		verRT, verFound, verErr := hostClient.GetSecret(ctx, p.versionedRefreshKey(ctx, revID))
-		if verErr != nil {
-			return "", nil, fmt.Errorf("not authenticated: %w", verErr)
+		revID := metadata.MetaString(metaKeyRefreshTokenID)
+		wantHash := metadata.MetaString(metaKeyRefreshTokenHash)
+
+		var refreshToken string
+		if revID != "" {
+			verRT, verFound, verErr := hostClient.GetSecret(ctx, p.versionedRefreshKey(ctx, revID))
+			if verErr != nil {
+				if cErr := contextErr(ctx, verErr); cErr != nil {
+					return "", nil, cErr
+				}
+				return "", nil, fmt.Errorf("not authenticated: %w", verErr)
+			}
+			if verFound && verRT != "" {
+				refreshToken = verRT
+			} else {
+				nextRaw, changed, reloadErr := reloadIfMetadataChanged(metaRaw)
+				if reloadErr != nil {
+					return "", nil, reloadErr
+				}
+				if changed {
+					metaRaw = nextRaw
+					continue
+				}
+			}
 		}
-		if verFound && verRT != "" {
-			refreshToken = verRT
+
+		if refreshToken == "" {
+			legacyRT, legacyFound, legacyErr := hostClient.GetSecret(ctx, legacyRefreshKey)
+			if legacyErr != nil {
+				if cErr := contextErr(ctx, legacyErr); cErr != nil {
+					return "", nil, cErr
+				}
+				return "", nil, fmt.Errorf("not authenticated: %w", legacyErr)
+			}
+			if !legacyFound || legacyRT == "" {
+				nextRaw, changed, reloadErr := reloadIfMetadataChanged(metaRaw)
+				if reloadErr != nil {
+					return "", nil, reloadErr
+				}
+				if changed {
+					metaRaw = nextRaw
+					continue
+				}
+				return "", nil, fmt.Errorf("not authenticated: secret not found: %s", legacyRefreshKey)
+			}
+			refreshToken = legacyRT
 		}
+
+		if wantHash != "" {
+			if fingerprintHash(refreshToken) != wantHash {
+				nextRaw, changed, reloadErr := reloadIfMetadataChanged(metaRaw)
+				if reloadErr != nil {
+					return "", nil, reloadErr
+				}
+				if changed {
+					metaRaw = nextRaw
+					continue
+				}
+				return "", nil, fmt.Errorf("not authenticated: stored session credentials are inconsistent, please re-authenticate with '%s auth login entra'", p.binaryName())
+			}
+		} else {
+			nextRaw, changed, reloadErr := reloadIfMetadataChanged(metaRaw)
+			if reloadErr != nil {
+				return "", nil, reloadErr
+			}
+			if changed {
+				metaRaw = nextRaw
+				continue
+			}
+		}
+
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
+		return refreshToken, metadata, nil
 	}
 
-	if refreshToken == "" {
-		legacyRT, legacyFound, legacyErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
-		if legacyErr != nil {
-			return "", nil, fmt.Errorf("not authenticated: %w", legacyErr)
-		}
-		if !legacyFound || legacyRT == "" {
-			return "", nil, fmt.Errorf("not authenticated: secret not found: %s", p.secretKey(ctx, secretSuffixRefreshToken))
-		}
-		refreshToken = legacyRT
-	}
-
-	if wantHash != "" && fingerprintHash(refreshToken) != wantHash {
-		return "", nil, fmt.Errorf("not authenticated: stored session credentials are inconsistent, please re-authenticate with '%s auth login entra'", p.binaryName())
-	}
-
-	return refreshToken, metadata, nil
+	return "", nil, errSessionCredentialsChangedConcurrently
 }
 
 // loadRefreshToken loads the stored refresh token from the host secret store,
 // preferring the metadata-bound versioned secret when session metadata exists.
 func (p *Plugin) loadRefreshToken(ctx context.Context) (string, error) {
 	mu := p.profileLock(ctx)
-	mu.RLock()
+	if err := mu.RLock(ctx); err != nil {
+		return "", err
+	}
 	defer mu.RUnlock()
 
-	if rt, _, err := p.loadSessionCredentialsUnlocked(ctx); err == nil {
+	rt, _, loadErr := p.loadSessionCredentialsUnlocked(ctx)
+	if loadErr == nil {
 		return rt, nil
+	}
+	if tErr := isTransientSessionLoadErr(ctx, loadErr); tErr != nil {
+		return "", tErr
 	}
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return "", fmt.Errorf("host service not available")
 	}
-	if _, metaFound, metaErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); metaErr == nil && !metaFound {
-		return p.getSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
+	if _, metaFound, metaErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); metaErr != nil {
+		if cErr := contextErr(ctx, metaErr); cErr != nil {
+			return "", cErr
+		}
+	} else if !metaFound {
+		rt, getErr := p.getSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
+		if cErr := contextErr(ctx, getErr); cErr != nil {
+			return "", cErr
+		}
+		return rt, getErr
 	}
 	return "", fmt.Errorf("stored session credentials are missing or inconsistent")
 }
 
 // loadRefreshTokenStatus reports whether a refresh token entry should be listed
 // by ListCachedTokens, along with any consistent metadata.
-func (p *Plugin) loadRefreshTokenStatus(ctx context.Context) (bool, *auth.HandlerMetadata) {
+func (p *Plugin) loadRefreshTokenStatus(ctx context.Context) (bool, *auth.HandlerMetadata, error) {
 	mu := p.profileLock(ctx)
-	mu.RLock()
+	if err := mu.RLock(ctx); err != nil {
+		return false, nil, err
+	}
 	defer mu.RUnlock()
 
-	if _, metadata, err := p.loadSessionCredentialsUnlocked(ctx); err == nil && metadata != nil {
-		return true, metadata
+	_, metadata, loadErr := p.loadSessionCredentialsUnlocked(ctx)
+	if loadErr == nil && metadata != nil {
+		return true, metadata, nil
+	}
+	if tErr := isTransientSessionLoadErr(ctx, loadErr); tErr != nil {
+		return false, nil, tErr
 	}
 
-	if !p.secretExists(ctx, p.secretKey(ctx, secretSuffixMetadata)) {
-		rt, err := p.getSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
-		return err == nil && rt != "", nil
+	if hostClient := p.hostClient(ctx); hostClient != nil {
+		_, metaFound, metaErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
+		if cErr := contextErr(ctx, metaErr); cErr != nil {
+			return false, nil, cErr
+		}
+		if metaErr == nil && !metaFound {
+			rt, getErr := p.getSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
+			if cErr := contextErr(ctx, getErr); cErr != nil {
+				return false, nil, cErr
+			}
+			return getErr == nil && rt != "", nil, nil
+		}
 	}
-	return false, nil
+	return false, nil, nil
 }
 
 func (p *Plugin) parseMetadata(raw string) (*auth.HandlerMetadata, error) {

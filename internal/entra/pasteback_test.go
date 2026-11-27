@@ -32,12 +32,18 @@ func advertisePasteBack(p *Plugin) {
 // with the given extra query parameters (code, error, ...).
 func validPasteFromRequest(t *testing.T, req *proto.PromptAuthResponseRequest, extra url.Values) string {
 	t.Helper()
-	require.NotNil(t, req, "plugin must have called PromptAuthResponse")
+	if !assert.NotNil(t, req, "plugin must have called PromptAuthResponse") {
+		return ""
+	}
 
 	u, err := url.Parse(req.AuthorizationUrl)
-	require.NoError(t, err)
+	if !assert.NoError(t, err) {
+		return ""
+	}
 	state := u.Query().Get("state")
-	require.NotEmpty(t, state, "authorization URL must carry a state")
+	if !assert.NotEmpty(t, state, "authorization URL must carry a state") {
+		return ""
+	}
 
 	q := url.Values{}
 	for k, v := range extra {

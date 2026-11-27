@@ -62,7 +62,7 @@ Keys under `auth.entra`:
 | `clientSecret` | - | Service principal secret (top-level or per-profile); overrides `AZURE_CLIENT_SECRET` |
 | `federatedTokenFile` | - | Workload identity token file (top-level or per-profile); overrides `AZURE_FEDERATED_TOKEN_FILE` |
 | `federatedToken` | - | Raw workload identity token for testing (top-level or per-profile); overrides `AZURE_FEDERATED_TOKEN` |
-| `httpClient` | - | HTTP client settings for token requests (timeouts, retries); response caching/compression stay off unless enabled here |
+| `httpClient` | - | HTTP client settings (`httpc.AppConfig`) for token and Microsoft Graph (`GetGroups`) requests: `timeout`, `retryMax`, `retryWaitMin`, `retryWaitMax`, `allowedPrivateCIDRs`, `trustProxyResolution`, and circuit-breaker options. Response caching and compression default to off (`GetGroups` never caches responses across profiles) |
 | `activeProfile` | - | Profile scafctl resolves when none is given (host-side; not forwarded to the plugin) |
 | `profiles.<name>.*` | - | Per-profile overrides of the keys above |
 
@@ -81,6 +81,11 @@ built-in trusted list for `entra` is `login.microsoftonline.com` and
 `login.microsoft.com`. Also set the cloud's login host in
 `auth.trustedVerificationDomains` (or
 `auth.handlers.entra.trustedVerificationDomains`) so the login proceeds.
+`GetGroups` automatically maps standard sovereign authorities
+(`login.microsoftonline.us`, `login.chinacloudapi.cn`,
+`login.partner.microsoftonline.cn`, `login.microsoftonline.eaglex.ic.gov`,
+`login.microsoftonline.microsoft.scloud`) to the corresponding sovereign
+Microsoft Graph endpoint (e.g. `https://graph.microsoft.us`).
 
 ### Environment Variables
 

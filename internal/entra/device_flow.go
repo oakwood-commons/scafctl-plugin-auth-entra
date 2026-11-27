@@ -102,13 +102,11 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, cfg *Config, _ sdkpl
 		return nil, fmt.Errorf("entra: extract_claims: %w", err)
 	}
 
-	// Step 5: Store credentials, then drop tokens cached for any previous
-	// identity (issue #49).
+	// Step 5: Store credentials and clear cached tokens from any previous
+	// identity atomically under profileLock.
 	if err := p.storeCredentials(ctx, tenantID, tokenResp, cfg.ClientID, scopes, "device_code", ""); err != nil {
 		return nil, fmt.Errorf("entra: store_credentials: %w", err)
 	}
-
-	p.clearUserTokenCache(ctx)
 
 	lgr.V(1).Info("authentication successful",
 		"subject", claims.Subject,
@@ -122,10 +120,11 @@ func (p *Plugin) performDeviceCodeFlow(ctx context.Context, cfg *Config, _ sdkpl
 }
 
 func (p *Plugin) requestDeviceCode(ctx context.Context, cfg *Config, tenantID string, scopes []string) (*DeviceCodeResponse, error) {
-	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	httpClient, releaseHTTP, err := p.httpClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseHTTP()
 
 	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/devicecode", cfg.GetAuthority(), tenantID)
 
@@ -162,10 +161,11 @@ func (p *Plugin) requestDeviceCode(ctx context.Context, cfg *Config, tenantID st
 
 func (p *Plugin) pollForToken(ctx context.Context, cfg *Config, tenantID string, deviceCode *DeviceCodeResponse) (*TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
-	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	httpClient, releaseHTTP, err := p.httpClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseHTTP()
 
 	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", cfg.GetAuthority(), tenantID)
 

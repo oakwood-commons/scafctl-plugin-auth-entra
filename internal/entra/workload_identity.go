@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -44,43 +45,7 @@ type WorkloadIdentityCredentials struct {
 
 // GetWorkloadIdentityCredentials retrieves workload identity configuration from environment variables.
 func GetWorkloadIdentityCredentials() *WorkloadIdentityCredentials {
-	directToken := os.Getenv(EnvAzureFederatedToken)
-	tokenFile := os.Getenv(EnvAzureFederatedTokenFile)
-
-	hasDirectToken := directToken != ""
-	hasTokenFile := false
-	if tokenFile != "" {
-		if _, err := os.Stat(tokenFile); err == nil { //nolint:gosec // tokenFile is from trusted env var
-			hasTokenFile = true
-		}
-	}
-
-	if !hasDirectToken && !hasTokenFile {
-		return nil
-	}
-
-	clientID := os.Getenv(EnvAzureClientID)
-	tenantID := os.Getenv(EnvAzureTenantID)
-
-	if clientID == "" || tenantID == "" {
-		return nil
-	}
-
-	// Trim any trailing slash: workload identity webhooks commonly inject
-	// e.g. https://login.microsoftonline.com/, which would otherwise
-	// produce a double slash in the token URL.
-	authority := strings.TrimRight(os.Getenv(EnvAzureAuthorityHost), "/")
-	if authority == "" {
-		authority = DefaultAuthority
-	}
-
-	return &WorkloadIdentityCredentials{
-		ClientID:  clientID,
-		TenantID:  tenantID,
-		TokenFile: tokenFile,
-		Token:     directToken,
-		Authority: authority,
-	}
+	return resolveWorkloadIdentityCredentialsFromConfig(nil)
 }
 
 // HasWorkloadIdentityCredentials checks if workload identity is configured and available
@@ -97,18 +62,23 @@ func (p *Plugin) resolveWorkloadIdentityCredentials() *WorkloadIdentityCredentia
 }
 
 func (p *Plugin) resolveWorkloadIdentityCredentialsForConfig(cfg *Config) *WorkloadIdentityCredentials {
-	if cfg == nil {
+	if cfg == nil && p != nil {
 		cfg = p.config
 	}
+	return resolveWorkloadIdentityCredentialsFromConfig(cfg)
+}
+
+func resolveWorkloadIdentityCredentialsFromConfig(cfg *Config) *WorkloadIdentityCredentials {
 	// Prefer explicitly configured values, fall back to env vars. Fields not
 	// provided in the config fall through to the environment variable.
-	clientID := cfg.profileOrEnv(cfg.ClientID, "clientId", EnvAzureClientID)
-	tenantID := cfg.profileOrEnv(cfg.TenantID, "tenantId", EnvAzureTenantID)
-	tokenFile := cfg.profileOrEnv(cfg.FederatedTokenFile, "federatedTokenFile", EnvAzureFederatedTokenFile)
-	directToken := cfg.profileOrEnv(cfg.FederatedToken, "federatedToken", EnvAzureFederatedToken)
-	// See GetWorkloadIdentityCredentials: trim trailing slash from the
-	// authority so injected values do not yield a double slash downstream.
-	authority := strings.TrimRight(cfg.profileOrEnv(cfg.Authority, "authority", EnvAzureAuthorityHost), "/")
+	clientID := cfg.profileOrEnv(cfgOrEmpty(cfg, func(c *Config) string { return c.ClientID }), "clientId", EnvAzureClientID)
+	tenantID := cfg.profileOrEnv(cfgOrEmpty(cfg, func(c *Config) string { return c.TenantID }), "tenantId", EnvAzureTenantID)
+	tokenFile := cfg.profileOrEnv(cfgOrEmpty(cfg, func(c *Config) string { return c.FederatedTokenFile }), "federatedTokenFile", EnvAzureFederatedTokenFile)
+	directToken := cfg.profileOrEnv(cfgOrEmpty(cfg, func(c *Config) string { return c.FederatedToken }), "federatedToken", EnvAzureFederatedToken)
+	// Trim any trailing slash: workload identity webhooks commonly inject
+	// e.g. https://login.microsoftonline.com/, which would otherwise
+	// produce a double slash in the token URL.
+	authority := strings.TrimRight(cfg.profileOrEnv(cfgOrEmpty(cfg, func(c *Config) string { return c.Authority }), "authority", EnvAzureAuthorityHost), "/")
 	if authority == "" {
 		authority = DefaultAuthority
 	}
@@ -117,7 +87,7 @@ func (p *Plugin) resolveWorkloadIdentityCredentialsForConfig(cfg *Config) *Workl
 	hasDirectToken := directToken != ""
 	hasTokenFile := false
 	if tokenFile != "" {
-		if _, err := os.Stat(tokenFile); err == nil { //nolint:gosec // tokenFile is from trusted config or env var
+		if _, err := os.Stat(filepath.Clean(tokenFile)); err == nil { //nolint:gosec // tokenFile is from trusted config or env var
 			hasTokenFile = true
 		}
 	}
@@ -136,6 +106,13 @@ func (p *Plugin) resolveWorkloadIdentityCredentialsForConfig(cfg *Config) *Workl
 		Token:     directToken,
 		Authority: authority,
 	}
+}
+
+func cfgOrEmpty(cfg *Config, get func(*Config) string) string {
+	if cfg == nil {
+		return ""
+	}
+	return get(cfg)
 }
 
 // hasWorkloadIdentityCredentials checks if workload identity credentials are
@@ -158,14 +135,12 @@ func (c *WorkloadIdentityCredentials) GetFederatedToken() (string, error) {
 		return "", fmt.Errorf("no federated token configured: set %s or %s", EnvAzureFederatedToken, EnvAzureFederatedTokenFile)
 	}
 
-	data, err := os.ReadFile(c.TokenFile)
+	token, err := sdkplugin.SecretRef("file://" + filepath.Clean(c.TokenFile)).Resolve()
 	if err != nil {
+		if strings.HasSuffix(err.Error(), " is empty") {
+			return "", fmt.Errorf("federated token file is empty: %s", c.TokenFile)
+		}
 		return "", fmt.Errorf("failed to read federated token file %s: %w", c.TokenFile, err)
-	}
-
-	token := strings.TrimSpace(string(data))
-	if token == "" {
-		return "", fmt.Errorf("federated token file is empty: %s", c.TokenFile)
 	}
 
 	return token, nil
@@ -193,7 +168,7 @@ func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginR
 				EnvAzureFederatedTokenFile, EnvAzureFederatedToken)
 		}
 		if tokenFile != "" {
-			if _, err := os.Stat(tokenFile); err != nil { //nolint:gosec // tokenFile is from trusted config or env var
+			if _, err := os.Stat(filepath.Clean(tokenFile)); err != nil { //nolint:gosec // tokenFile is from trusted config or env var
 				return nil, fmt.Errorf("workload identity token file %s: %w", tokenFile, err)
 			}
 		}
@@ -249,10 +224,15 @@ func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginR
 func (p *Plugin) acquireWorkloadIdentityToken(ctx context.Context, cfg *Config, creds *WorkloadIdentityCredentials, scope string) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err := validateAuthorityURL(creds.Authority); err != nil {
+		return nil, fmt.Errorf("invalid workload identity authority: %w", err)
+	}
+
+	httpClient, releaseHTTP, err := p.httpClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseHTTP()
 
 	federatedToken, err := creds.GetFederatedToken()
 	if err != nil {
@@ -359,6 +339,9 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 	// Check cache first
 	if !req.ForceRefresh && hostClient != nil {
 		token, err := cacheGet(ctx, hostClient, fullKey)
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return nil, cErr
+		}
 		if err == nil && token != nil && token.IsValidFor(minValidFor) {
 			return &sdkplugin.TokenResponse{
 				AccessToken: token.AccessToken,
@@ -382,6 +365,9 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 	// Cache the token
 	if hostClient != nil {
 		if cacheErr := cacheSet(ctx, hostClient, fullKey, token); cacheErr != nil {
+			if cErr := contextErr(ctx, cacheErr); cErr != nil {
+				return nil, cErr
+			}
 			lgr.V(1).Info("failed to cache token", "error", cacheErr)
 		}
 	}

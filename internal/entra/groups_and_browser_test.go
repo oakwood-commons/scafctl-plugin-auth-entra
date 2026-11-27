@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/oakwood-commons/httpc"
 	"github.com/oakwood-commons/scafctl-plugin-auth-entra/internal/clock"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
@@ -32,6 +33,24 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+const (
+	testFakeBrowserEnv         = "ENTRA_TEST_FAKE_BROWSER"
+	testFakeBrowserCaptureTmp  = "opened-url.tmp"
+	testFakeBrowserCaptureFile = "opened-url.txt"
+)
+
+func TestMain(m *testing.M) {
+	if os.Getenv(testFakeBrowserEnv) == "1" {
+		if len(os.Args) > 1 {
+			if err := os.WriteFile(testFakeBrowserCaptureTmp, []byte(os.Args[len(os.Args)-1]), 0o600); err == nil {
+				_ = os.Rename(testFakeBrowserCaptureTmp, testFakeBrowserCaptureFile)
+			}
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 // startPluginAuthGRPCServer starts a real gRPC AuthHandlerServiceServer backed
 // by p and returns a connected proto.AuthHandlerServiceClient.
@@ -105,7 +124,7 @@ func TestGetGroups_GRPCRoundTripAndPrecedence(t *testing.T) {
 		for i := range page2 {
 			page2[i] = graphGroupEntry{ID: fmt.Sprintf("grp-page2-%03d", i)}
 		}
-		nextPageURL := "https://graph.microsoft.com/v1.0/me/memberOf/microsoft.graph.group?$skiptoken=page2"
+		nextPageURL := "https://graph.microsoft.us/v1.0/me/memberOf/microsoft.graph.group?$skiptoken=page2"
 
 		graphMock := NewMockGraphClient()
 		graphMock.AddResponse(http.StatusOK, graphGroupsPage{
@@ -132,17 +151,56 @@ func TestGetGroups_GRPCRoundTripAndPrecedence(t *testing.T) {
 		assert.Equal(t, "grp-page2-074", resp.GetGroups()[224])
 
 		// Token refresh honored both the "corp" profile secret keys and the
-		// per-RPC sovereign cloud authority from GetGroupsRequest.Settings.
+		// per-RPC sovereign cloud authority + Graph scope from GetGroupsRequest.Settings.
 		tokenReqs := httpMock.GetRequests()
 		require.Len(t, tokenReqs, 1)
 		assert.Equal(t, "https://login.microsoftonline.us/corp-tenant/oauth2/v2.0/token", tokenReqs[0].Endpoint)
 		assert.Equal(t, "refresh_token", tokenReqs[0].Data.Get("grant_type"))
 		assert.Equal(t, "user-rt-1", tokenReqs[0].Data.Get("refresh_token"))
+		assert.Contains(t, tokenReqs[0].Data.Get("scope"), "https://graph.microsoft.us/.default")
 
 		require.Len(t, graphMock.Requests, 2)
-		assert.Equal(t, graphGroupsMemberOfURL, graphMock.Requests[0].URL)
+		assert.Equal(t, graphMemberOfURLForHost("graph.microsoft.us"), graphMock.Requests[0].URL)
 		assert.Equal(t, nextPageURL, graphMock.Requests[1].URL)
 		assert.Equal(t, "delegated-graph-token", graphMock.Requests[0].BearerToken)
+
+		assert.Equal(t, "microsoftgraph.chinacloudapi.cn", graphHostForAuthority("https://login.chinacloudapi.cn"))
+		assert.Equal(t, "microsoftgraph.chinacloudapi.cn", graphHostForAuthority("https://login.partner.microsoftonline.cn"))
+		assert.Equal(t, "graph.eaglex.ic.gov", graphHostForAuthority("https://login.microsoftonline.eaglex.ic.gov"))
+		assert.Equal(t, "graph.microsoft.scloud", graphHostForAuthority("https://login.microsoftonline.microsoft.scloud"))
+		assert.Equal(t, "graph.microsoft.com", graphHostForAuthority("https://login.microsoftonline.com"))
+	})
+
+	t.Run("rejects non-HTTPS or cross-origin @odata.nextLink before sending bearer token", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		for _, badNextLink := range []string{
+			"http://graph.microsoft.com/v1.0/me/memberOf?$skiptoken=p2",
+			"https://evil.example.com/v1.0/me/memberOf?$skiptoken=p2",
+			"https://user:pass@graph.microsoft.com/v1.0/me/memberOf?$skiptoken=p2",
+			"https://graph.microsoft.com:8443/v1.0/me/memberOf?$skiptoken=p2",
+		} {
+			httpMock := NewMockHTTPClient()
+			httpMock.AddResponse(http.StatusOK, TokenResponse{
+				AccessToken:  "delegated-graph-token",
+				RefreshToken: "stored-refresh-token",
+				TokenType:    "Bearer",
+				ExpiresIn:    3600,
+				Scope:        graphGroupsScope + " offline_access",
+			})
+			graphMock := NewMockGraphClient()
+			graphMock.AddResponse(http.StatusOK, graphGroupsPage{
+				NextLink: badNextLink,
+				Value:    []graphGroupEntry{{ID: "grp-1"}},
+			})
+
+			p, fake := newTestPlugin(t, httpMock, graphMock)
+			storeUserSession(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour))
+
+			_, err := p.GetGroups(context.Background(), HandlerName)
+			require.Error(t, err, "must reject untrusted nextLink %q", badNextLink)
+			assert.Len(t, graphMock.Requests, 1, "must not forward bearer token to untrusted nextLink %q", badNextLink)
+		}
 	})
 
 	t.Run("stored interactive user session succeeds even when ambient AZURE_CLIENT_ID and AZURE_CLIENT_SECRET are set", func(t *testing.T) {
@@ -299,7 +357,7 @@ func TestGetGroups_GRPCRoundTripAndPrecedence(t *testing.T) {
 			ClientID:  "work-cid",
 		}
 		workMeta.SetMeta(MetaKeyTenantID, "work-tid")
-		fake.secrets[p.tokenCachePrefix(ctxWork)+p.userSessionFingerprintWithConfig(workCfg, workMeta)+":"+graphGroupsScope] = cacheEntryJSON(t, "tok-work")
+		fake.secrets[p.tokenCachePrefix(ctxWork)+p.userSessionFingerprintWithConfig(workCfg, workMeta)+":"+graphScopeForAuthority(workCfg.GetAuthority())] = cacheEntryJSON(t, "tok-work")
 
 		personalMeta := &auth.HandlerMetadata{
 			Claims:    &auth.Claims{ObjectID: "oid-personal"},
@@ -494,69 +552,100 @@ func TestInteractiveLogin_BrowserPreference(t *testing.T) {
 		}
 	})
 
-	t.Run("defaultBrowserOpener launches configured browser executable via oauth.OpenBrowserWithPreference", func(t *testing.T) {
+	t.Run("defaultBrowserOpener launches configured browser executable or $BROWSER via oauth.OpenBrowserWithPreference", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
-			t.Skip("POSIX shell script browser stub requires unix-like OS")
+			t.Skip("symlinked helper-process browser stub requires unix-like OS")
 		}
-		clearCredentialEnv(t)
 
-		tmpDir := t.TempDir()
-		urlCaptureFile := filepath.Join(tmpDir, "opened-url.txt")
-		fakeBrowserScript := filepath.Join(tmpDir, "fake-edge")
-		script := fmt.Sprintf("#!/bin/sh\nprintf '%%s' \"$1\" > %q\n", urlCaptureFile)
-		require.NoError(t, os.WriteFile(fakeBrowserScript, []byte(script), 0o755)) //nolint:gosec // executable test stub
-
-		httpMock := pasteTokenResponse()
-		p, _ := newTestPlugin(t, httpMock, nil)
-		p.headlessReason = func() string { return "" }
-		// Keep production defaultBrowserOpener untouched so Login exercises
-		// oauth.OpenBrowserWithPreference end-to-end.
-
-		loginDone := make(chan error, 1)
-		go func() {
-			_, loginErr := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
-				Flow:    auth.FlowInteractive,
-				Browser: fakeBrowserScript,
-				Timeout: 10 * time.Second,
-			}, nil)
-			loginDone <- loginErr
-		}()
-
-		var launchedURL string
-		require.Eventually(t, func() bool {
-			b, err := os.ReadFile(urlCaptureFile) //nolint:gosec // test temp file
-			if err != nil || len(b) == 0 {
-				return false
+		for _, useEnv := range []bool{false, true} {
+			name := "explicit req.Browser"
+			if useEnv {
+				name = "BROWSER environment variable"
 			}
-			launchedURL = string(b)
-			return true
-		}, 5*time.Second, 20*time.Millisecond, "configured browser executable must receive authorization URL")
+			t.Run(name, func(t *testing.T) {
+				clearCredentialEnv(t)
 
-		completeLoopbackCallback(t, launchedURL, "REAL-OPENER-CODE")
-		require.NoError(t, <-loginDone)
+				tmpDir := t.TempDir()
+				t.Chdir(tmpDir)
+				t.Setenv(testFakeBrowserEnv, "1")
+
+				exePath, err := os.Executable()
+				require.NoError(t, err)
+				fakeBrowserBin := filepath.Join(tmpDir, "fake-edge")
+				require.NoError(t, os.Symlink(exePath, fakeBrowserBin))
+
+				reqBrowser := fakeBrowserBin
+				if useEnv {
+					reqBrowser = ""
+					t.Setenv("BROWSER", fakeBrowserBin)
+				}
+
+				httpMock := pasteTokenResponse()
+				p, _ := newTestPlugin(t, httpMock, nil)
+				p.headlessReason = func() string { return "" }
+
+				loginCtx, cancelLogin := context.WithCancel(context.Background())
+				loginDone := make(chan struct{})
+				loginErrCh := make(chan error, 1)
+				t.Cleanup(func() {
+					cancelLogin()
+					<-loginDone
+				})
+				go func() {
+					defer close(loginDone)
+					_, loginErr := p.Login(loginCtx, HandlerName, sdkplugin.LoginRequest{
+						Flow:    auth.FlowInteractive,
+						Browser: reqBrowser,
+						Timeout: 10 * time.Second,
+					}, nil)
+					loginErrCh <- loginErr
+				}()
+
+				var launchedURL string
+				require.Eventually(t, func() bool {
+					b, readErr := os.ReadFile(testFakeBrowserCaptureFile)
+					if readErr != nil || len(b) == 0 {
+						return false
+					}
+					launchedURL = string(b)
+					return true
+				}, 5*time.Second, 20*time.Millisecond, "configured browser executable must receive authorization URL")
+
+				completeLoopbackCallback(t, launchedURL, "REAL-OPENER-CODE")
+				require.NoError(t, <-loginErrCh)
+			})
+		}
 	})
 
 	t.Run("defaultBrowserOpener logs warning via logr and falls back to system default when preferred browser fails", func(t *testing.T) {
-		if runtime.GOOS != "linux" {
-			t.Skip("xdg-open PATH stub is linux-specific")
+		var sysStub string
+		switch runtime.GOOS {
+		case "linux":
+			sysStub = "xdg-open"
+		case "darwin":
+			sysStub = "open"
+		default:
+			t.Skip("system-opener PATH stub requires linux or darwin")
 		}
 
 		tmpDir := t.TempDir()
-		fallbackFile := filepath.Join(tmpDir, "fallback-url.txt")
-		fakeXdgOpen := filepath.Join(tmpDir, "xdg-open")
-		script := fmt.Sprintf("#!/bin/sh\nprintf '%%s' \"$1\" > %q\n", fallbackFile)
-		require.NoError(t, os.WriteFile(fakeXdgOpen, []byte(script), 0o755)) //nolint:gosec // executable test stub
+		t.Chdir(tmpDir)
+		t.Setenv(testFakeBrowserEnv, "1")
+
+		exePath, err := os.Executable()
+		require.NoError(t, err)
+		require.NoError(t, os.Symlink(exePath, filepath.Join(tmpDir, sysStub)))
 		t.Setenv("PATH", tmpDir)
 
 		ctx, logLines := capturingLogger()
 		targetURL := "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=test"
-		err := defaultBrowserOpener(withBrowserPreference(ctx, filepath.Join(tmpDir, "missing-browser")), targetURL)
+		err = defaultBrowserOpener(withBrowserPreference(ctx, filepath.Join(tmpDir, "missing-browser")), targetURL)
 		require.NoError(t, err)
 
 		require.Eventually(t, func() bool {
-			b, readErr := os.ReadFile(fallbackFile) //nolint:gosec // test temp file
+			b, readErr := os.ReadFile(testFakeBrowserCaptureFile)
 			return readErr == nil && string(b) == targetURL
-		}, 3*time.Second, 20*time.Millisecond, "xdg-open fallback must receive URL")
+		}, 3*time.Second, 20*time.Millisecond, "system opener fallback must receive URL")
 
 		joined := strings.Join(*logLines, "\n")
 		assert.Contains(t, joined, "falling back to system default browser")
@@ -815,11 +904,13 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		// Same httpClient config reuses the initialized clients without rebuilding.
 		sameCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"1ns","retryMax":0}}`))
 		require.NoError(t, err)
-		gotHTTP, err := p.httpClientForConfig(context.Background(), sameCfg)
+		gotHTTP, relSameHTTP, err := p.httpClientForConfig(context.Background(), sameCfg)
 		require.NoError(t, err)
+		defer relSameHTTP()
 		assert.Same(t, initHTTPClient, gotHTTP)
-		gotGraph, err := p.graphClientForConfig(context.Background(), sameCfg)
+		gotGraph, relSameGraph, err := p.graphClientForConfig(context.Background(), sameCfg)
 		require.NoError(t, err)
+		defer relSameGraph()
 		assert.Same(t, initGraphClient, gotGraph)
 
 		// A per-RPC config omitting httpClient (cfg.HTTPClient == nil) must NOT
@@ -827,18 +918,22 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		// and reuses those cached instances across subsequent calls.
 		cleanCfg, err := parseHandlerConfig([]byte(`{"tenantId":"other-tenant"}`))
 		require.NoError(t, err)
-		cleanHTTP, err := p.httpClientForConfig(context.Background(), cleanCfg)
+		cleanHTTP, relCleanHTTP, err := p.httpClientForConfig(context.Background(), cleanCfg)
 		require.NoError(t, err)
+		defer relCleanHTTP()
 		assert.NotSame(t, initHTTPClient, cleanHTTP)
-		cleanHTTP2, err := p.httpClientForConfig(context.Background(), cleanCfg)
+		cleanHTTP2, relCleanHTTP2, err := p.httpClientForConfig(context.Background(), cleanCfg)
 		require.NoError(t, err)
+		defer relCleanHTTP2()
 		assert.Same(t, cleanHTTP, cleanHTTP2, "repeated calls with identical effective httpClient config must reuse the cached HTTPClient")
 
-		cleanGraph, err := p.graphClientForConfig(context.Background(), cleanCfg)
+		cleanGraph, relCleanGraph, err := p.graphClientForConfig(context.Background(), cleanCfg)
 		require.NoError(t, err)
+		defer relCleanGraph()
 		assert.NotSame(t, initGraphClient, cleanGraph)
-		cleanGraph2, err := p.graphClientForConfig(context.Background(), cleanCfg)
+		cleanGraph2, relCleanGraph2, err := p.graphClientForConfig(context.Background(), cleanCfg)
 		require.NoError(t, err)
+		defer relCleanGraph2()
 		assert.Same(t, cleanGraph, cleanGraph2, "repeated calls with identical effective httpClient config must reuse the cached GraphClient")
 
 		// Verify a per-RPC Graph client succeeds against a real HTTP test server
@@ -857,16 +952,46 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		ts.Start()
 		defer ts.Close()
 
-		// Semantically equivalent durations ("5s" vs "5000ms") resolve to the same cache entry.
-		loopbackCfgA, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","allowPrivateIPs":true}}`))
+		// Semantically equivalent durations and reordered CIDR lists resolve to the same cache entry.
+		loopbackCfgA, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","allowedPrivateCIDRs":["127.0.0.0/8","::1/128"]}}`))
 		require.NoError(t, err)
-		loopbackCfgB, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5000ms","allowPrivateIPs":true,"enableCache":false}}`))
+		loopbackCfgB, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5000ms","allowedPrivateCIDRs":["::1/128","127.0.0.0/8"],"enableCache":false}}`))
 		require.NoError(t, err)
-		loopbackGraphA, err := p.graphClientForConfig(context.Background(), loopbackCfgA)
+		loopbackGraphA, relLoopA, err := p.graphClientForConfig(context.Background(), loopbackCfgA)
 		require.NoError(t, err)
-		loopbackGraphB, err := p.graphClientForConfig(context.Background(), loopbackCfgB)
+		defer relLoopA()
+		loopbackGraphB, relLoopB, err := p.graphClientForConfig(context.Background(), loopbackCfgB)
 		require.NoError(t, err)
+		defer relLoopB()
 		assert.Same(t, loopbackGraphA, loopbackGraphB)
+
+		// Distinct IPPolicy settings (legacy allowPrivateIPs, trustProxyResolution, invalid CIDRs) stay isolated or fail validation.
+		legacyAllowAllCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","allowPrivateIPs":true}}`))
+		require.NoError(t, err)
+		legacyGraph, relLegacy, err := p.graphClientForConfig(context.Background(), legacyAllowAllCfg)
+		require.NoError(t, err)
+		defer relLegacy()
+		assert.NotSame(t, loopbackGraphA, legacyGraph, "allowPrivateIPs=true widens policy beyond loopback CIDRs and must not share cache entry")
+
+		emptyCIDROverrideCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"30s","allowPrivateIPs":true,"allowedPrivateCIDRs":[]}}`))
+		require.NoError(t, err)
+		overrideGraph, relOverride, err := p.graphClientForConfig(context.Background(), emptyCIDROverrideCfg)
+		require.NoError(t, err)
+		defer relOverride()
+		assert.Same(t, cleanGraph, overrideGraph, "explicit empty allowedPrivateCIDRs overrides allowPrivateIPs=true back to default block-all policy")
+
+		trustProxyCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","allowedPrivateCIDRs":["127.0.0.0/8","::1/128"],"trustProxyResolution":true}}`))
+		require.NoError(t, err)
+		trustProxyGraph, relTrust, err := p.graphClientForConfig(context.Background(), trustProxyCfg)
+		require.NoError(t, err)
+		defer relTrust()
+		assert.NotSame(t, loopbackGraphA, trustProxyGraph, "trustProxyResolution=true alters egress policy and must not share cache entry")
+
+		badCIDRCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"allowedPrivateCIDRs":["not-a-cidr"]}}`))
+		require.NoError(t, err)
+		_, relBad, err := p.graphClientForConfig(context.Background(), badCIDRCfg)
+		defer relBad()
+		require.ErrorContains(t, err, "invalid allowedPrivateCIDRs")
 
 		for range 4 {
 			resp, reqErr := loopbackGraphA.Get(context.Background(), ts.URL, "bearer-test")
@@ -903,21 +1028,23 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 
 		// Call #1 and #2 build separate *Config instances (simulating two separate RPCs)
 		// that resolve to the SAME cached *DefaultHTTPClient, accumulating 2 failures to open the breaker.
-		hc1, err := p.httpClientForConfig(context.Background(), cbCfg1)
+		hc1, relHC1, err := p.httpClientForConfig(context.Background(), cbCfg1)
 		require.NoError(t, err)
 		resp1, err1 := hc1.PostForm(context.Background(), plainFailingTS.URL, url.Values{"grant_type": {"client_credentials"}})
 		if resp1 != nil {
 			_ = resp1.Body.Close()
 		}
+		relHC1()
 		require.Error(t, err1)
 
-		hc2, err := p.httpClientForConfig(context.Background(), cbCfg2)
+		hc2, relHC2, err := p.httpClientForConfig(context.Background(), cbCfg2)
 		require.NoError(t, err)
 		assert.Same(t, hc1, hc2)
 		resp2, err2 := hc2.PostForm(context.Background(), plainFailingTS.URL, url.Values{"grant_type": {"client_credentials"}})
 		if resp2 != nil {
 			_ = resp2.Body.Close()
 		}
+		relHC2()
 		require.Error(t, err2)
 		hitsBeforeOpen := plainHits.Load()
 		assert.GreaterOrEqual(t, hitsBeforeOpen, int32(2))
@@ -926,9 +1053,10 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		// without making any network request to plainFailingTS.
 		cbCfg3, err := parseHandlerConfig([]byte(cbCfgJSON))
 		require.NoError(t, err)
-		hc3, err := p.httpClientForConfig(context.Background(), cbCfg3)
+		hc3, relHC3, err := p.httpClientForConfig(context.Background(), cbCfg3)
 		require.NoError(t, err)
 		_, err3 := hc3.PostForm(context.Background(), plainFailingTS.URL, url.Values{"grant_type": {"client_credentials"}})
+		relHC3()
 		require.Error(t, err3)
 		assert.ErrorIs(t, err3, httpc.ErrCircuitBreakerOpen)
 		assert.Equal(t, hitsBeforeOpen, plainHits.Load(), "open circuit breaker must short-circuit before hitting upstream")
@@ -936,9 +1064,11 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		// A distinct per-RPC HTTP config gets its own isolated client whose breaker is still closed.
 		otherCBCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"3s","retryMax":1,"retryWaitMin":"1ms","retryWaitMax":"2ms","allowPrivateIPs":true,"enableCircuitBreaker":true,"circuitBreakerMaxFailures":2,"circuitBreakerOpenTimeout":"1m"}}`))
 		require.NoError(t, err)
-		hcOther, err := p.httpClientForConfig(context.Background(), otherCBCfg)
+		hcOther, relOther, err := p.httpClientForConfig(context.Background(), otherCBCfg)
 		require.NoError(t, err)
+		relOther()
 		assert.NotSame(t, hc1, hcOther)
+		require.NoError(t, p.StopAuthHandler(context.Background(), HandlerName))
 
 		// 2. Bounded LRU eviction & StopAuthHandler close idle transport connections.
 		var closedConns atomic.Int32
@@ -966,28 +1096,32 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		cfgK3, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"6s","allowPrivateIPs":true}}`))
 		require.NoError(t, err)
 
-		gc1, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
+		gc1, relGC1, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
 		require.NoError(t, err)
-		gc2, err := evictPlugin.graphClientForConfig(context.Background(), cfgK2)
+		gc2, relGC2, err := evictPlugin.graphClientForConfig(context.Background(), cfgK2)
 		require.NoError(t, err)
 		assert.Equal(t, 2, evictPlugin.graphClientCache.Len())
 
-		// Open one idle keep-alive connection on both gc1 and gc2.
+		// Open one idle keep-alive connection on both gc1 and gc2, then release their RPC leases.
 		for _, gc := range []GraphClient{gc1, gc2} {
 			r, getErr := gc.Get(context.Background(), keepAliveTS.URL, "tok")
 			require.NoError(t, getErr)
 			_, _ = io.Copy(io.Discard, r.Body)
 			_ = r.Body.Close()
 		}
+		relGC1()
+		relGC2()
 		assert.Equal(t, int32(0), closedConns.Load(), "keep-alive connections remain idle before eviction")
 
 		// Touch K1 so K2 becomes the least-recently-used entry, then insert K3.
-		gc1Again, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
+		gc1Again, relGC1Again, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
 		require.NoError(t, err)
 		assert.Same(t, gc1, gc1Again)
+		relGC1Again()
 
-		_, err = evictPlugin.graphClientForConfig(context.Background(), cfgK3)
+		_, relGC3, err := evictPlugin.graphClientForConfig(context.Background(), cfgK3)
 		require.NoError(t, err)
+		relGC3()
 		assert.Equal(t, 2, evictPlugin.graphClientCache.Len(), "cache must stay bounded at clientCacheSize")
 
 		// Evicting K2 must close K2's idle keep-alive socket promptly while keeping K1's open.
@@ -995,15 +1129,121 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 			return closedConns.Load() == 1
 		}, 2*time.Second, 10*time.Millisecond, "LRU eviction must close evicted client's idle connections")
 
-		gc1StillCached, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
+		gc1StillCached, relStill, err := evictPlugin.graphClientForConfig(context.Background(), cfgK1)
 		require.NoError(t, err)
 		assert.Same(t, gc1, gc1StillCached, "promoted MRU entry K1 must survive eviction")
+		relStill()
 
 		// StopAuthHandler closes all remaining cached clients (closing K1's idle connection).
 		require.NoError(t, evictPlugin.StopAuthHandler(context.Background(), HandlerName))
 		require.Eventually(t, func() bool {
 			return closedConns.Load() == 2
 		}, 2*time.Second, 10*time.Millisecond, "StopAuthHandler must close remaining cached idle connections")
+	})
+
+	t.Run("evicting or stopping a borrowed client before its first request defers Close until the last borrower releases", func(t *testing.T) {
+		var newConns atomic.Int32
+		var closedConns atomic.Int32
+		keepAliveTS := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"value":[{"id":"grp-1"}]}`))
+		}))
+		keepAliveTS.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			switch state { //nolint:exhaustive // only tracking new and closed sockets
+			case http.StateNew:
+				newConns.Add(1)
+			case http.StateClosed:
+				closedConns.Add(1)
+			}
+		}
+		keepAliveTS.Start()
+		defer keepAliveTS.Close()
+
+		p := &Plugin{clientCacheSize: 1}
+		require.NoError(t, p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			BinaryName: "scafctl",
+		}))
+
+		cfgK1, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"4s","allowPrivateIPs":true}}`))
+		require.NoError(t, err)
+		cfgK2, err := parseHandlerConfig([]byte(`{"httpClient":{"timeout":"5s","allowPrivateIPs":true}}`))
+		require.NoError(t, err)
+
+		// Borrower 1A and 1B acquire K1 BEFORE issuing any HTTP request (simulating
+		// getGroups acquiring graphClient before GetToken runs).
+		gc1A, release1A, err := p.graphClientForConfig(context.Background(), cfgK1)
+		require.NoError(t, err)
+		gc1B, release1B, err := p.graphClientForConfig(context.Background(), cfgK1)
+		require.NoError(t, err)
+		assert.Same(t, gc1A, gc1B)
+
+		// Another request inserts K2 (capacity 1), evicting K1 while 1A and 1B still hold leases
+		// and BEFORE K1 has opened any TCP connection.
+		_, release2, err := p.graphClientForConfig(context.Background(), cfgK2)
+		require.NoError(t, err)
+		release2()
+		assert.Equal(t, 1, p.graphClientCache.Len())
+		assert.Zero(t, newConns.Load())
+		assert.Zero(t, closedConns.Load())
+
+		// Now Borrower 1A issues two sequential paginated requests on the already-evicted client.
+		for range 2 {
+			resp, getErr := gc1A.Get(context.Background(), keepAliveTS.URL, "tok")
+			require.NoError(t, getErr)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		assert.Equal(t, int32(1), newConns.Load(), "evicted borrowed client reuses its keep-alive socket across pages")
+		assert.Equal(t, int32(0), closedConns.Load(), "socket stays open while borrowers hold leases")
+
+		// Releasing 1A alone must NOT close K1 while 1B still holds a lease.
+		release1A()
+		release1A() // idempotent second call must not underflow refs
+		respB, errB := gc1B.Get(context.Background(), keepAliveTS.URL, "tok")
+		require.NoError(t, errB)
+		_, _ = io.Copy(io.Discard, respB.Body)
+		_ = respB.Body.Close()
+		assert.Equal(t, int32(1), newConns.Load(), "second borrower still reuses the same keep-alive socket")
+		assert.Equal(t, int32(0), closedConns.Load())
+
+		// Releasing the final borrower (1B) must immediately close K1's keep-alive socket.
+		release1B()
+		require.Eventually(t, func() bool {
+			return closedConns.Load() == 1
+		}, 2*time.Second, 10*time.Millisecond, "deferred eviction cleanup must close sockets opened after eviction when last borrower releases")
+
+		// Also verify CloseAll / StopAuthHandler (including repeated StopAuthHandler
+		// calls and post-stop one-shot borrows) defers cleanup while a borrower is active.
+		hc2, releaseHC2, err := p.httpClientForConfig(context.Background(), cfgK2)
+		require.NoError(t, err)
+		require.NoError(t, p.StopAuthHandler(context.Background(), HandlerName))
+		require.NoError(t, p.StopAuthHandler(context.Background(), HandlerName))
+
+		postStopResp, postStopErr := hc2.PostForm(context.Background(), keepAliveTS.URL, url.Values{"grant_type": {"refresh_token"}})
+		require.NoError(t, postStopErr)
+		_, _ = io.Copy(io.Discard, postStopResp.Body)
+		_ = postStopResp.Body.Close()
+		assert.Equal(t, int32(2), newConns.Load())
+		assert.Equal(t, int32(1), closedConns.Load(), "socket opened by active borrower after StopAuthHandler stays open until release")
+
+		releaseHC2()
+		require.Eventually(t, func() bool {
+			return closedConns.Load() == 2
+		}, 2*time.Second, 10*time.Millisecond, "releasing active borrower after StopAuthHandler closes its keep-alive socket")
+
+		// A late in-flight borrow after StopAuthHandler receives a pre-retired client
+		// that closes its socket as soon as its lease is released, without resurrecting the cache.
+		lateHC, releaseLate, err := p.httpClientForConfig(context.Background(), cfgK1)
+		require.NoError(t, err)
+		assert.Zero(t, p.httpClientCache.Len(), "closed cache must not retain post-stop entries")
+		lateResp, lateErr := lateHC.PostForm(context.Background(), keepAliveTS.URL, url.Values{"grant_type": {"refresh_token"}})
+		require.NoError(t, lateErr)
+		_, _ = io.Copy(io.Discard, lateResp.Body)
+		_ = lateResp.Body.Close()
+		releaseLate()
+		require.Eventually(t, func() bool {
+			return closedConns.Load() == 3
+		}, 2*time.Second, 10*time.Millisecond, "post-stop one-shot client must close its socket immediately on release")
 	})
 
 	t.Run("concurrent -race stress over bounded HTTP and Graph client caches", func(t *testing.T) {
@@ -1025,13 +1265,15 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 					cfg, parseErr := parseHandlerConfig([]byte(raw))
 					assert.NoError(t, parseErr)
 
-					hc, hErr := p.httpClientForConfig(context.Background(), cfg)
+					hc, relHC, hErr := p.httpClientForConfig(context.Background(), cfg)
 					assert.NoError(t, hErr)
 					assert.NotNil(t, hc)
+					relHC()
 
-					gc, gErr := p.graphClientForConfig(context.Background(), cfg)
+					gc, relGC, gErr := p.graphClientForConfig(context.Background(), cfg)
 					assert.NoError(t, gErr)
 					assert.NotNil(t, gc)
+					relGC()
 				}
 			}(g)
 		}
@@ -1041,5 +1283,131 @@ func TestPerRPCRequestSettings_AllRPCsAndClientIsolation(t *testing.T) {
 		assert.LessOrEqual(t, p.graphClientCache.Len(), 4)
 		assert.Equal(t, DefaultClientID, p.config.ClientID, "p.config must never be mutated")
 		require.NoError(t, p.StopAuthHandler(context.Background(), HandlerName))
+	})
+
+	t.Run("DefaultGraphClient disables HTTP response caching even when enableCache is true so group memberships never bleed across identities", func(t *testing.T) {
+		var hits atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "public, max-age=600")
+			switch r.Header.Get("Authorization") {
+			case "Bearer token-alice":
+				_, _ = w.Write([]byte(`{"value":[{"id":"grp-alice"}]}`))
+			case "Bearer token-bob":
+				_, _ = w.Write([]byte(`{"value":[{"id":"grp-bob"}]}`))
+			default:
+				w.WriteHeader(http.StatusUnauthorized)
+			}
+		}))
+		defer srv.Close()
+
+		enableCache := true
+		gc, err := NewDefaultGraphClient(&httpc.AppConfig{
+			Timeout:             "5s",
+			EnableCache:         &enableCache,
+			CacheType:           "memory",
+			MemoryCacheSize:     64,
+			CacheTTL:            "10m",
+			AllowedPrivateCIDRs: []string{"127.0.0.0/8", "::1/128"},
+		}, logr.Discard())
+		require.NoError(t, err)
+		defer func() { _ = gc.Close() }()
+
+		respA, err := gc.Get(context.Background(), srv.URL+"/v1.0/me/memberOf", "token-alice")
+		require.NoError(t, err)
+		bodyA, err := io.ReadAll(respA.Body)
+		_ = respA.Body.Close()
+		require.NoError(t, err)
+		assert.Contains(t, string(bodyA), "grp-alice")
+
+		respB, err := gc.Get(context.Background(), srv.URL+"/v1.0/me/memberOf", "token-bob")
+		require.NoError(t, err)
+		bodyB, err := io.ReadAll(respB.Body)
+		_ = respB.Body.Close()
+		require.NoError(t, err)
+		assert.Contains(t, string(bodyB), "grp-bob")
+		assert.NotContains(t, string(bodyB), "grp-alice")
+		assert.Equal(t, int32(2), hits.Load(), "Graph client must hit upstream for every bearer token and never serve cached responses across users")
+	})
+
+	t.Run("NewDefaultHTTPClient, NewDefaultGraphClient, and resolveEffectiveHTTPConfig cover cache, compression, body-size, and invalid-config branches", func(t *testing.T) {
+		enableCache := true
+		enableCompression := true
+		hc, err := NewDefaultHTTPClient(&httpc.AppConfig{
+			Timeout:             "5s",
+			RetryMax:            2,
+			RetryWaitMin:        "10ms",
+			RetryWaitMax:        "50ms",
+			EnableCache:         &enableCache,
+			CacheType:           "filesystem",
+			CacheDir:            t.TempDir(),
+			CacheTTL:            "1m",
+			CacheKeyPrefix:      "test:",
+			MaxCacheFileSize:    1024,
+			EnableCompression:   &enableCompression,
+			MaxResponseBodySize: 2048,
+			AllowedPrivateCIDRs: []string{"127.0.0.0/8", "::1/128"},
+		}, logr.Discard())
+		require.NoError(t, err)
+		require.NoError(t, hc.Close())
+
+		_, err = NewDefaultHTTPClient(&httpc.AppConfig{CacheType: "invalid"}, logr.Discard())
+		require.ErrorContains(t, err, "invalid cacheType")
+		_, err = NewDefaultGraphClient(&httpc.AppConfig{CacheTTL: "bad"}, logr.Discard())
+		require.ErrorContains(t, err, "invalid cacheTTL")
+
+		// Failed ConfigureAuthHandler must preserve existing p.cfg and p.config.
+		p, _ := newTestPlugin(t, nil, nil)
+		origBinary := p.cfg.BinaryName
+		origClientID := p.config.ClientID
+		err = p.ConfigureAuthHandler(context.Background(), HandlerName, sdkplugin.ProviderConfig{
+			BinaryName: "mutated-cli",
+			Settings: map[string]json.RawMessage{
+				HandlerName: json.RawMessage(`{"authority":"http://insecure.example.com"}`),
+			},
+		})
+		require.Error(t, err)
+		assert.Equal(t, origBinary, p.cfg.BinaryName, "failed reconfigure must not mutate p.cfg")
+		assert.Equal(t, origClientID, p.config.ClientID, "failed reconfigure must not mutate p.config")
+	})
+
+	t.Run("rejects oversized Graph memberOf page, insecure AZURE_AUTHORITY_HOST, and BiDi spoofing runes", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		// 1. Oversized Graph page (> maxGraphGroupPageBytes) fails fast.
+		p, fake := newTestPlugin(t, nil, nil)
+		storeUserSession(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour))
+		fake.secrets[userTokenCacheKey(p, "sess-1", graphGroupsScope)] = cacheEntryJSON(t, "tok-1")
+		p.graphClient = &staticBodyGraphClient{
+			status: http.StatusOK,
+			body:   strings.Repeat("x", maxGraphGroupPageBytes+16),
+		}
+		_, err := p.GetGroups(context.Background(), HandlerName)
+		require.ErrorContains(t, err, "exceeded maximum page size")
+
+		// 2. Non-HTTPS AZURE_AUTHORITY_HOST is rejected before sending federated assertion.
+		httpMock := NewMockHTTPClient()
+		wiPlugin, _ := newTestPlugin(t, httpMock, nil)
+		t.Setenv(EnvAzureClientID, "wi-cid")
+		t.Setenv(EnvAzureTenantID, "wi-tid")
+		t.Setenv(EnvAzureFederatedToken, "jwt-assertion")
+		t.Setenv(EnvAzureAuthorityHost, "http://insecure.example.com")
+		_, err = wiPlugin.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowWorkloadIdentity,
+		}, nil)
+		require.ErrorContains(t, err, "must use https://")
+		assert.Empty(t, httpMock.GetRequests(), "must never send federated assertion over http://")
+
+		// 3. BiDi spoofing runes stripped by sanitizeControlChars and pasted error descriptions bounded.
+		assert.Equal(t, "safe-text", sanitizeControlChars("safe\u202e-\u2066text\u061c"))
+		longDesc := strings.Repeat("a", 700)
+		_, pasteErr := parsePastedRedirect(
+			"http://localhost:8400/?state=st1&error=access_denied&error_description="+longDesc,
+			"http://localhost:8400",
+			"st1",
+		)
+		require.Error(t, pasteErr)
+		assert.LessOrEqual(t, len(pasteErr.Error()), 600)
 	})
 }

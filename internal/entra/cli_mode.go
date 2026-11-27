@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
@@ -131,7 +130,11 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 	ctx = withResolvedConfig(ctx, cfg)
 
 	// Check for a valid stored user session first (highest priority)
-	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
+	metadata, isUserSession, loadErr := m.p.inspectStoredSession(ctx)
+	if tErr := isTransientSessionLoadErr(ctx, loadErr); tErr != nil {
+		return nil, tErr
+	}
+	if isUserSession {
 		return &auth.Status{
 			Authenticated: true,
 			Claims:        metadata.Claims,
@@ -155,14 +158,12 @@ func (m *cliMode) GetStatus(ctx context.Context) (*auth.Status, error) {
 		return m.p.servicePrincipalStatusForConfig(cfg)
 	}
 
-	// Load and validate stored session credentials under profile read lock
-	_, metadata, err := m.p.loadSessionCredentials(ctx)
-	if err != nil {
+	if loadErr != nil || metadata == nil {
 		return &auth.Status{Authenticated: false}, nil //nolint:nilerr // missing/corrupted/mismatched credentials = not authenticated
 	}
 
 	// Check if refresh token is expired
-	if !metadata.ExpiresAt.IsZero() && time.Now().After(metadata.ExpiresAt) {
+	if !metadata.ExpiresAt.IsZero() && m.p.now().After(metadata.ExpiresAt) {
 		return &auth.Status{
 			Authenticated: false,
 			Reason:        "session expired",
@@ -196,7 +197,11 @@ func (m *cliMode) GetToken(ctx context.Context, req sdkplugin.TokenRequest) (*sd
 	ctx = withResolvedConfig(ctx, cfg)
 
 	// Use the stored user session first when valid (highest priority)
-	if metadata, ok := m.p.validStoredUserSession(ctx); ok {
+	metadata, isUserSession, loadErr := m.p.inspectStoredSession(ctx)
+	if tErr := isTransientSessionLoadErr(ctx, loadErr); tErr != nil {
+		return nil, tErr
+	}
+	if isUserSession {
 		return m.userSessionToken(ctx, req, cfg, metadata)
 	}
 
@@ -289,6 +294,9 @@ func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenReque
 	// Check cache first (unless force refresh)
 	if !req.ForceRefresh && hostClient != nil {
 		token, err := cacheGet(ctx, hostClient, fullKey)
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return nil, cErr
+		}
 		if err == nil && token != nil && token.IsValidFor(minValidFor) {
 			lgr.V(1).Info("using cached token",
 				"scope", qualifiedScope,
@@ -324,6 +332,9 @@ func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenReque
 	// Cache the token
 	if hostClient != nil {
 		if cacheErr := cacheSet(ctx, hostClient, fullKey, token); cacheErr != nil {
+			if cErr := contextErr(ctx, cacheErr); cErr != nil {
+				return nil, cErr
+			}
 			lgr.V(1).Info("failed to cache token", "error", cacheErr)
 		}
 	}
@@ -349,7 +360,11 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 	var results []*auth.CachedTokenInfo
 
 	// Refresh token
-	if hasRefresh, metadata := m.p.loadRefreshTokenStatus(ctx); hasRefresh {
+	hasRefresh, metadata, statusErr := m.p.loadRefreshTokenStatus(ctx)
+	if tErr := isTransientSessionLoadErr(ctx, statusErr); tErr != nil {
+		return nil, tErr
+	}
+	if hasRefresh {
 		info := &auth.CachedTokenInfo{
 			Handler:   HandlerName,
 			TokenKind: "refresh",
@@ -361,26 +376,47 @@ func (m *cliMode) ListCachedTokens(ctx context.Context) ([]*auth.CachedTokenInfo
 			info.SessionID = metadata.SessionID
 		}
 		if !info.ExpiresAt.IsZero() {
-			info.IsExpired = time.Now().After(info.ExpiresAt)
+			info.IsExpired = m.p.now().After(info.ExpiresAt)
 		}
 		results = append(results, info)
 	}
 
 	// Minted access tokens from cache
-	entries, _ := cacheListEntries(ctx, hostClient, m.p.tokenCachePrefix(ctx))
+	entries, listErr := cacheListEntries(ctx, hostClient, m.p.tokenCachePrefix(ctx))
+	if cErr := contextErr(ctx, listErr); cErr != nil {
+		return nil, cErr
+	}
 	results = append(results, entries...)
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return results, nil
 }
 
-// PurgeExpiredTokens removes expired access tokens from the cache in CLI mode.
+// PurgeExpiredTokens removes expired access tokens and aged orphaned refresh
+// revisions from the cache in CLI mode.
 func (m *cliMode) PurgeExpiredTokens(ctx context.Context) (int, error) {
 	hostClient := m.p.hostClient(ctx)
 	if hostClient == nil {
 		return 0, fmt.Errorf("host service not available")
 	}
 
-	return cachePurgeExpired(ctx, hostClient, m.p.tokenCachePrefix(ctx))
+	mu := m.p.profileLock(ctx)
+	if err := mu.Lock(ctx); err != nil {
+		return 0, err
+	}
+	defer mu.Unlock()
+
+	purged, err := cachePurgeExpired(ctx, hostClient, m.p.tokenCachePrefix(ctx))
+	if err != nil {
+		return 0, err
+	}
+	swept, err := m.p.sweepOrphanedRefreshRevisions(ctx, hostClient, "")
+	if err != nil {
+		return 0, err
+	}
+	return purged + swept, nil
 }
 
 // DetectAvailableFlows reports which auth flows are available based on

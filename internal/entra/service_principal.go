@@ -153,10 +153,11 @@ func (p *Plugin) acquireServicePrincipalToken(ctx context.Context, cfg *Config, 
 		cfg = p.config
 	}
 
-	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	httpClient, releaseHTTP, err := p.httpClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseHTTP()
 
 	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", cfg.GetAuthority(), creds.TenantID)
 
@@ -259,6 +260,9 @@ func (p *Plugin) getServicePrincipalToken(ctx context.Context, req sdkplugin.Tok
 	// Check cache first
 	if !req.ForceRefresh && hostClient != nil {
 		token, err := cacheGet(ctx, hostClient, fullKey)
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return nil, cErr
+		}
 		if err == nil && token != nil && token.IsValidFor(minValidFor) {
 			return &sdkplugin.TokenResponse{
 				AccessToken: token.AccessToken,
@@ -282,6 +286,9 @@ func (p *Plugin) getServicePrincipalToken(ctx context.Context, req sdkplugin.Tok
 	// Cache the token
 	if hostClient != nil {
 		if cacheErr := cacheSet(ctx, hostClient, fullKey, token); cacheErr != nil {
+			if cErr := contextErr(ctx, cacheErr); cErr != nil {
+				return nil, cErr
+			}
 			lgr.V(1).Info("failed to cache token", "error", cacheErr)
 		}
 	}

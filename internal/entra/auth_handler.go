@@ -9,8 +9,10 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,8 @@ import (
 	"github.com/oakwood-commons/httpc"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/oakwood-commons/scafctl-plugin-auth-entra/internal/clock"
 )
@@ -67,37 +71,194 @@ type BrowserOpenFunc func(ctx context.Context, url string) error
 
 // Plugin implements the scafctl AuthHandlerPlugin interface.
 type Plugin struct {
-	cfg              sdkplugin.ProviderConfig
-	config           *Config
-	httpClient       HTTPClient
-	graphClient      GraphClient
-	clock            clock.Clock
-	cachedHostClient *sdkplugin.HostServiceClient
-	openBrowser      BrowserOpenFunc
-	headlessReason   func() string
-	mode             mode
-	profileLocks     sync.Map
-	cleanupTimeout   time.Duration
+	cfg               sdkplugin.ProviderConfig
+	config            *Config
+	httpClient        HTTPClient
+	graphClient       GraphClient
+	clock             clock.Clock
+	cachedHostClient  *sdkplugin.HostServiceClient
+	openBrowser       BrowserOpenFunc
+	headlessReason    func() string
+	mode              mode
+	profileLocks      sync.Map
+	cleanupTimeout    time.Duration
+	orphanGracePeriod time.Duration
+	nowFunc           func() time.Time
 
 	clientCacheMu    sync.Mutex
 	clientCacheSize  int
 	baseLogger       logr.Logger
 	initHTTPKey      effectiveHTTPConfigKey
 	hasInitHTTPKey   bool
+	initHTTPHandle   *clientRefHandle
+	initGraphHandle  *clientRefHandle
 	httpClientCache  *boundedClientCache[effectiveHTTPConfigKey, *DefaultHTTPClient]
 	graphClientCache *boundedClientCache[effectiveHTTPConfigKey, *DefaultGraphClient]
 }
 
-// profileLock returns the profile-scoped RWMutex coordinating in-process
-// credential snapshots, writes, rollbacks, logouts, and session reads.
-func (p *Plugin) profileLock(ctx context.Context) *sync.RWMutex {
+// profileRWMutex is a context-aware, writer-preferring reader/writer lock.
+// Waiting Lock and RLock callers return ctx.Err() immediately when ctx is
+// canceled while another caller holds the lock across host secret-store I/O.
+type profileRWMutex struct {
+	mu             sync.Mutex
+	writerActive   bool
+	writersWaiting int
+	readersActive  int
+	notify         chan struct{}
+}
+
+func newProfileRWMutex() *profileRWMutex {
+	return &profileRWMutex{notify: make(chan struct{})}
+}
+
+func (m *profileRWMutex) broadcastLocked() {
+	close(m.notify)
+	m.notify = make(chan struct{})
+}
+
+func (m *profileRWMutex) Lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if !m.writerActive && m.readersActive == 0 {
+		m.writerActive = true
+		m.mu.Unlock()
+		return nil
+	}
+	m.writersWaiting++
+	for {
+		ch := m.notify
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			m.mu.Lock()
+			m.writersWaiting--
+			if m.writersWaiting == 0 && !m.writerActive {
+				m.broadcastLocked()
+			}
+			m.mu.Unlock()
+			return ctx.Err()
+		case <-ch:
+			if err := ctx.Err(); err != nil {
+				m.mu.Lock()
+				m.writersWaiting--
+				if m.writersWaiting == 0 && !m.writerActive {
+					m.broadcastLocked()
+				}
+				m.mu.Unlock()
+				return err
+			}
+			m.mu.Lock()
+			if !m.writerActive && m.readersActive == 0 {
+				m.writersWaiting--
+				m.writerActive = true
+				m.mu.Unlock()
+				return nil
+			}
+		}
+	}
+}
+
+func (m *profileRWMutex) Unlock() {
+	m.mu.Lock()
+	if !m.writerActive {
+		m.mu.Unlock()
+		panic("entra: Unlock of unlocked profileRWMutex")
+	}
+	m.writerActive = false
+	m.broadcastLocked()
+	m.mu.Unlock()
+}
+
+func (m *profileRWMutex) RLock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if !m.writerActive && m.writersWaiting == 0 {
+		m.readersActive++
+		m.mu.Unlock()
+		return nil
+	}
+	for {
+		ch := m.notify
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			m.mu.Lock()
+			if !m.writerActive && m.writersWaiting == 0 {
+				m.readersActive++
+				m.mu.Unlock()
+				return nil
+			}
+		}
+	}
+}
+
+func (m *profileRWMutex) RUnlock() {
+	m.mu.Lock()
+	if m.readersActive <= 0 {
+		m.mu.Unlock()
+		panic("entra: RUnlock of unlocked profileRWMutex")
+	}
+	m.readersActive--
+	if m.readersActive == 0 {
+		m.broadcastLocked()
+	}
+	m.mu.Unlock()
+}
+
+func isContextErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		switch status.Code(e) { //nolint:exhaustive // only context-cancellation gRPC codes are checked
+		case codes.Canceled, codes.DeadlineExceeded:
+			return true
+		}
+	}
+	return false
+}
+
+// contextErr returns a context error when err is itself a cancellation/deadline
+// error or when err failed after ctx was already canceled (for example, when
+// the host serializes a canceled SecretStore operation into a plain string
+// response error without gRPC status codes).
+func contextErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isContextErr(err) {
+		return err
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	return nil
+}
+
+// profileLock returns the profile-scoped context-aware RWMutex coordinating
+// in-process credential snapshots, writes, rollbacks, logouts, and session reads.
+func (p *Plugin) profileLock(ctx context.Context) *profileRWMutex {
 	profile := auth.ProfileFromContext(ctx)
 	if v, ok := p.profileLocks.Load(profile); ok {
-		return v.(*sync.RWMutex)
+		return v.(*profileRWMutex)
 	}
-	mu := &sync.RWMutex{}
+	mu := newProfileRWMutex()
 	actual, _ := p.profileLocks.LoadOrStore(profile, mu)
-	return actual.(*sync.RWMutex)
+	return actual.(*profileRWMutex)
 }
 
 var (
@@ -207,7 +368,7 @@ func (p *Plugin) ensureGraphClientCacheLocked() *boundedClientCache[effectiveHTT
 	return p.graphClientCache
 }
 
-func (p *Plugin) httpClientForConfig(ctx context.Context, cfg *Config) (HTTPClient, error) {
+func (p *Plugin) httpClientForConfig(ctx context.Context, cfg *Config) (HTTPClient, func(), error) {
 	var appCfg *httpc.AppConfig
 	if cfg != nil {
 		appCfg = cfg.HTTPClient
@@ -215,7 +376,7 @@ func (p *Plugin) httpClientForConfig(ctx context.Context, cfg *Config) (HTTPClie
 
 	key, clientCfg, err := resolveEffectiveHTTPConfig(appCfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
+		return nil, noopRelease, fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
 	}
 
 	p.clientCacheMu.Lock()
@@ -223,29 +384,37 @@ func (p *Plugin) httpClientForConfig(ctx context.Context, cfg *Config) (HTTPClie
 	hasInit := p.hasInitHTTPKey
 	initKey := p.initHTTPKey
 	baseLgr := p.baseLogger
-	var cache *boundedClientCache[effectiveHTTPConfigKey, *DefaultHTTPClient]
 	if curHTTP != nil {
-		if _, isDefault := curHTTP.(*DefaultHTTPClient); !isDefault {
+		defHTTP, isDefault := curHTTP.(*DefaultHTTPClient)
+		if !isDefault {
 			p.clientCacheMu.Unlock()
-			return curHTTP, nil
+			return curHTTP, noopRelease, nil
 		}
 		if hasInit && key == initKey {
-			p.clientCacheMu.Unlock()
-			return curHTTP, nil
+			if p.initHTTPHandle != nil && p.initHTTPHandle.closer == defHTTP {
+				if rel, ok := p.initHTTPHandle.tryAcquire(); ok {
+					p.clientCacheMu.Unlock()
+					return curHTTP, rel, nil
+				}
+			} else if p.initHTTPHandle != nil {
+				p.clientCacheMu.Unlock()
+				return curHTTP, noopRelease, nil
+			}
 		}
 	} else if cfg == nil || (p.config != nil && cfg == p.config) {
 		p.clientCacheMu.Unlock()
-		return nil, fmt.Errorf("HTTP client not initialized")
+		return nil, noopRelease, fmt.Errorf("HTTP client not initialized")
 	}
-	cache = p.ensureHTTPClientCacheLocked()
+	cache := p.ensureHTTPClientCacheLocked()
 	p.clientCacheMu.Unlock()
 
-	return cache.GetOrCreate(key, func() *DefaultHTTPClient {
+	client, rel := cache.Acquire(key, func() *DefaultHTTPClient {
 		return newDefaultHTTPClientFromResolved(clientCfg, pickHTTPLogger(ctx, baseLgr))
-	}), nil
+	})
+	return client, rel, nil
 }
 
-func (p *Plugin) graphClientForConfig(ctx context.Context, cfg *Config) (GraphClient, error) {
+func (p *Plugin) graphClientForConfig(ctx context.Context, cfg *Config) (GraphClient, func(), error) {
 	var appCfg *httpc.AppConfig
 	if cfg != nil {
 		appCfg = cfg.HTTPClient
@@ -253,57 +422,70 @@ func (p *Plugin) graphClientForConfig(ctx context.Context, cfg *Config) (GraphCl
 
 	key, clientCfg, err := resolveEffectiveHTTPConfig(appCfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build Graph client from httpClient config: %w", err)
+		return nil, noopRelease, fmt.Errorf("failed to build Graph client from httpClient config: %w", err)
 	}
+	graphKey := key.withoutHTTPCache()
 
 	p.clientCacheMu.Lock()
 	curGraph := p.graphClient
 	hasInit := p.hasInitHTTPKey
-	initKey := p.initHTTPKey
+	initKey := p.initHTTPKey.withoutHTTPCache()
 	baseLgr := p.baseLogger
-	var cache *boundedClientCache[effectiveHTTPConfigKey, *DefaultGraphClient]
 	if curGraph != nil {
-		if _, isDefault := curGraph.(*DefaultGraphClient); !isDefault {
+		defGraph, isDefault := curGraph.(*DefaultGraphClient)
+		if !isDefault {
 			p.clientCacheMu.Unlock()
-			return curGraph, nil
+			return curGraph, noopRelease, nil
 		}
-		if hasInit && key == initKey {
-			p.clientCacheMu.Unlock()
-			return curGraph, nil
+		if hasInit && graphKey == initKey {
+			if p.initGraphHandle != nil && p.initGraphHandle.closer == defGraph {
+				if rel, ok := p.initGraphHandle.tryAcquire(); ok {
+					p.clientCacheMu.Unlock()
+					return curGraph, rel, nil
+				}
+			} else if p.initGraphHandle != nil {
+				p.clientCacheMu.Unlock()
+				return curGraph, noopRelease, nil
+			}
 		}
 	} else if cfg == nil || (p.config != nil && cfg == p.config) {
 		p.clientCacheMu.Unlock()
-		return nil, fmt.Errorf("graph client not initialized")
+		return nil, noopRelease, fmt.Errorf("graph client not initialized")
 	}
-	cache = p.ensureGraphClientCacheLocked()
+	cache := p.ensureGraphClientCacheLocked()
 	p.clientCacheMu.Unlock()
 
-	return cache.GetOrCreate(key, func() *DefaultGraphClient {
+	client, rel := cache.Acquire(graphKey, func() *DefaultGraphClient {
 		return newDefaultGraphClientFromResolved(clientCfg, pickHTTPLogger(ctx, baseLgr))
-	}), nil
+	})
+	return client, rel, nil
 }
 
 func (p *Plugin) closeHTTPClients() {
 	p.clientCacheMu.Lock()
-	httpCache := p.httpClientCache
-	graphCache := p.graphClientCache
+	httpCache := p.ensureHTTPClientCacheLocked()
+	graphCache := p.ensureGraphClientCacheLocked()
 	curHTTP := p.httpClient
 	curGraph := p.graphClient
-	p.httpClientCache = nil
-	p.graphClientCache = nil
+	httpHandle := p.initHTTPHandle
+	graphHandle := p.initGraphHandle
 	p.clientCacheMu.Unlock()
 
-	if httpCache != nil {
-		httpCache.CloseAll()
-	}
-	if graphCache != nil {
-		graphCache.CloseAll()
-	}
+	httpCache.CloseAll()
+	graphCache.CloseAll()
 	if defHTTP, ok := curHTTP.(*DefaultHTTPClient); ok {
-		_ = defHTTP.Close()
+		if httpHandle != nil && httpHandle.closer == defHTTP {
+			httpHandle.retire()
+		} else {
+			_ = defHTTP.Close()
+		}
 	}
 	if defGraph, ok := curGraph.(*DefaultGraphClient); ok {
-		_ = defGraph.Close()
+		if graphHandle != nil && graphHandle.closer == defGraph {
+			graphHandle.retire()
+		} else {
+			_ = defGraph.Close()
+		}
 	}
 }
 
@@ -347,8 +529,6 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		return fmt.Errorf("unknown handler: %s", handlerName)
 	}
 
-	p.cfg = cfg
-
 	var rawSettings []byte
 	if raw, ok := cfg.Settings[HandlerName]; ok {
 		rawSettings = raw
@@ -363,6 +543,7 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		return fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
 	}
 
+	p.cfg = cfg
 	p.config = parsedCfg
 
 	// Initialize clock
@@ -394,27 +575,37 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		nextGraph = newDefaultGraphClientFromResolved(initClientCfg, httpLogger)
 	}
 
-	var prevHTTP *DefaultHTTPClient
-	var prevGraph *DefaultGraphClient
+	var prevHTTPHandle *clientRefHandle
+	var prevGraphHandle *clientRefHandle
+	var unusedHTTP *DefaultHTTPClient
+	var unusedGraph *DefaultGraphClient
 	p.clientCacheMu.Lock()
 	if nextHTTP != nil {
 		if defHTTP, isDefault := p.httpClient.(*DefaultHTTPClient); isDefault {
-			prevHTTP = defHTTP
+			prevHTTPHandle = p.initHTTPHandle
+			if prevHTTPHandle == nil {
+				prevHTTPHandle = newClientRefHandle(defHTTP)
+			}
 		}
-		if p.httpClient == nil || prevHTTP != nil {
+		if p.httpClient == nil || prevHTTPHandle != nil {
 			p.httpClient = nextHTTP
+			p.initHTTPHandle = newClientRefHandle(nextHTTP)
 		} else {
-			prevHTTP = nextHTTP
+			unusedHTTP = nextHTTP
 		}
 	}
 	if nextGraph != nil {
 		if defGraph, isDefault := p.graphClient.(*DefaultGraphClient); isDefault {
-			prevGraph = defGraph
+			prevGraphHandle = p.initGraphHandle
+			if prevGraphHandle == nil {
+				prevGraphHandle = newClientRefHandle(defGraph)
+			}
 		}
-		if p.graphClient == nil || prevGraph != nil {
+		if p.graphClient == nil || prevGraphHandle != nil {
 			p.graphClient = nextGraph
+			p.initGraphHandle = newClientRefHandle(nextGraph)
 		} else {
-			prevGraph = nextGraph
+			unusedGraph = nextGraph
 		}
 	}
 	oldHTTPCache := p.httpClientCache
@@ -432,11 +623,17 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 	if oldGraphCache != nil {
 		oldGraphCache.CloseAll()
 	}
-	if prevHTTP != nil {
-		_ = prevHTTP.Close()
+	if prevHTTPHandle != nil {
+		prevHTTPHandle.retire()
 	}
-	if prevGraph != nil {
-		_ = prevGraph.Close()
+	if prevGraphHandle != nil {
+		prevGraphHandle.retire()
+	}
+	if unusedHTTP != nil {
+		_ = unusedHTTP.Close()
+	}
+	if unusedGraph != nil {
+		_ = unusedGraph.Close()
 	}
 
 	// Initialize browser opener (can be overridden for testing)
@@ -449,8 +646,12 @@ func (p *Plugin) ConfigureAuthHandler(ctx context.Context, handlerName string, c
 		p.headlessReason = defaultHeadlessReason
 	}
 
-	// Default to CLI mode
+	// Default to CLI mode, stopping any previously active stopper mode cleanly.
+	prevMode := p.mode
 	p.mode = &cliMode{p: p}
+	if s, ok := prevMode.(interface{ Stop() }); ok {
+		s.Stop()
+	}
 
 	return nil
 }
@@ -502,11 +703,12 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 	}
 
 	mu := p.profileLock(ctx)
-	mu.Lock()
+	if err := mu.Lock(ctx); err != nil {
+		return err
+	}
 	defer mu.Unlock()
 
-	p.logoutLocked(ctx, hostClient)
-	return nil
+	return p.logoutLocked(ctx, hostClient)
 }
 
 // logoutIfSessionMatches clears stored credentials only when the stored
@@ -514,59 +716,71 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 // expectedSessionID. Returning without deleting on GetSecret errors, absent
 // metadata, or parse failures ensures a transient read error during an old
 // refresh's invalid_grant cannot wipe a newer session.
-func (p *Plugin) logoutIfSessionMatches(ctx context.Context, expectedSessionID string) {
+func (p *Plugin) logoutIfSessionMatches(ctx context.Context, expectedSessionID string) error {
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
-		return
+		return nil
 	}
 
 	mu := p.profileLock(ctx)
-	mu.Lock()
+	if err := mu.Lock(ctx); err != nil {
+		return err
+	}
 	defer mu.Unlock()
 
 	metaRaw, found, err := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
-	if err != nil || !found || metaRaw == "" {
-		return
+	if err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return cErr
+		}
+		return nil
+	}
+	if !found || metaRaw == "" {
+		return nil
 	}
 	curMeta, parseErr := p.parseMetadata(metaRaw)
 	if parseErr != nil || curMeta.SessionID != expectedSessionID {
-		return
+		return nil
 	}
 
-	p.logoutLocked(ctx, hostClient)
+	return p.logoutLocked(ctx, hostClient)
 }
 
-func (p *Plugin) logoutLocked(ctx context.Context, hostClient *sdkplugin.HostServiceClient) {
+func (p *Plugin) logoutLocked(ctx context.Context, hostClient *sdkplugin.HostServiceClient) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("logging out", "handler", HandlerName)
 
-	// Clear all cached tokens
-	cacheClear(ctx, lgr, hostClient, p.tokenCachePrefix(ctx))
-
-	// Delete versioned refresh tokens and legacy refresh token
+	// Delete the legacy refresh token before metadata so neither cross-process
+	// readers nor ListCachedTokens can observe !metaFound with a surviving
+	// legacy refresh_token key if Logout is interleaved or canceled mid-sweep.
 	refreshKey := p.secretKey(ctx, secretSuffixRefreshToken)
-	cacheClear(ctx, lgr, hostClient, refreshKey+".")
 	if err := hostClient.DeleteSecret(ctx, refreshKey); err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return cErr
+		}
 		lgr.V(1).Info("failed to delete refresh token (may not exist)", "error", err)
 	}
 
-	// Delete metadata
+	// Delete metadata next so the session is immediately marked logged out.
 	if err := hostClient.DeleteSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return cErr
+		}
 		lgr.V(1).Info("failed to delete metadata (may not exist)", "error", err)
 	}
-}
 
-// clearUserTokenCache removes all cached access tokens for the active
-// profile. Interactive and device-code logins call it right before storing
-// new credentials, so a login without a preceding logout can never serve a
-// token that was cached for the previous identity (issue #49). Refresh-token
-// rotation inside mintToken must NOT go through here -- same identity, same
-// session, and it would evict the very entries it keeps fresh.
-func (p *Plugin) clearUserTokenCache(ctx context.Context) {
-	lgr := logr.FromContextOrDiscard(ctx)
-	if hostClient := p.hostClient(ctx); hostClient != nil {
-		cacheClear(ctx, lgr, hostClient, p.tokenCachePrefix(ctx))
+	// Clear all cached access tokens and versioned refresh revisions.
+	if err := cacheClear(ctx, lgr, hostClient, p.tokenCachePrefix(ctx)); err != nil {
+		return err
 	}
+	if err := cacheClear(ctx, lgr, hostClient, refreshKey+"."); err != nil {
+		return err
+	}
+
+	return ctx.Err()
 }
 
 // GetStatus returns the current authentication status.
@@ -624,7 +838,8 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 	return m.ListCachedTokens(ctx)
 }
 
-// PurgeExpiredTokens removes expired access tokens from the cache.
+// PurgeExpiredTokens removes expired access tokens and aged orphaned refresh
+// revisions from the cache.
 // Delegates to the active mode (CLI mode by default).
 func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (int, error) {
 	if handlerName != HandlerName {
@@ -669,7 +884,7 @@ func (p *Plugin) detectWorkloadIdentityUnavailableReasonForConfig(cfg *Config) s
 
 	hasTokenSource := directToken != ""
 	if tokenFile != "" {
-		if _, err := os.Stat(tokenFile); err == nil { //nolint:gosec // tokenFile is from trusted config or env var
+		if _, err := os.Stat(filepath.Clean(tokenFile)); err == nil { //nolint:gosec // tokenFile is from trusted config or env var
 			hasTokenSource = true
 		} else if !hasTokenSource {
 			// Token file is set but inaccessible, and no direct token either.
@@ -725,16 +940,6 @@ func (p *Plugin) hostClient(ctx context.Context) *sdkplugin.HostServiceClient {
 		return p.cachedHostClient
 	}
 	return sdkplugin.HostClientFromContext(ctx)
-}
-
-// secretExists checks if a secret exists in the host secret store.
-func (p *Plugin) secretExists(ctx context.Context, key string) bool {
-	hostClient := p.hostClient(ctx)
-	if hostClient == nil {
-		return false
-	}
-	_, found, err := hostClient.GetSecret(ctx, key)
-	return err == nil && found
 }
 
 // getSecret retrieves a secret value from the host secret store.
@@ -829,7 +1034,11 @@ func (p *Plugin) activateServerMode(ctx context.Context, sc *ServerConfig) error
 	if err != nil {
 		return err
 	}
+	prevMode := p.mode
 	p.mode = sm
+	if s, ok := prevMode.(interface{ Stop() }); ok {
+		s.Stop()
+	}
 	return nil
 }
 

@@ -20,8 +20,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTestServerModeHTTPClient creates a server-mode client with AllowPrivateIPs
-// enabled so httptest servers on localhost are reachable.
+// newTestServerModeHTTPClient creates a server-mode client with private IPs
+// permitted so httptest servers on localhost are reachable.
 func newTestServerModeHTTPClient() *serverModeHTTPClient {
 	return &serverModeHTTPClient{
 		client: httpc.NewClient(&httpc.ClientConfig{
@@ -32,7 +32,7 @@ func newTestServerModeHTTPClient() *serverModeHTTPClient {
 			EnableCache:       false,
 			EnableCompression: false,
 			Logger:            logr.Discard(),
-			AllowPrivateIPs:   true,
+			IPPolicy:          httpc.AllowAllPrivateIPs(),
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
 				DialContext: (&net.Dialer{

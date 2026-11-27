@@ -128,8 +128,7 @@ func (p *Plugin) authCodeLogin(ctx context.Context, req sdkplugin.LoginRequest, 
 
 	// Build authorization URL. Include prompt=select_account so Microsoft
 	// Entra always shows the account chooser ("Pick an account" / "Use
-	// another account") even when only one browser SSO session is active
-	// (issue #71).
+	// another account") even when only one browser SSO session is active.
 	scopeStr := strings.Join(scopes, " ")
 	authURL := fmt.Sprintf("%s/%s/oauth2/v2.0/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&code_challenge=%s&code_challenge_method=S256&state=%s&prompt=select_account",
 		cfg.GetAuthority(),
@@ -297,13 +296,11 @@ waitForAuthCode:
 
 	// Store refresh token and metadata before dropping cached access tokens
 	// from any previous identity, so a credential-write failure leaves a
-	// replaced session intact (issue #49).
+	// replaced session intact.
 	if err := p.storeCredentials(ctx, tenantID, tokenResp, cfg.ClientID, scopes, "interactive", ""); err != nil {
 		settleCallback(false)
 		return nil, fmt.Errorf("entra: store_credentials: %w", err)
 	}
-
-	p.clearUserTokenCache(ctx)
 
 	settleCallback(true)
 
@@ -318,22 +315,32 @@ waitForAuthCode:
 	}, nil
 }
 
-// sanitizeControlChars strips C0 (U+0000-U+001F), DEL (U+007F), and C1
-// (U+0080-U+009F) control characters from a string, so callback-supplied
-// text cannot inject terminal escape sequences into errors printed to the
-// terminal (issue #49).
+// sanitizeControlChars strips C0 (U+0000-U+001F), DEL (U+007F), C1
+// (U+0080-U+009F), and Unicode BiDi formatting controls from a string, so
+// untrusted redirect or error text cannot inject terminal escape sequences or
+// bidirectional spoofing into output printed to the terminal.
 func sanitizeControlChars(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r <= 0x1f || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		if r <= 0x1f || r == 0x7f || (r >= 0x80 && r <= 0x9f) ||
+			r == 0x061c || (r >= 0x200e && r <= 0x200f) ||
+			(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
 			return -1
 		}
 		return r
 	}, s)
 }
 
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
+}
+
 // authCallbackError formats a redirect-supplied error message (from the HTTP
 // callback or a pasted redirect URL): control characters are stripped for
-// defense-in-depth terminal safety across both paths (issue #49) and a
+// defense-in-depth terminal safety across both paths and a
 // well-known AADSTS code gets a hint.
 func authCallbackError(raw string) error {
 	msg := sanitizeControlChars(raw)
@@ -386,9 +393,9 @@ func parsePastedRedirect(pasted, redirectURI, expectedState string) (string, err
 		return "", errors.New("entra: pasted response state mismatch (possible CSRF attack)")
 	}
 	if e := q.Get("error"); e != "" {
-		msg := "OAuth error: " + e
+		msg := "OAuth error: " + truncateRunes(e, 128)
 		if d := q.Get("error_description"); d != "" {
-			msg += ": " + d
+			msg += ": " + truncateRunes(d, 512)
 		}
 		return "", authCallbackError(msg)
 	}
@@ -407,10 +414,11 @@ func (p *Plugin) exchangeAuthCode(ctx context.Context, tenantID, code, redirectU
 	if err != nil {
 		return nil, err
 	}
-	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	httpClient, releaseHTTP, err := p.httpClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseHTTP()
 
 	endpoint := fmt.Sprintf("%s/%s/oauth2/v2.0/token", cfg.GetAuthority(), tenantID)
 

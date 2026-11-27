@@ -1,6 +1,7 @@
 package entra
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1389,7 +1390,7 @@ func TestWorkloadIdentityLoginErrors(t *testing.T) {
 	})
 }
 
-// --- authCodeLogin callback port tests (Issue #43) ---
+// --- authCodeLogin callback port tests ---
 
 // freePort asks the OS for an unused TCP port.
 func freePort(t *testing.T) int {
@@ -1401,10 +1402,11 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// probeCallback extracts the redirect_uri from the authorization URL, dials it
-// with the matching state parameter (and no code), and returns the port it
-// listened on. A GET with valid state and no code parameter gets an HTTP 400
-// response, proving a callback server is listening there.
+// probeCallback extracts the redirect_uri from the authorization URL, dials its
+// loopback TCP port directly with the matching state parameter (and no code),
+// and returns the port it listened on. A GET with valid state and no code
+// parameter receives an HTTP 400 response, proving the callback server is
+// listening there without passing query-derived URLs into net/http client sinks.
 func probeCallback(t *testing.T, authURL string) string {
 	t.Helper()
 	u, err := url.Parse(authURL)
@@ -1414,15 +1416,27 @@ func probeCallback(t *testing.T, authURL string) string {
 	state := u.Query().Get("state")
 	require.NotEmpty(t, state, "authorization URL must carry a state")
 
-	resp, err := http.Get(redirect + "/?state=" + url.QueryEscape(state)) //nolint:noctx // test helper hitting a local server
+	ru, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "http", ru.Scheme)
+	assert.Equal(t, "localhost", ru.Hostname())
+	portNum, err := strconv.Atoi(ru.Port())
+	require.NoError(t, err)
+	port := strconv.Itoa(portNum)
+
+	var d net.Dialer
+	conn, err := d.DialContext(context.Background(), "tcp", net.JoinHostPort("localhost", port))
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	_, err = fmt.Fprintf(conn, "GET /?state=%s HTTP/1.1\r\nHost: localhost:%s\r\nConnection: close\r\n\r\n", url.QueryEscape(state), port)
+	require.NoError(t, err)
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
-	ru, err := url.Parse(redirect)
-	require.NoError(t, err)
-	port := ru.Port()
-	require.NotEmpty(t, port)
 	return port
 }
 
@@ -1431,18 +1445,35 @@ func probeCallback(t *testing.T, authURL string) string {
 func completeLoopbackCallback(t *testing.T, authURL, code string) {
 	t.Helper()
 	u, err := url.Parse(authURL)
-	require.NoError(t, err)
-	redirect := u.Query().Get("redirect_uri")
+	if !assert.NoError(t, err) {
+		return
+	}
+	ru, err := url.Parse(u.Query().Get("redirect_uri"))
+	if !assert.NoError(t, err) {
+		return
+	}
+	portNum, err := strconv.Atoi(ru.Port())
+	if !assert.NoError(t, err) {
+		return
+	}
+	port := strconv.Itoa(portNum)
 	state := u.Query().Get("state")
 	go func() {
-		resp, getErr := http.Get(redirect + "/?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)) //nolint:noctx // test helper hitting a local server
-		if getErr == nil {
+		var d net.Dialer
+		conn, dialErr := d.DialContext(context.Background(), "tcp", net.JoinHostPort("localhost", port))
+		if !assert.NoError(t, dialErr) {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "GET /?code=%s&state=%s HTTP/1.1\r\nHost: localhost:%s\r\nConnection: close\r\n\r\n",
+			url.QueryEscape(code), url.QueryEscape(state), port)
+		if resp, readErr := http.ReadResponse(bufio.NewReader(conn), nil); readErr == nil {
 			_ = resp.Body.Close()
 		}
 	}()
 }
 
-// --- authCodeLogin authorize URL & prompt=select_account tests (Issue #71) ---
+// --- authCodeLogin authorize URL & prompt=select_account tests ---
 
 func TestAuthCodeLoginAuthorizeURL(t *testing.T) {
 	t.Run("includes prompt=select_account with PKCE and state by default", func(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -992,7 +993,7 @@ func TestLogoutIfSessionMatches_RequiresPositiveSessionProof(t *testing.T) {
 		}
 		fake.mu.Unlock()
 
-		p.logoutIfSessionMatches(context.Background(), sessionID)
+		require.NoError(t, p.logoutIfSessionMatches(context.Background(), sessionID))
 
 		// Restore healthy reads and confirm Bob's session and cached token remain intact.
 		fake.mu.Lock()
@@ -1013,7 +1014,7 @@ func TestLogoutIfSessionMatches_RequiresPositiveSessionProof(t *testing.T) {
 		fake.secrets[SecretKeyMetadata] = "{corrupt-json"
 		fake.mu.Unlock()
 
-		p.logoutIfSessionMatches(context.Background(), sessionID)
+		require.NoError(t, p.logoutIfSessionMatches(context.Background(), sessionID))
 
 		fake.mu.Lock()
 		assert.Equal(t, "bob-rt", fake.secrets[SecretKeyRefreshToken])
@@ -1027,7 +1028,7 @@ func TestLogoutIfSessionMatches_RequiresPositiveSessionProof(t *testing.T) {
 		delete(fake.secrets, SecretKeyMetadata)
 		fake.mu.Unlock()
 
-		p.logoutIfSessionMatches(context.Background(), sessionID)
+		require.NoError(t, p.logoutIfSessionMatches(context.Background(), sessionID))
 
 		fake.mu.Lock()
 		assert.Equal(t, "bob-rt", fake.secrets[SecretKeyRefreshToken])
@@ -1038,7 +1039,7 @@ func TestLogoutIfSessionMatches_RequiresPositiveSessionProof(t *testing.T) {
 	t.Run("matching SessionID deletes session when metadata is readable and valid", func(t *testing.T) {
 		p, fake, sessionID := seedBobSession(t)
 
-		p.logoutIfSessionMatches(context.Background(), sessionID)
+		require.NoError(t, p.logoutIfSessionMatches(context.Background(), sessionID))
 
 		fake.mu.Lock()
 		assert.Empty(t, fake.secrets)
@@ -1411,5 +1412,1098 @@ func TestAuthCodeLogin_OverlappingLoginsAndBoundedCleanup(t *testing.T) {
 		require.NoError(t, out.err)
 		assert.Equal(t, http.StatusServiceUnavailable, out.status)
 		assert.Equal(t, wantFailure, out.body)
+	})
+
+	t.Run("post-commit SetSecret error or uncertain metadata read preserves active refresh token revision", func(t *testing.T) {
+		aliceJWT := makeTestJWT(map[string]any{
+			"sub":                "alice-sub",
+			"oid":                "alice-oid",
+			"tid":                "alice-tid",
+			"preferred_username": "alice@example.com",
+		})
+
+		httpMock := NewMockHTTPClient()
+		httpMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at-1",
+			RefreshToken: "alice-rt-committed",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+		httpMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at-refreshed",
+			RefreshToken: "alice-rt-committed",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+
+		p, fake := newTestPlugin(t, httpMock, nil)
+		configureCustomPages(t, p)
+
+		// Simulate a gRPC deadline error arriving AFTER the host already persisted SecretKeyMetadata.
+		committedThenErrored := false
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+			if name == SecretKeyMetadata && !committedThenErrored {
+				committedThenErrored = true
+				fake.mu.Lock()
+				fake.secrets[name] = value
+				fake.mu.Unlock()
+				return errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded after write")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		browserCh := attachBrowserCallback(p, "POST-COMMIT-ERR-CODE")
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:     auth.FlowInteractive,
+			TenantID: "alice-tid",
+		}, nil)
+		require.Error(t, err)
+		<-browserCh
+
+		// Because metadata actually committed on the host before the RPC error,
+		// verRefreshKey MUST NOT have been deleted -- the profile remains usable.
+		st, statusErr := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, statusErr)
+		require.True(t, st.Authenticated, "committed metadata must keep its versioned refresh token")
+		assert.Equal(t, "alice-sub", st.Claims.Subject)
+
+		tokResp, tokErr := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://graph.microsoft.com/.default",
+			ForceRefresh: true,
+		})
+		require.NoError(t, tokErr)
+		assert.Equal(t, "alice-at-refreshed", tokResp.AccessToken)
+
+		// Also verify that if rollback's GetSecret(metadataKey) itself fails with an
+		// uncertain error, verRefreshKey is preserved rather than blindly deleted.
+		httpMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at-uncertain",
+			RefreshToken: "bob-rt-uncertain",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+		var readAfterErr bool
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, _ string) error {
+			if name == SecretKeyMetadata {
+				readAfterErr = true
+				return errors.New("uncertain metadata write error")
+			}
+			return nil
+		}
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyMetadata && readAfterErr {
+				return errors.New("transient metadata read failure during rollback")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		browserCh2 := attachBrowserCallback(p, "UNCERTAIN-READ-CODE")
+		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow:     auth.FlowInteractive,
+			TenantID: "alice-tid",
+		}, nil)
+		require.Error(t, err)
+		<-browserCh2
+
+		fake.mu.Lock()
+		fake.setSecretFunc = nil
+		fake.getSecretFunc = nil
+		var retainedUncertain bool
+		for k, v := range fake.secrets {
+			if strings.HasPrefix(k, SecretKeyRefreshToken+".") && v == "bob-rt-uncertain" {
+				retainedUncertain = true
+			}
+		}
+		fake.mu.Unlock()
+		assert.True(t, retainedUncertain, "uncertain metadata read during rollback must preserve candidate refresh token revision")
+	})
+
+	t.Run("two overlapping successful writes across processes keep pending revisions safe and sweep aged orphans later", func(t *testing.T) {
+		aliceJWT := makeTestJWT(map[string]any{"sub": "alice-sub", "oid": "alice-oid", "tid": "tid-1"})
+		bobJWT := makeTestJWT(map[string]any{"sub": "bob-sub", "oid": "bob-oid", "tid": "tid-1"})
+		carolJWT := makeTestJWT(map[string]any{"sub": "carol-sub", "oid": "carol-oid", "tid": "tid-1"})
+		daveJWT := makeTestJWT(map[string]any{"sub": "dave-sub", "oid": "dave-oid", "tid": "tid-1"})
+
+		var nowMu sync.Mutex
+		curNow := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+		nowFn := func() time.Time {
+			nowMu.Lock()
+			defer nowMu.Unlock()
+			return curNow
+		}
+		advanceClock := func(d time.Duration) {
+			nowMu.Lock()
+			curNow = curNow.Add(d)
+			nowMu.Unlock()
+		}
+
+		sharedFake := newFakeHostService()
+		sharedHost := newFakeHostClient(sharedFake)
+
+		newProcPlugin := func(mock *MockHTTPClient) *Plugin {
+			pl := &Plugin{
+				httpClient:        mock,
+				nowFunc:           nowFn,
+				orphanGracePeriod: 10 * time.Minute,
+			}
+			cfgCtx := sdkplugin.WithHostClient(context.Background(), sharedHost)
+			require.NoError(t, pl.ConfigureAuthHandler(cfgCtx, HandlerName, sdkplugin.ProviderConfig{BinaryName: "scafctl"}))
+			pl.httpClient = mock
+			pl.headlessReason = func() string { return "" }
+			return pl
+		}
+
+		// Seed initial session A.
+		mockInit := NewMockHTTPClient()
+		mockInit.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "at-a", RefreshToken: "rt-a", TokenType: "Bearer", ExpiresIn: 3600, IDToken: aliceJWT,
+		})
+		pInit := newProcPlugin(mockInit)
+		chInit := attachBrowserCallback(pInit, "CODE-A")
+		_, err := pInit.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+		<-chInit
+
+		// Coordinate two separate plugin processes (p1 -> B, p2 -> C) so both
+		// snapshot session A before either writes metadata, and BOTH succeed.
+		p1Snapshotted := make(chan struct{})
+		releaseP1Meta := make(chan struct{})
+		var p1Once sync.Once
+		sharedFake.mu.Lock()
+		sharedFake.setSecretFunc = func(_ context.Context, name, value string) error {
+			if name == SecretKeyMetadata && strings.Contains(value, "bob-sub") {
+				p1Once.Do(func() { close(p1Snapshotted) })
+				<-releaseP1Meta
+			}
+			return nil
+		}
+		sharedFake.mu.Unlock()
+
+		mock1 := NewMockHTTPClient()
+		mock1.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "at-b", RefreshToken: "rt-b", TokenType: "Bearer", ExpiresIn: 3600, IDToken: bobJWT,
+		})
+		p1 := newProcPlugin(mock1)
+		ch1 := attachBrowserCallback(p1, "CODE-B")
+
+		p1Done := make(chan error, 1)
+		go func() {
+			_, lErr := p1.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+			p1Done <- lErr
+		}()
+		<-p1Snapshotted
+
+		// Also stage a fresh pending revision from a concurrent writer whose
+		// metadata has not committed yet -- an immediate sweep MUST NOT delete it.
+		pendingRevKey := pInit.versionedRefreshKey(context.Background(), pInit.formatRefreshRevisionID())
+		sharedFake.mu.Lock()
+		sharedFake.secrets[pendingRevKey] = "rt-pending-inflight"
+		sharedFake.mu.Unlock()
+
+		// Start p2 before releasing p1 so both p1 and p2 snapshot prevRevID == A.
+		p2Snapshotted := make(chan struct{})
+		releaseP2Meta := make(chan struct{})
+		var p2Once sync.Once
+		sharedFake.mu.Lock()
+		sharedFake.setSecretFunc = func(_ context.Context, name, value string) error {
+			if name == SecretKeyMetadata && strings.Contains(value, "carol-sub") {
+				p2Once.Do(func() { close(p2Snapshotted) })
+				<-releaseP2Meta
+			}
+			return nil
+		}
+		sharedFake.mu.Unlock()
+
+		mock2 := NewMockHTTPClient()
+		mock2.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "at-c", RefreshToken: "rt-c", TokenType: "Bearer", ExpiresIn: 3600, IDToken: carolJWT,
+		})
+		p2 := newProcPlugin(mock2)
+		ch2 := attachBrowserCallback(p2, "CODE-C")
+		p2Done := make(chan error, 1)
+		go func() {
+			_, lErr := p2.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+			p2Done <- lErr
+		}()
+		<-p2Snapshotted
+
+		// Both p1 and p2 read prevRevID == A! Now commit B, then commit C.
+		close(releaseP1Meta)
+		require.NoError(t, <-p1Done)
+		<-ch1
+
+		close(releaseP2Meta)
+		require.NoError(t, <-p2Done)
+		<-ch2
+
+		sharedFake.mu.Lock()
+		sharedFake.setSecretFunc = nil
+		// Immediately at T0: A was collected, C is active, and pendingRevKey MUST still exist!
+		_, pendingStillThere := sharedFake.secrets[pendingRevKey]
+		var hasA, hasB, hasC bool
+		for k, v := range sharedFake.secrets {
+			if strings.HasPrefix(k, SecretKeyRefreshToken+".") {
+				switch v {
+				case "rt-a":
+					hasA = true
+				case "rt-b":
+					hasB = true
+				case "rt-c":
+					hasC = true
+				}
+			}
+		}
+		sharedFake.mu.Unlock()
+		assert.False(t, hasA, "initial revision A must be collected immediately")
+		assert.True(t, hasB, "recent revision B stays protected during orphanGracePeriod")
+		assert.True(t, hasC, "winning revision C must be retained")
+		assert.True(t, pendingStillThere, "immediate sweep must never delete another writer's fresh pending revision")
+
+		// Advance clock past orphanGracePeriod (15m > 10m), stage a NEW fresh
+		// pending revision at T0+15m, and trigger a rotation/login D -> aged
+		// orphans (B and the abandoned T0 pending key) are collected while D
+		// and the new T0+15m pending key remain intact!
+		advanceClock(15 * time.Minute)
+		freshPendingKey := pInit.versionedRefreshKey(context.Background(), pInit.formatRefreshRevisionID())
+		sharedFake.mu.Lock()
+		sharedFake.secrets[freshPendingKey] = "rt-fresh-pending"
+		sharedFake.mu.Unlock()
+
+		mock4 := NewMockHTTPClient()
+		mock4.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "at-d", RefreshToken: "rt-d", TokenType: "Bearer", ExpiresIn: 3600, IDToken: daveJWT,
+		})
+		p4 := newProcPlugin(mock4)
+		ch4 := attachBrowserCallback(p4, "CODE-D")
+		_, err = p4.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+		<-ch4
+
+		sharedFake.mu.Lock()
+		var remainingVersioned []string
+		for k, v := range sharedFake.secrets {
+			if strings.HasPrefix(k, SecretKeyRefreshToken+".") {
+				remainingVersioned = append(remainingVersioned, v)
+			}
+		}
+		sharedFake.mu.Unlock()
+		assert.ElementsMatch(t, []string{"rt-d", "rt-fresh-pending"}, remainingVersioned,
+			"deferred sweep must collect aged orphaned revisions (rt-b and stale pending) while keeping active rt-d and fresh pending revision")
+	})
+
+	t.Run("canceled readers and writers waiting behind a blocked profileLock return promptly", func(t *testing.T) {
+		clearCredentialEnv(t)
+
+		aliceJWT := makeTestJWT(map[string]any{"sub": "alice-sub", "oid": "alice-oid", "tid": "tid-1"})
+		httpMock := NewMockHTTPClient()
+		httpMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "at-1", RefreshToken: "rt-1", TokenType: "Bearer", ExpiresIn: 3600, IDToken: aliceJWT,
+		})
+		p, fake := newTestPlugin(t, httpMock, NewMockGraphClient())
+
+		writeEntered := make(chan struct{})
+		releaseWrite := make(chan struct{})
+		var writeOnce sync.Once
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, _ string, _ string) error {
+			writeOnce.Do(func() { close(writeEntered) })
+			<-releaseWrite
+			return nil
+		}
+		fake.mu.Unlock()
+
+		ch := attachBrowserCallback(p, "LOCK-CODE")
+		writerDone := make(chan struct{})
+		writerErrCh := make(chan error, 1)
+		t.Cleanup(func() {
+			select {
+			case <-releaseWrite:
+			default:
+				close(releaseWrite)
+			}
+			<-writerDone
+		})
+		go func() {
+			defer close(writerDone)
+			_, wErr := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+			writerErrCh <- wErr
+		}()
+		<-writeEntered
+
+		// While the credential writer holds profileLock across SetSecret, all
+		// read/write RPCs with short deadlines must abort on ctx.Done() promptly.
+		started := time.Now()
+
+		statusCtx, cancelStatus := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancelStatus()
+		_, err := p.GetStatus(statusCtx, HandlerName, sdkplugin.StatusRequest{})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		tokCtx, cancelTok := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancelTok()
+		_, err = p.GetToken(tokCtx, HandlerName, sdkplugin.TokenRequest{Scope: "https://graph.microsoft.com/.default", ForceRefresh: true})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		grpCtx, cancelGrp := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancelGrp()
+		_, err = p.GetGroups(grpCtx, HandlerName)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		listCtx, cancelList := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancelList()
+		_, err = p.ListCachedTokens(listCtx, HandlerName)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		purgeCtx, cancelPurge := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancelPurge()
+		_, err = p.PurgeExpiredTokens(purgeCtx, HandlerName)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		logoutCtx, cancelLogout := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancelLogout()
+		err = p.Logout(logoutCtx, HandlerName, sdkplugin.LogoutRequest{})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		assert.Less(t, time.Since(started), 5*time.Second, "canceled callers must not block behind stalled profileLock holder")
+
+		close(releaseWrite)
+		require.NoError(t, <-writerErrCh)
+		<-ch
+
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.True(t, st.Authenticated)
+	})
+}
+
+type funcGraphClient struct {
+	fn func(ctx context.Context, reqURL, bearerToken string) (*http.Response, error)
+}
+
+func (f *funcGraphClient) Get(ctx context.Context, reqURL, bearerToken string) (*http.Response, error) {
+	return f.fn(ctx, reqURL, bearerToken)
+}
+
+func TestCrossProcessSessionRead_RetriesWhenRotationDeletesPreviousRevision(t *testing.T) {
+	clearCredentialEnv(t)
+	// Configure ambient service principal credentials so any false negative in
+	// cross-process user-session loading would lose user-session precedence.
+	t.Setenv(EnvAzureClientID, "ambient-sp-client")
+	t.Setenv(EnvAzureTenantID, "ambient-sp-tenant")
+	t.Setenv(EnvAzureClientSecret, "ambient-sp-secret")
+
+	aliceJWT := makeTestJWT(map[string]any{
+		"sub":                "alice-sub",
+		"oid":                "alice-oid",
+		"tid":                "alice-tid",
+		"preferred_username": "alice@example.com",
+	})
+
+	newSharedProc := func(t *testing.T, sharedHost *sdkplugin.HostServiceClient, httpMock *MockHTTPClient, graph GraphClient) *Plugin {
+		t.Helper()
+		pl := &Plugin{
+			httpClient:  httpMock,
+			graphClient: graph,
+		}
+		cfgCtx := sdkplugin.WithHostClient(context.Background(), sharedHost)
+		require.NoError(t, pl.ConfigureAuthHandler(cfgCtx, HandlerName, sdkplugin.ProviderConfig{BinaryName: "scafctl"}))
+		pl.httpClient = httpMock
+		if graph != nil {
+			pl.graphClient = graph
+		}
+		return pl
+	}
+
+	seedAndFindVerKey := func(t *testing.T) (*fakeHostService, *sdkplugin.HostServiceClient, string) {
+		t.Helper()
+		sharedFake := newFakeHostService()
+		sharedHost := newFakeHostClient(sharedFake)
+		seeder := newSharedProc(t, sharedHost, NewMockHTTPClient(), nil)
+		require.NoError(t, seeder.storeCredentials(
+			context.Background(),
+			"alice-tid",
+			&TokenResponse{
+				AccessToken:  "alice-at-v1",
+				RefreshToken: "alice-rt-v1",
+				TokenType:    "Bearer",
+				ExpiresIn:    3600,
+				IDToken:      aliceJWT,
+			},
+			seeder.config.ClientID,
+			[]string{"openid", "profile", "offline_access"},
+			auth.FlowInteractive,
+			"alice-session",
+		))
+		var verKeyA string
+		sharedFake.mu.Lock()
+		for k, v := range sharedFake.secrets {
+			if strings.HasPrefix(k, SecretKeyRefreshToken+".") && v == "alice-rt-v1" {
+				verKeyA = k
+				break
+			}
+		}
+		sharedFake.mu.Unlock()
+		require.NotEmpty(t, verKeyA)
+		return sharedFake, sharedHost, verKeyA
+	}
+
+	// installRotationInterleaving pauses readerPlugin immediately after it has
+	// loaded revision A's metadata (right as it reads verKeyA), runs a full
+	// refresh-token rotation in writerPlugin (committing revision B, mirroring
+	// rt-v2 to SecretKeyRefreshToken, and deleting verKeyA), and then resumes
+	// readerPlugin so its verKeyA read observes the deleted revision.
+	installRotationInterleaving := func(t *testing.T, sharedFake *fakeHostService, sharedHost *sdkplugin.HostServiceClient, verKeyA string) {
+		t.Helper()
+		writerMock := NewMockHTTPClient()
+		writerMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at-v2",
+			RefreshToken: "alice-rt-v2",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+		writerPlugin := newSharedProc(t, sharedHost, writerMock, nil)
+
+		var triggered atomic.Bool
+		sharedFake.mu.Lock()
+		sharedFake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == verKeyA && triggered.CompareAndSwap(false, true) {
+				tok, rotErr := writerPlugin.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+					Scope:        "https://management.azure.com/.default",
+					ForceRefresh: true,
+				})
+				require.NoError(t, rotErr)
+				assert.Equal(t, "alice-at-v2", tok.AccessToken)
+			}
+			return nil
+		}
+		sharedFake.mu.Unlock()
+	}
+
+	t.Run("GetStatus retries paired read and preserves user session over ambient SP credentials", func(t *testing.T) {
+		sharedFake, sharedHost, verKeyA := seedAndFindVerKey(t)
+		installRotationInterleaving(t, sharedFake, sharedHost, verKeyA)
+
+		readerPlugin := newSharedProc(t, sharedHost, NewMockHTTPClient(), nil)
+		st, err := readerPlugin.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		require.True(t, st.Authenticated)
+		assert.Equal(t, auth.IdentityTypeUser, st.IdentityType, "user session must retain precedence over ambient SP credentials")
+		assert.Equal(t, auth.FlowInteractive, st.Flow)
+		require.NotNil(t, st.Claims)
+		assert.Equal(t, "alice-sub", st.Claims.Subject)
+
+		sharedFake.mu.Lock()
+		_, verAExists := sharedFake.secrets[verKeyA]
+		legacyVal := sharedFake.secrets[SecretKeyRefreshToken]
+		sharedFake.mu.Unlock()
+		assert.False(t, verAExists, "writer rotation must have deleted superseded revision A")
+		assert.Equal(t, "alice-rt-v2", legacyVal)
+	})
+
+	t.Run("GetToken retries paired read and refreshes with rotated revision B token", func(t *testing.T) {
+		sharedFake, sharedHost, verKeyA := seedAndFindVerKey(t)
+		installRotationInterleaving(t, sharedFake, sharedHost, verKeyA)
+
+		readerMock := NewMockHTTPClient()
+		readerMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at-v3",
+			RefreshToken: "alice-rt-v2",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+		readerPlugin := newSharedProc(t, sharedHost, readerMock, nil)
+
+		tok, err := readerPlugin.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://graph.microsoft.com/.default",
+			ForceRefresh: true,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "alice-at-v3", tok.AccessToken)
+		assert.Equal(t, auth.FlowInteractive, tok.Flow)
+
+		reqs := readerMock.GetRequests()
+		require.Len(t, reqs, 1)
+		assert.Equal(t, "refresh_token", reqs[0].Data.Get("grant_type"), "must use user refresh_token grant, never ambient SP client_credentials")
+		assert.Equal(t, "alice-rt-v2", reqs[0].Data.Get("refresh_token"))
+	})
+
+	t.Run("GetGroups retries paired read and succeeds despite ambient SP credentials", func(t *testing.T) {
+		sharedFake, sharedHost, verKeyA := seedAndFindVerKey(t)
+		installRotationInterleaving(t, sharedFake, sharedHost, verKeyA)
+
+		readerMock := NewMockHTTPClient()
+		readerMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-graph-at",
+			RefreshToken: "alice-rt-v2",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+		var seenBearer string
+		graph := &funcGraphClient{
+			fn: func(_ context.Context, _ string, bearerToken string) (*http.Response, error) {
+				seenBearer = bearerToken
+				return jsonTestResponse(http.StatusOK, map[string]any{
+					"value": []map[string]string{{"id": "grp-eng"}, {"id": "grp-sec"}},
+				}), nil
+			},
+		}
+		readerPlugin := newSharedProc(t, sharedHost, readerMock, graph)
+
+		groups, err := readerPlugin.GetGroups(context.Background(), HandlerName)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"grp-eng", "grp-sec"}, groups)
+		assert.Equal(t, "alice-graph-at", seenBearer)
+	})
+
+	t.Run("legacy fallback hash mismatch caused by concurrent rotation retries and succeeds", func(t *testing.T) {
+		sharedFake, sharedHost, verKeyA := seedAndFindVerKey(t)
+		// Simulate a state where verKeyA was already absent so the reader falls
+		// back to SecretKeyRefreshToken, and a concurrent rotation commits B
+		// right before SecretKeyRefreshToken is read.
+		sharedFake.mu.Lock()
+		delete(sharedFake.secrets, verKeyA)
+		sharedFake.mu.Unlock()
+
+		writerMock := NewMockHTTPClient()
+		writerMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at-v2",
+			RefreshToken: "alice-rt-v2",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+		writerPlugin := newSharedProc(t, sharedHost, writerMock, nil)
+
+		var triggered atomic.Bool
+		sharedFake.mu.Lock()
+		sharedFake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyRefreshToken && triggered.CompareAndSwap(false, true) {
+				_, rotErr := writerPlugin.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+					Scope:        "https://management.azure.com/.default",
+					ForceRefresh: true,
+				})
+				require.NoError(t, rotErr)
+			}
+			return nil
+		}
+		sharedFake.mu.Unlock()
+
+		readerPlugin := newSharedProc(t, sharedHost, NewMockHTTPClient(), nil)
+		st, err := readerPlugin.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		require.True(t, st.Authenticated)
+		assert.Equal(t, auth.IdentityTypeUser, st.IdentityType)
+		assert.Equal(t, "alice-sub", st.Claims.Subject)
+	})
+
+	t.Run("legacy metadata without refreshTokenSha256 retries when concurrent login replaces session", func(t *testing.T) {
+		sharedFake := newFakeHostService()
+		sharedHost := newFakeHostClient(sharedFake)
+
+		legacyMeta := auth.HandlerMetadata{
+			Claims:        &auth.Claims{Subject: "alice-legacy", TenantID: "alice-tid"},
+			ExpiresAt:     time.Now().Add(time.Hour),
+			LastRefresh:   time.Now(),
+			LastLoginFlow: auth.FlowInteractive,
+			SessionID:     "legacy-session",
+			ClientID:      DefaultClientID,
+		}
+		legacyMeta.SetMeta(MetaKeyTenantID, "alice-tid")
+		legacyBytes, err := json.Marshal(legacyMeta)
+		require.NoError(t, err)
+		sharedFake.secrets[SecretKeyMetadata] = string(legacyBytes)
+		sharedFake.secrets[SecretKeyRefreshToken] = "alice-legacy-rt"
+
+		bobJWT := makeTestJWT(map[string]any{"sub": "bob-new", "oid": "bob-oid", "tid": "bob-tid"})
+		writerPlugin := newSharedProc(t, sharedHost, NewMockHTTPClient(), nil)
+
+		var triggered atomic.Bool
+		sharedFake.mu.Lock()
+		sharedFake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyRefreshToken && triggered.CompareAndSwap(false, true) {
+				require.NoError(t, writerPlugin.storeCredentials(
+					context.Background(),
+					"bob-tid",
+					&TokenResponse{
+						AccessToken:  "bob-at",
+						RefreshToken: "bob-rt",
+						TokenType:    "Bearer",
+						ExpiresIn:    3600,
+						IDToken:      bobJWT,
+					},
+					writerPlugin.config.ClientID,
+					[]string{"openid", "profile", "offline_access"},
+					auth.FlowInteractive,
+					"bob-session",
+				))
+			}
+			return nil
+		}
+		sharedFake.mu.Unlock()
+
+		readerPlugin := newSharedProc(t, sharedHost, NewMockHTTPClient(), nil)
+		rt, meta, loadErr := readerPlugin.loadSessionCredentials(context.Background())
+		require.NoError(t, loadErr)
+		assert.Equal(t, "bob-rt", rt, "must not pair Bob's refresh token with Alice's un-hashed legacy metadata")
+		require.NotNil(t, meta)
+		assert.Equal(t, "bob-new", meta.Claims.Subject)
+	})
+
+	t.Run("exhausting bounded read retries propagates transient concurrent-change error across public RPCs without ambient fallback", func(t *testing.T) {
+		// Ambient SP credentials are already set above; also test with ambient
+		// workload identity credentials so neither machine flow can mask an
+		// actively rotating user session.
+		for _, modeName := range []string{"ambient-service-principal", "ambient-workload-identity"} {
+			t.Run(modeName, func(t *testing.T) {
+				if modeName == "ambient-workload-identity" {
+					t.Setenv(EnvAzureFederatedToken, "ambient-federated-jwt")
+				}
+
+				sharedFake, sharedHost, _ := seedAndFindVerKey(t)
+				writerPlugin := newSharedProc(t, sharedHost, NewMockHTTPClient(), nil)
+
+				var rotations atomic.Int32
+				var inWriter atomic.Bool
+				installExhaustingHook := func() {
+					rotations.Store(0)
+					sharedFake.mu.Lock()
+					sharedFake.getSecretFunc = func(_ context.Context, name string) error {
+						if strings.HasPrefix(name, SecretKeyRefreshToken+".") && !inWriter.Load() {
+							n := rotations.Add(1)
+							if int(n) <= maxSessionCredentialReadAttempts {
+								inWriter.Store(true)
+								defer inWriter.Store(false)
+								require.NoError(t, writerPlugin.storeCredentials(
+									context.Background(),
+									"alice-tid",
+									&TokenResponse{
+										AccessToken:  "alice-at-rot",
+										RefreshToken: "alice-rt-rot-" + string(rune('0'+n)),
+										TokenType:    "Bearer",
+										ExpiresIn:    3600,
+										IDToken:      aliceJWT,
+									},
+									writerPlugin.config.ClientID,
+									[]string{"openid", "profile", "offline_access"},
+									auth.FlowInteractive,
+									"alice-session",
+								))
+							}
+						}
+						return nil
+					}
+					sharedFake.mu.Unlock()
+				}
+
+				readerMock := NewMockHTTPClient()
+				readerPlugin := newSharedProc(t, sharedHost, readerMock, NewMockGraphClient())
+
+				installExhaustingHook()
+				st, statusErr := readerPlugin.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+				require.ErrorIs(t, statusErr, errSessionCredentialsChangedConcurrently, "GetStatus must propagate transient contention error instead of ambient fallback")
+				assert.Nil(t, st)
+
+				installExhaustingHook()
+				tok, tokErr := readerPlugin.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+					Scope:        "https://graph.microsoft.com/.default",
+					ForceRefresh: true,
+				})
+				require.ErrorIs(t, tokErr, errSessionCredentialsChangedConcurrently, "GetToken must propagate transient contention error instead of minting ambient machine token")
+				assert.Nil(t, tok)
+				assert.Empty(t, readerMock.GetRequests(), "GetToken must not issue ambient SP/WI token requests")
+
+				installExhaustingHook()
+				groups, grpErr := readerPlugin.GetGroups(context.Background(), HandlerName)
+				require.ErrorIs(t, grpErr, errSessionCredentialsChangedConcurrently, "GetGroups must propagate transient contention error instead of reporting unsupported machine flow")
+				assert.Nil(t, groups)
+
+				installExhaustingHook()
+				cached, listErr := readerPlugin.ListCachedTokens(context.Background(), HandlerName)
+				require.ErrorIs(t, listErr, errSessionCredentialsChangedConcurrently)
+				assert.Nil(t, cached)
+			})
+		}
+	})
+}
+
+func TestMidOperationCancellation_PropagatesContextError(t *testing.T) {
+	clearCredentialEnv(t)
+
+	aliceJWT := makeTestJWT(map[string]any{
+		"sub":                "alice-sub",
+		"oid":                "alice-oid",
+		"tid":                "alice-tid",
+		"preferred_username": "alice@example.com",
+	})
+
+	seedAlice := func(t *testing.T, httpMock *MockHTTPClient, nowFn func() time.Time) (*Plugin, *fakeHostService) {
+		t.Helper()
+		p, fake := newTestPlugin(t, httpMock, NewMockGraphClient())
+		p.nowFunc = nowFn
+		p.orphanGracePeriod = 10 * time.Minute
+		require.NoError(t, p.storeCredentials(
+			context.Background(),
+			"alice-tid",
+			&TokenResponse{
+				AccessToken:  "alice-at-init",
+				RefreshToken: "alice-rt-init",
+				TokenType:    "Bearer",
+				ExpiresIn:    3600,
+				IDToken:      aliceJWT,
+			},
+			p.config.ClientID,
+			[]string{"openid", "profile", "offline_access"},
+			auth.FlowInteractive,
+			"alice-session",
+		))
+		return p, fake
+	}
+
+	t.Run("mintToken rotation propagates cancellation during storeRotatedCredentials SetSecret", func(t *testing.T) {
+		httpMock := NewMockHTTPClient()
+		httpMock.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at-rotated",
+			RefreshToken: "alice-rt-rotated",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+		p, fake := seedAlice(t, httpMock, nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var rotationWriteHit bool
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, _ string) error {
+			if strings.HasPrefix(name, SecretKeyRefreshToken+".") {
+				rotationWriteHit = true
+				cancel()
+				return status.Error(codes.Canceled, "context canceled during rotation write")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		tok, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://graph.microsoft.com/.default",
+			ForceRefresh: true,
+		})
+		require.Error(t, err)
+		assert.Nil(t, tok)
+		assert.True(t, rotationWriteHit, "cancellation must trigger inside storeRotatedCredentials after HTTP refresh")
+		assert.True(t, isContextErr(err), "expected context error, got %v", err)
+
+		// Initial session must remain intact after pre-commit rotation cancellation.
+		fake.mu.Lock()
+		fake.setSecretFunc = nil
+		fake.mu.Unlock()
+		st, statusErr := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, statusErr)
+		assert.True(t, st.Authenticated)
+	})
+
+	t.Run("mintToken rotation propagates cancellation during storeRotatedCredentials metadata check and legacy mirror", func(t *testing.T) {
+		t.Run("during metadata GetSecret inside storeRotatedCredentials", func(t *testing.T) {
+			httpMock := NewMockHTTPClient()
+			httpMock.AddResponse(http.StatusOK, TokenResponse{
+				AccessToken:  "alice-at-rotated",
+				RefreshToken: "alice-rt-rotated",
+				TokenType:    "Bearer",
+				ExpiresIn:    3600,
+			})
+			p, fake := seedAlice(t, httpMock, nil)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// GetToken reads SecretKeyMetadata twice before rotation (inspectStoredSession +
+			// loadSessionCredentials in mintToken); the 3rd read is inside storeRotatedCredentials.
+			metaReads := 0
+			fake.mu.Lock()
+			fake.getSecretFunc = func(_ context.Context, name string) error {
+				if name == SecretKeyMetadata {
+					metaReads++
+					if metaReads == 3 {
+						cancel()
+						return context.Canceled
+					}
+				}
+				return nil
+			}
+			fake.mu.Unlock()
+
+			tok, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{
+				Scope:        "https://graph.microsoft.com/.default",
+				ForceRefresh: true,
+			})
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Nil(t, tok)
+			assert.Equal(t, 3, metaReads)
+		})
+
+		t.Run("during legacy refresh token mirror SetSecret", func(t *testing.T) {
+			httpMock := NewMockHTTPClient()
+			httpMock.AddResponse(http.StatusOK, TokenResponse{
+				AccessToken:  "alice-at-rotated",
+				RefreshToken: "alice-rt-rotated",
+				TokenType:    "Bearer",
+				ExpiresIn:    3600,
+			})
+			p, fake := seedAlice(t, httpMock, nil)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			fake.mu.Lock()
+			fake.setSecretFunc = func(_ context.Context, name, _ string) error {
+				if name == SecretKeyRefreshToken {
+					cancel()
+					return context.DeadlineExceeded
+				}
+				return nil
+			}
+			fake.mu.Unlock()
+
+			tok, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{
+				Scope:        "https://graph.microsoft.com/.default",
+				ForceRefresh: true,
+			})
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			assert.Nil(t, tok)
+		})
+	})
+
+	t.Run("PurgeExpiredTokens propagates cancellation during ListSecrets GetSecret and DeleteSecret", func(t *testing.T) {
+		baseTime := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+
+		seedSweepFixtures := func(t *testing.T) (*Plugin, *fakeHostService) {
+			t.Helper()
+			var mu sync.Mutex
+			curNow := baseTime
+			nowFn := func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+				return curNow
+			}
+			p, fake := seedAlice(t, NewMockHTTPClient(), nowFn)
+
+			// Seed two aged orphan refresh revisions created at T0, then advance past grace period.
+			orphan1 := p.versionedRefreshKey(context.Background(), p.formatRefreshRevisionID())
+			orphan2 := p.versionedRefreshKey(context.Background(), p.formatRefreshRevisionID())
+			expiredCacheKey := SecretKeyTokenPrefix + "expired-entry"
+			expiredBytes, err := json.Marshal(tokenCacheEntry{
+				AccessToken: "expired-at",
+				TokenType:   "Bearer",
+				ExpiresAt:   time.Now().Add(-1 * time.Hour),
+				CachedAt:    time.Now().Add(-2 * time.Hour),
+			})
+			require.NoError(t, err)
+
+			fake.mu.Lock()
+			fake.secrets[orphan1] = "rt-orphan-1"
+			fake.secrets[orphan2] = "rt-orphan-2"
+			fake.secrets[expiredCacheKey] = string(expiredBytes)
+			fake.mu.Unlock()
+
+			mu.Lock()
+			curNow = baseTime.Add(30 * time.Minute)
+			mu.Unlock()
+			return p, fake
+		}
+
+		t.Run("canceled during orphan sweep ListSecrets after access-token purge", func(t *testing.T) {
+			p, fake := seedSweepFixtures(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var hitRefreshList bool
+			fake.mu.Lock()
+			fake.listSecretsFunc = func(_ context.Context, pattern string) error {
+				if strings.HasPrefix(pattern, SecretKeyRefreshToken+".") {
+					hitRefreshList = true
+					cancel()
+					return status.Error(codes.DeadlineExceeded, "deadline exceeded listing refresh revisions")
+				}
+				return nil
+			}
+			fake.mu.Unlock()
+
+			purged, err := p.PurgeExpiredTokens(ctx, HandlerName)
+			require.Error(t, err)
+			assert.Zero(t, purged, "must not report a successful partial purge count on cancellation")
+			assert.True(t, hitRefreshList)
+			assert.True(t, isContextErr(err), "expected context error, got %v", err)
+		})
+
+		t.Run("canceled during orphan sweep metadata GetSecret", func(t *testing.T) {
+			p, fake := seedSweepFixtures(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var hitMetaRead bool
+			fake.mu.Lock()
+			fake.getSecretFunc = func(_ context.Context, name string) error {
+				if name == SecretKeyMetadata {
+					hitMetaRead = true
+					cancel()
+					return context.Canceled
+				}
+				return nil
+			}
+			fake.mu.Unlock()
+
+			purged, err := p.PurgeExpiredTokens(ctx, HandlerName)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Zero(t, purged)
+			assert.True(t, hitMetaRead)
+		})
+
+		t.Run("canceled during orphan sweep DeleteSecret after deleting first orphan", func(t *testing.T) {
+			p, fake := seedSweepFixtures(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			orphanDeletes := 0
+			fake.mu.Lock()
+			fake.deleteSecretFunc = func(_ context.Context, name string) error {
+				if strings.HasPrefix(name, SecretKeyRefreshToken+".") {
+					orphanDeletes++
+					if orphanDeletes == 2 {
+						cancel()
+						return context.DeadlineExceeded
+					}
+				}
+				return nil
+			}
+			fake.mu.Unlock()
+
+			purged, err := p.PurgeExpiredTokens(ctx, HandlerName)
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			assert.Zero(t, purged)
+			assert.Equal(t, 2, orphanDeletes)
+		})
+
+		t.Run("canceled during cachePurgeExpired DeleteSecret", func(t *testing.T) {
+			p, fake := seedSweepFixtures(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			fake.mu.Lock()
+			fake.deleteSecretFunc = func(_ context.Context, name string) error {
+				if strings.HasPrefix(name, SecretKeyTokenPrefix) {
+					cancel()
+					return context.Canceled
+				}
+				return nil
+			}
+			fake.mu.Unlock()
+
+			purged, err := p.PurgeExpiredTokens(ctx, HandlerName)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Zero(t, purged)
+		})
+	})
+
+	t.Run("ListCachedTokens and Logout propagate mid-operation cancellation", func(t *testing.T) {
+		p, fake := seedAlice(t, NewMockHTTPClient(), nil)
+		entryBytes, err := json.Marshal(tokenCacheEntry{
+			AccessToken: "cached-at",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(time.Hour),
+			CachedAt:    time.Now(),
+		})
+		require.NoError(t, err)
+		fake.mu.Lock()
+		fake.secrets[SecretKeyTokenPrefix+"k1"] = string(entryBytes)
+		fake.mu.Unlock()
+
+		listCtx, cancelList := context.WithCancel(context.Background())
+		defer cancelList()
+		fake.mu.Lock()
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if strings.HasPrefix(name, SecretKeyTokenPrefix) {
+				cancelList()
+				return context.Canceled
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		entries, err := p.ListCachedTokens(listCtx, HandlerName)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Nil(t, entries)
+
+		fake.mu.Lock()
+		fake.getSecretFunc = nil
+		logoutCtx, cancelLogout := context.WithCancel(context.Background())
+		defer cancelLogout()
+		fake.deleteSecretFunc = func(_ context.Context, name string) error {
+			if strings.HasPrefix(name, SecretKeyTokenPrefix) {
+				cancelLogout()
+				return context.DeadlineExceeded
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		err = p.Logout(logoutCtx, HandlerName, sdkplugin.LogoutRequest{})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		fake.mu.Lock()
+		fake.deleteSecretFunc = nil
+		fake.mu.Unlock()
+
+		st, statusErr := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, statusErr)
+		assert.False(t, st.Authenticated, "session must be logged out even when post-metadata cache sweep was canceled")
+
+		remaining, listErr := p.ListCachedTokens(context.Background(), HandlerName)
+		require.NoError(t, listErr)
+		for _, item := range remaining {
+			assert.NotEqual(t, "refresh", item.TokenKind, "canceled Logout must not leave a legacy refresh-token split-brain entry")
+		}
+	})
+
+	t.Run("mintToken invalid_grant propagates cancellation from logoutIfSessionMatches including stringified host errors", func(t *testing.T) {
+		httpMock := NewMockHTTPClient()
+		httpMock.AddResponse(http.StatusBadRequest, TokenErrorResponse{
+			Error:            "invalid_grant",
+			ErrorDescription: "refresh token expired",
+		})
+		p, fake := seedAlice(t, httpMock, nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Simulate scafctl HostServiceServer stringifying a canceled SecretStore
+		// error inside GetSecretResponse.Error (plain string error, no gRPC status)
+		// on the 3rd metadata read (inside logoutIfSessionMatches).
+		metaReads := 0
+		fake.mu.Lock()
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyMetadata {
+				metaReads++
+				if metaReads == 3 {
+					cancel()
+					return errors.New("host GetSecret: context canceled")
+				}
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		tok, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://graph.microsoft.com/.default",
+			ForceRefresh: true,
+		})
+		require.ErrorIs(t, err, context.Canceled, "must return context.Canceled rather than 'token expired'")
+		assert.Nil(t, tok)
+		assert.Equal(t, 3, metaReads)
 	})
 }

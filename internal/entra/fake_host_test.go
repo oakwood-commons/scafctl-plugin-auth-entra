@@ -23,6 +23,7 @@ type fakeHostService struct {
 	setSecretKeyErr  map[string]error
 	setSecretFunc    func(ctx context.Context, name, value string) error
 	deleteSecretFunc func(ctx context.Context, name string) error
+	listSecretsFunc  func(ctx context.Context, pattern string) error
 	// promptFunc backs PromptAuthResponse; tests use it to deliver pasted
 	// redirect URLs, block until canceled, or return host errors. nil
 	// mimics a pre-paste-back host (gRPC Unimplemented).
@@ -103,7 +104,16 @@ func (f *fakeHostService) DeleteSecret(ctx context.Context, in *proto.DeleteSecr
 	return &proto.DeleteSecretResponse{}, nil
 }
 
-func (f *fakeHostService) ListSecrets(_ context.Context, in *proto.ListSecretsRequest, _ ...grpc.CallOption) (*proto.ListSecretsResponse, error) {
+func (f *fakeHostService) ListSecrets(ctx context.Context, in *proto.ListSecretsRequest, _ ...grpc.CallOption) (*proto.ListSecretsResponse, error) {
+	f.mu.Lock()
+	fn := f.listSecretsFunc
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(ctx, in.Pattern); err != nil {
+			return nil, err
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	prefix := strings.TrimSuffix(in.Pattern, "*")

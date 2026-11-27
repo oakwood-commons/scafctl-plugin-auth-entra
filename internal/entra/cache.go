@@ -30,8 +30,14 @@ type tokenCacheEntry struct {
 
 // cacheGet retrieves a cached token from the host secret store.
 func cacheGet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, fullKey string) (*auth.Token, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, found, err := hostClient.GetSecret(ctx, fullKey)
 	if err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return nil, cErr
+		}
 		return nil, err
 	}
 	if !found {
@@ -56,6 +62,9 @@ func cacheGet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, full
 
 // cacheSet stores a token in the host secret store cache.
 func cacheSet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, fullKey string, token *auth.Token) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entry := tokenCacheEntry{
 		AccessToken: token.AccessToken,
 		TokenType:   token.TokenType,
@@ -71,34 +80,68 @@ func cacheSet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, full
 		return fmt.Errorf("failed to marshal token for caching: %w", err)
 	}
 
-	return hostClient.SetSecret(ctx, fullKey, string(data))
+	if err := hostClient.SetSecret(ctx, fullKey, string(data)); err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return cErr
+		}
+		return err
+	}
+	return nil
 }
 
 // cacheClear removes all cached tokens matching the given prefix.
-func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient, prefix string) {
+func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient, prefix string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return cErr
+		}
 		lgr.V(1).Info("failed to list cached tokens", "error", err)
-		return
+		return nil
 	}
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := hostClient.DeleteSecret(ctx, key); err != nil {
+			if cErr := contextErr(ctx, err); cErr != nil {
+				return cErr
+			}
 			lgr.V(1).Info("failed to delete cached token", "key", key, "error", err)
 		}
 	}
+	return ctx.Err()
 }
 
 // cacheListEntries lists all cached token entries matching the given prefix.
 func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClient, prefix string) ([]*auth.CachedTokenInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return nil, cErr
+		}
 		return nil, err
 	}
 
 	var results []*auth.CachedTokenInfo
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		value, found, err := hostClient.GetSecret(ctx, key)
-		if err != nil || !found {
+		if err != nil {
+			if cErr := contextErr(ctx, err); cErr != nil {
+				return nil, cErr
+			}
+			continue
+		}
+		if !found {
 			continue
 		}
 
@@ -123,21 +166,39 @@ func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClie
 			SessionID: entry.SessionID,
 		})
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	return results, nil
 }
 
 // cachePurgeExpired removes expired tokens matching the given prefix and returns the count removed.
 func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceClient, prefix string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
+		if cErr := contextErr(ctx, err); cErr != nil {
+			return 0, cErr
+		}
 		return 0, err
 	}
 
 	count := 0
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		value, found, err := hostClient.GetSecret(ctx, key)
-		if err != nil || !found {
+		if err != nil {
+			if cErr := contextErr(ctx, err); cErr != nil {
+				return 0, cErr
+			}
+			continue
+		}
+		if !found {
 			continue
 		}
 
@@ -147,10 +208,17 @@ func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceCli
 		}
 
 		if !entry.ExpiresAt.IsZero() && time.Now().After(entry.ExpiresAt) {
-			if err := hostClient.DeleteSecret(ctx, key); err == nil {
-				count++
+			if err := hostClient.DeleteSecret(ctx, key); err != nil {
+				if cErr := contextErr(ctx, err); cErr != nil {
+					return 0, cErr
+				}
+				continue
 			}
+			count++
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 
 	return count, nil

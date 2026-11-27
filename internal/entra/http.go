@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -76,8 +77,24 @@ type effectiveHTTPConfigKey struct {
 	circuitBreakerOpenTimeout         time.Duration
 	circuitBreakerHalfOpenMaxRequests int
 	enableCompression                 bool
-	allowPrivateIPs                   bool
+	allowPrivate                      bool
+	trustProxyResolution              bool
+	allowedCIDRs                      string
 	maxResponseBodySize               int64
+}
+
+// withoutHTTPCache zeroes response-cache fields on k for DefaultGraphClient,
+// which always disables HTTP response caching so identity-scoped Graph
+// responses can never bleed across profiles or sessions.
+func (k effectiveHTTPConfigKey) withoutHTTPCache() effectiveHTTPConfigKey {
+	k.enableCache = false
+	k.cacheType = ""
+	k.cacheDir = ""
+	k.cacheTTL = 0
+	k.cacheKeyPrefix = ""
+	k.maxCacheFileSize = 0
+	k.memoryCacheSize = 0
+	return k
 }
 
 func effectiveHTTPConfigKeyFromClientConfig(cfg *httpc.ClientConfig) effectiveHTTPConfigKey {
@@ -89,8 +106,22 @@ func effectiveHTTPConfigKeyFromClientConfig(cfg *httpc.ClientConfig) effectiveHT
 		enableCache:          cfg.EnableCache,
 		enableCircuitBreaker: cfg.EnableCircuitBreaker,
 		enableCompression:    cfg.EnableCompression,
-		allowPrivateIPs:      cfg.AllowPrivateIPs,
 		maxResponseBodySize:  cfg.MaxResponseBodySize,
+	}
+	if cfg.IPPolicy != nil {
+		k.allowPrivate = cfg.IPPolicy.AllowPrivate
+		k.trustProxyResolution = cfg.IPPolicy.TrustProxyResolution
+		if !cfg.IPPolicy.AllowPrivate && len(cfg.IPPolicy.AllowedCIDRs) > 0 {
+			cidrs := make([]string, 0, len(cfg.IPPolicy.AllowedCIDRs))
+			for _, n := range cfg.IPPolicy.AllowedCIDRs {
+				if n != nil {
+					cidrs = append(cidrs, n.String())
+				}
+			}
+			slices.Sort(cidrs)
+			cidrs = slices.Compact(cidrs)
+			k.allowedCIDRs = strings.Join(cidrs, ",")
+		}
 	}
 	if cfg.EnableCache {
 		k.cacheType = cfg.CacheType
@@ -193,8 +224,23 @@ func resolveEffectiveHTTPConfig(cfg *httpc.AppConfig) (effectiveHTTPConfigKey, *
 	if merged.EnableCompression != nil {
 		clientCfg.EnableCompression = *merged.EnableCompression
 	}
-	if merged.AllowPrivateIPs != nil {
-		clientCfg.AllowPrivateIPs = *merged.AllowPrivateIPs
+	if merged.AllowPrivateIPs != nil && *merged.AllowPrivateIPs { //nolint:staticcheck // SA1019: honor legacy allowPrivateIPs config field when allowedPrivateCIDRs is unset
+		clientCfg.IPPolicy = httpc.AllowAllPrivateIPs()
+	}
+	if merged.AllowedPrivateCIDRs != nil {
+		policy, err := httpc.NewIPPolicy(merged.AllowedPrivateCIDRs...)
+		if err != nil {
+			return effectiveHTTPConfigKey{}, nil, fmt.Errorf("invalid allowedPrivateCIDRs: %w", err)
+		}
+		clientCfg.IPPolicy = policy
+	}
+	if merged.TrustProxyResolution != nil {
+		var policy httpc.IPPolicy
+		if clientCfg.IPPolicy != nil {
+			policy = *clientCfg.IPPolicy
+		}
+		policy.TrustProxyResolution = *merged.TrustProxyResolution
+		clientCfg.IPPolicy = &policy
 	}
 	if merged.MaxResponseBodySize > 0 {
 		clientCfg.MaxResponseBodySize = merged.MaxResponseBodySize
@@ -223,25 +269,110 @@ func cloneResolvedClientConfig(baseCfg *httpc.ClientConfig, logger logr.Logger, 
 		cbCopy := *baseCfg.CircuitBreakerConfig
 		cfgCopy.CircuitBreakerConfig = &cbCopy
 	}
+	if baseCfg.IPPolicy != nil {
+		ipCopy := *baseCfg.IPPolicy
+		if baseCfg.IPPolicy.AllowedCIDRs != nil {
+			ipCopy.AllowedCIDRs = slices.Clone(baseCfg.IPPolicy.AllowedCIDRs)
+		}
+		cfgCopy.IPPolicy = &ipCopy
+	}
 	cfgCopy.Logger = logger
 	cfgCopy.Transport = tr
 	return &cfgCopy
 }
 
+func noopRelease() {}
+
+// clientRefHandle tracks active borrowers of a closable HTTP/Graph client so
+// cache eviction, reconfiguration, or shutdown defers Close() until the last
+// in-flight borrower releases its reference.
+type clientRefHandle struct {
+	mu      sync.Mutex
+	closer  io.Closer
+	refs    int
+	retired bool
+	closed  bool
+}
+
+func newClientRefHandle(closer io.Closer) *clientRefHandle {
+	return &clientRefHandle{closer: closer}
+}
+
+func (h *clientRefHandle) tryAcquire() (func(), bool) {
+	if h == nil {
+		return noopRelease, false
+	}
+	h.mu.Lock()
+	if h.retired || h.closed {
+		h.mu.Unlock()
+		return noopRelease, false
+	}
+	h.refs++
+	h.mu.Unlock()
+	return h.releaseFunc(), true
+}
+
+func (h *clientRefHandle) acquireFresh() func() {
+	h.mu.Lock()
+	h.refs++
+	h.mu.Unlock()
+	return h.releaseFunc()
+}
+
+func (h *clientRefHandle) releaseFunc() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			h.mu.Lock()
+			h.refs--
+			shouldClose := h.retired && h.refs == 0 && !h.closed
+			if shouldClose {
+				h.closed = true
+			}
+			closer := h.closer
+			h.mu.Unlock()
+
+			if shouldClose && closer != nil {
+				_ = closer.Close()
+			}
+		})
+	}
+}
+
+func (h *clientRefHandle) retire() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.retired = true
+	shouldClose := h.refs == 0 && !h.closed
+	if shouldClose {
+		h.closed = true
+	}
+	closer := h.closer
+	h.mu.Unlock()
+
+	if shouldClose && closer != nil {
+		_ = closer.Close()
+	}
+}
+
 // boundedClientCache is a concurrency-safe, size-bounded LRU cache of closable
-// HTTP/Graph clients. Evicted or cleared entries have Close() invoked outside
-// the cache mutex so idle transport connections and cache handles are released
-// without blocking concurrent lookups.
+// HTTP/Graph clients. Borrowers acquire a reference lease via Acquire; evicted
+// or cleared entries defer Close() until all active borrowers release their
+// leases so requests issued after eviction never leak keep-alive connections.
 type boundedClientCache[K comparable, V io.Closer] struct {
 	mu       sync.Mutex
 	capacity int
+	closed   bool
 	store    map[K]*list.Element
 	order    *list.List
 }
 
 type clientCacheEntry[K comparable, V io.Closer] struct {
-	key   K
-	value V
+	key    K
+	value  V
+	handle *clientRefHandle
 }
 
 func newBoundedClientCache[K comparable, V io.Closer](capacity int) *boundedClientCache[K, V] {
@@ -255,47 +386,63 @@ func newBoundedClientCache[K comparable, V io.Closer](capacity int) *boundedClie
 	}
 }
 
-func (c *boundedClientCache[K, V]) GetOrCreate(key K, build func() V) V {
+func (c *boundedClientCache[K, V]) Acquire(key K, build func() V) (V, func()) {
 	c.mu.Lock()
 	if elem, ok := c.store[key]; ok {
 		c.order.MoveToFront(elem)
-		val := elem.Value.(*clientCacheEntry[K, V]).value
-		c.mu.Unlock()
-		return val
+		entry := elem.Value.(*clientCacheEntry[K, V])
+		rel, acquired := entry.handle.tryAcquire()
+		if acquired {
+			val := entry.value
+			c.mu.Unlock()
+			return val, rel
+		}
 	}
 	c.mu.Unlock()
 
 	candidate := build()
 
 	c.mu.Lock()
-	if elem, ok := c.store[key]; ok {
-		c.order.MoveToFront(elem)
-		winner := elem.Value.(*clientCacheEntry[K, V]).value
+	if c.closed {
 		c.mu.Unlock()
-		_ = candidate.Close()
-		return winner
+		h := newClientRefHandle(candidate)
+		rel := h.acquireFresh()
+		h.retire()
+		return candidate, rel
+	}
+	if elem, ok := c.store[key]; ok {
+		entry := elem.Value.(*clientCacheEntry[K, V])
+		if rel, acquired := entry.handle.tryAcquire(); acquired {
+			c.order.MoveToFront(elem)
+			winner := entry.value
+			c.mu.Unlock()
+			_ = candidate.Close()
+			return winner, rel
+		}
+		delete(c.store, entry.key)
+		c.order.Remove(elem)
 	}
 
-	elem := c.order.PushFront(&clientCacheEntry[K, V]{key: key, value: candidate})
+	h := newClientRefHandle(candidate)
+	rel := h.acquireFresh()
+	elem := c.order.PushFront(&clientCacheEntry[K, V]{key: key, value: candidate, handle: h})
 	c.store[key] = elem
 
-	var evicted V
-	var hasEvicted bool
+	var evictedHandle *clientRefHandle
 	if c.order.Len() > c.capacity {
 		if oldest := c.order.Back(); oldest != nil {
-			entry := oldest.Value.(*clientCacheEntry[K, V])
-			delete(c.store, entry.key)
+			victim := oldest.Value.(*clientCacheEntry[K, V])
+			delete(c.store, victim.key)
 			c.order.Remove(oldest)
-			evicted = entry.value
-			hasEvicted = true
+			evictedHandle = victim.handle
 		}
 	}
 	c.mu.Unlock()
 
-	if hasEvicted {
-		_ = evicted.Close()
+	if evictedHandle != nil {
+		evictedHandle.retire()
 	}
-	return candidate
+	return candidate, rel
 }
 
 func (c *boundedClientCache[K, V]) Len() int {
@@ -312,16 +459,17 @@ func (c *boundedClientCache[K, V]) CloseAll() {
 		return
 	}
 	c.mu.Lock()
-	toClose := make([]V, 0, c.order.Len())
+	c.closed = true
+	handles := make([]*clientRefHandle, 0, c.order.Len())
 	for elem := c.order.Front(); elem != nil; elem = elem.Next() {
-		toClose = append(toClose, elem.Value.(*clientCacheEntry[K, V]).value)
+		handles = append(handles, elem.Value.(*clientCacheEntry[K, V]).handle)
 	}
 	c.store = make(map[K]*list.Element, c.capacity)
 	c.order.Init()
 	c.mu.Unlock()
 
-	for _, client := range toClose {
-		_ = client.Close()
+	for _, h := range handles {
+		h.retire()
 	}
 }
 
@@ -333,8 +481,13 @@ type DefaultGraphClient struct {
 
 func newDefaultGraphClientFromResolved(baseCfg *httpc.ClientConfig, logger logr.Logger) *DefaultGraphClient {
 	tr := newIsolatedTransport()
+	cfg := cloneResolvedClientConfig(baseCfg, logger, tr)
+	// Graph /me/memberOf responses are scoped to the caller's delegated Bearer
+	// token, whereas httpcache keys GET responses by URL alone; keep HTTP
+	// response caching disabled so group memberships never bleed across profiles.
+	cfg.EnableCache = false
 	return &DefaultGraphClient{
-		client:    httpc.NewClient(cloneResolvedClientConfig(baseCfg, logger, tr)),
+		client:    httpc.NewClient(cfg),
 		transport: tr,
 	}
 }

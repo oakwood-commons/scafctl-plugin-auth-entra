@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
@@ -16,12 +18,50 @@ import (
 )
 
 const (
-	// graphGroupsMemberOfURL is the Graph API endpoint for paginated group memberships.
-	graphGroupsMemberOfURL = "https://graph.microsoft.com/v1.0/me/memberOf/microsoft.graph.group?$select=id&$top=999"
+	// graphGroupsHost is the default commercial Microsoft Graph API hostname.
+	graphGroupsHost = "graph.microsoft.com"
 
-	// graphGroupsScope is the OAuth scope used to obtain a Graph access token.
-	graphGroupsScope = "https://graph.microsoft.com/.default"
+	// graphGroupsMemberOfPath is the Graph API path and query for paginated group memberships.
+	graphGroupsMemberOfPath = "/v1.0/me/memberOf/microsoft.graph.group?$select=id&$top=999"
+
+	// graphGroupsScope is the default commercial OAuth scope used to obtain a Graph access token.
+	graphGroupsScope = "https://" + graphGroupsHost + "/.default"
+
+	// maxGraphGroupPages bounds Graph /me/memberOf pagination against cyclic nextLink responses.
+	maxGraphGroupPages = 1000
+
+	// maxGraphGroupPageBytes bounds a single Graph /me/memberOf page body (4 MiB).
+	maxGraphGroupPageBytes = 4 << 20
 )
+
+// graphHostForAuthority maps an Entra authority URL to its corresponding
+// Microsoft Graph API hostname, defaulting to commercial graph.microsoft.com.
+func graphHostForAuthority(authority string) string {
+	u, err := url.Parse(authority)
+	if err != nil {
+		return graphGroupsHost
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "login.microsoftonline.us":
+		return "graph.microsoft.us"
+	case "login.chinacloudapi.cn", "login.partner.microsoftonline.cn":
+		return "microsoftgraph.chinacloudapi.cn"
+	case "login.microsoftonline.eaglex.ic.gov":
+		return "graph.eaglex.ic.gov"
+	case "login.microsoftonline.microsoft.scloud":
+		return "graph.microsoft.scloud"
+	default:
+		return graphGroupsHost
+	}
+}
+
+func graphScopeForAuthority(authority string) string {
+	return "https://" + graphHostForAuthority(authority) + "/.default"
+}
+
+func graphMemberOfURLForHost(graphHost string) string {
+	return "https://" + graphHost + graphGroupsMemberOfPath
+}
 
 // graphGroupsPage is the paged JSON response from Graph /me/memberOf.
 type graphGroupsPage struct {
@@ -54,15 +94,19 @@ func (p *Plugin) getGroups(ctx context.Context) ([]string, error) {
 	}
 	ctx = withResolvedConfig(ctx, cfg)
 
-	graphClient, err := p.graphClientForConfig(ctx, cfg)
+	graphClient, releaseGraph, err := p.graphClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseGraph()
 
 	// /me/memberOf requires a delegated (user) token. Honor a valid stored
 	// interactive/device-code user session first before rejecting ambient or
 	// configured non-user flows, inspecting stored session credentials once.
 	if metadata, hasUserSession, loadErr := p.inspectStoredSession(ctx); !hasUserSession {
+		if tErr := isTransientSessionLoadErr(ctx, loadErr); tErr != nil {
+			return nil, tErr
+		}
 		if p.hasWorkloadIdentityCredentialsForConfig(cfg) {
 			return nil, fmt.Errorf("group membership queries are not supported for workload identity flows")
 		}
@@ -76,8 +120,11 @@ func (p *Plugin) getGroups(ctx context.Context) ([]string, error) {
 		}
 	}
 
+	graphHost := graphHostForAuthority(cfg.GetAuthority())
+	graphScope := graphScopeForAuthority(cfg.GetAuthority())
+
 	// Acquire a Graph access token via the existing token machinery.
-	tokenResp, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{Scope: graphGroupsScope})
+	tokenResp, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{Scope: graphScope})
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire Graph token for group lookup: %w", err)
 	}
@@ -87,9 +134,15 @@ func (p *Plugin) getGroups(ctx context.Context) ([]string, error) {
 
 	// Paginate through all group memberships.
 	groups := make([]string, 0)
-	nextURL := graphGroupsMemberOfURL
+	nextURL := graphMemberOfURLForHost(graphHost)
+	pagesFetched := 0
 
 	for nextURL != "" {
+		if pagesFetched >= maxGraphGroupPages {
+			return nil, fmt.Errorf("graph memberOf exceeded maximum page count (%d)", maxGraphGroupPages)
+		}
+		pagesFetched++
+
 		lgr.V(1).Info("fetching group memberships from Graph", "url", nextURL)
 
 		resp, err := graphClient.Get(ctx, nextURL, tokenResp.AccessToken)
@@ -97,14 +150,17 @@ func (p *Plugin) getGroups(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("graph memberOf request failed: %w", err)
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxGraphGroupPageBytes+1))
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read Graph memberOf response: %w", err)
 		}
+		if len(body) > maxGraphGroupPageBytes {
+			return nil, fmt.Errorf("graph memberOf response exceeded maximum page size (%d bytes)", maxGraphGroupPageBytes)
+		}
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("graph memberOf returned HTTP %d: %s", resp.StatusCode, truncate(string(body), 512))
+			return nil, fmt.Errorf("graph memberOf returned HTTP %d: %s", resp.StatusCode, sanitizeControlChars(truncate(string(body), 512)))
 		}
 
 		var page graphGroupsPage
@@ -118,12 +174,36 @@ func (p *Plugin) getGroups(ctx context.Context) ([]string, error) {
 			}
 		}
 
+		if page.NextLink != "" {
+			if err := validateGraphNextLink(page.NextLink, graphHost); err != nil {
+				return nil, err
+			}
+		}
 		nextURL = page.NextLink
 		lgr.V(2).Info("fetched group membership page", "pageSize", len(page.Value), "hasMore", nextURL != "")
 	}
 
 	lgr.V(1).Info("fetched all group memberships", "count", len(groups))
 	return groups, nil
+}
+
+// validateGraphNextLink ensures an @odata.nextLink URL uses HTTPS on the
+// expected Microsoft Graph origin before forwarding the delegated bearer token.
+func validateGraphNextLink(rawURL, expectedHost string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid Graph @odata.nextLink URL: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("refusing non-HTTPS Graph @odata.nextLink scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return fmt.Errorf("refusing Graph @odata.nextLink URL with userinfo")
+	}
+	if !strings.EqualFold(u.Hostname(), expectedHost) || (u.Port() != "" && u.Port() != "443") {
+		return fmt.Errorf("refusing cross-origin Graph @odata.nextLink host %q (expected %q)", u.Host, expectedHost)
+	}
+	return nil
 }
 
 // rejectNonUserGroupFlow returns an error when flow represents a non-delegated

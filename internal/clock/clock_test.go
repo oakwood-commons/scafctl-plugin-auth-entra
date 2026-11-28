@@ -1,6 +1,7 @@
 package clock
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -73,4 +74,23 @@ drained:
 	default:
 		t.Fatal("mock ticker channel should have data after reset")
 	}
+}
+
+func TestRealSleep(t *testing.T) {
+	r := Real{}
+	require.NoError(t, r.Sleep(context.Background(), 0))
+	require.NoError(t, r.Sleep(context.Background(), 10*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, r.Sleep(ctx, time.Hour), context.Canceled)
+}
+
+func TestMockSleep(t *testing.T) {
+	m := Mock{}
+	require.NoError(t, m.Sleep(context.Background(), time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, m.Sleep(ctx, time.Hour), context.Canceled)
 }

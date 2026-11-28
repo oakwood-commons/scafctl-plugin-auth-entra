@@ -414,6 +414,49 @@ func (p *Plugin) httpClientForConfig(ctx context.Context, cfg *Config) (HTTPClie
 	return client, rel, nil
 }
 
+// devicePollHTTPClientForConfig returns an HTTPClient with transport-level
+// retries disabled so oauth.PollDeviceToken enforces post-response interval
+// spacing across every retryable transport or HTTP failure. Non-default
+// HTTPClient implementations (such as test mocks) are returned directly.
+func (p *Plugin) devicePollHTTPClientForConfig(ctx context.Context, cfg *Config) (HTTPClient, func(), error) {
+	var appCfg *httpc.AppConfig
+	if cfg != nil {
+		appCfg = cfg.HTTPClient
+	}
+
+	key, clientCfg, err := resolveEffectiveHTTPConfig(appCfg)
+	if err != nil {
+		return nil, noopRelease, fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
+	}
+
+	p.clientCacheMu.Lock()
+	curHTTP := p.httpClient
+	hasInit := p.hasInitHTTPKey
+	baseLgr := p.baseLogger
+	if curHTTP != nil {
+		defHTTP, isDefault := curHTTP.(*DefaultHTTPClient)
+		if !isDefault {
+			p.clientCacheMu.Unlock()
+			return curHTTP, noopRelease, nil
+		}
+		if !hasInit && appCfg == nil && defHTTP != nil && defHTTP.baseCfg != nil {
+			key = defHTTP.baseKey
+			clientCfg = defHTTP.baseCfg
+		}
+	} else if cfg == nil || (p.config != nil && cfg == p.config) {
+		p.clientCacheMu.Unlock()
+		return nil, noopRelease, fmt.Errorf("HTTP client not initialized")
+	}
+	pollKey := key.withoutRetries()
+	cache := p.ensureHTTPClientCacheLocked()
+	p.clientCacheMu.Unlock()
+
+	client, rel := cache.Acquire(pollKey, func() *DefaultHTTPClient {
+		return newDefaultNoRetryHTTPClientFromResolved(clientCfg, pickHTTPLogger(ctx, baseLgr))
+	})
+	return client, rel, nil
+}
+
 func (p *Plugin) graphClientForConfig(ctx context.Context, cfg *Config) (GraphClient, func(), error) {
 	var appCfg *httpc.AppConfig
 	if cfg != nil {

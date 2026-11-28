@@ -77,7 +77,7 @@ func TestUserSessionTokenKeyFromEffectiveIdentity(t *testing.T) {
 // userTokenCacheKeyFor mirrors userSessionToken's cache key for an explicit
 // metadata value.
 func userTokenCacheKeyFor(p *Plugin, metadata *auth.HandlerMetadata, scope string) string {
-	return SecretKeyTokenPrefix + p.userSessionFingerprint(metadata) + ":" + scope
+	return buildTokenCacheKey(SecretKeyTokenPrefix, p.userSessionFingerprint(metadata), scope)
 }
 
 func TestLoginClearsUserTokenCache(t *testing.T) {

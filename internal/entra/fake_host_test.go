@@ -2,8 +2,10 @@ package entra
 
 import (
 	"context"
+	"fmt"
 	"reflect"
-	"strings"
+	"regexp"
+	"slices"
 	"sync"
 	"unsafe"
 
@@ -13,6 +15,32 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func isASCIIAlphaNum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// validateStoreSecretName enforces both HostService RPC secret-name rules and
+// the host encrypted secret backing-store naming contract (1..255 bytes,
+// leading ASCII alphanumeric, and only ASCII alphanumeric, '.', '_', or '-').
+func validateStoreSecretName(name string) error {
+	if err := sdkplugin.ValidateHostSecretName(name); err != nil {
+		return err
+	}
+	if len(name) > 255 {
+		return fmt.Errorf("secret name exceeds backing store maximum length of 255")
+	}
+	if !isASCIIAlphaNum(name[0]) {
+		return fmt.Errorf("secret name must start with an ASCII alphanumeric character")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !isASCIIAlphaNum(c) && c != '.' && c != '_' && c != '-' {
+			return fmt.Errorf("secret name contains invalid backing-store character %q", c)
+		}
+	}
+	return nil
+}
 
 // fakeHostService implements proto.HostServiceClient backed by an in-memory map.
 type fakeHostService struct {
@@ -49,6 +77,10 @@ func newFakeHostClient(fake *fakeHostService) *sdkplugin.HostServiceClient {
 }
 
 func (f *fakeHostService) GetSecret(ctx context.Context, in *proto.GetSecretRequest, _ ...grpc.CallOption) (*proto.GetSecretResponse, error) {
+	if err := validateStoreSecretName(in.Name); err != nil {
+		return &proto.GetSecretResponse{Error: fmt.Sprintf("get secret %q: %v", in.Name, err)}, nil
+	}
+
 	f.mu.Lock()
 	fn := f.getSecretFunc
 	f.mu.Unlock()
@@ -65,6 +97,10 @@ func (f *fakeHostService) GetSecret(ctx context.Context, in *proto.GetSecretRequ
 }
 
 func (f *fakeHostService) SetSecret(ctx context.Context, in *proto.SetSecretRequest, _ ...grpc.CallOption) (*proto.SetSecretResponse, error) {
+	if err := validateStoreSecretName(in.Name); err != nil {
+		return &proto.SetSecretResponse{Error: fmt.Sprintf("set secret %q: %v", in.Name, err)}, nil
+	}
+
 	f.mu.Lock()
 	fn := f.setSecretFunc
 	f.mu.Unlock()
@@ -89,6 +125,10 @@ func (f *fakeHostService) SetSecret(ctx context.Context, in *proto.SetSecretRequ
 }
 
 func (f *fakeHostService) DeleteSecret(ctx context.Context, in *proto.DeleteSecretRequest, _ ...grpc.CallOption) (*proto.DeleteSecretResponse, error) {
+	if err := validateStoreSecretName(in.Name); err != nil {
+		return &proto.DeleteSecretResponse{Error: fmt.Sprintf("delete secret %q: %v", in.Name, err)}, nil
+	}
+
 	f.mu.Lock()
 	fn := f.deleteSecretFunc
 	f.mu.Unlock()
@@ -105,6 +145,22 @@ func (f *fakeHostService) DeleteSecret(ctx context.Context, in *proto.DeleteSecr
 }
 
 func (f *fakeHostService) ListSecrets(ctx context.Context, in *proto.ListSecretsRequest, _ ...grpc.CallOption) (*proto.ListSecretsResponse, error) {
+	var re *regexp.Regexp
+	if in.Pattern != "" {
+		if len(in.Pattern) > sdkplugin.MaxHostSecretPatternLength {
+			return &proto.ListSecretsResponse{
+				Error: fmt.Sprintf("pattern too long: max %d characters", sdkplugin.MaxHostSecretPatternLength),
+			}, nil
+		}
+		var err error
+		re, err = regexp.Compile(in.Pattern)
+		if err != nil {
+			return &proto.ListSecretsResponse{
+				Error: fmt.Sprintf("invalid pattern: %v", err),
+			}, nil
+		}
+	}
+
 	f.mu.Lock()
 	fn := f.listSecretsFunc
 	f.mu.Unlock()
@@ -116,13 +172,13 @@ func (f *fakeHostService) ListSecrets(ctx context.Context, in *proto.ListSecrets
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	prefix := strings.TrimSuffix(in.Pattern, "*")
 	var names []string
 	for k := range f.secrets {
-		if strings.HasPrefix(k, prefix) {
+		if re == nil || re.MatchString(k) {
 			names = append(names, k)
 		}
 	}
+	slices.Sort(names)
 	return &proto.ListSecretsResponse{Names: names}, nil
 }
 

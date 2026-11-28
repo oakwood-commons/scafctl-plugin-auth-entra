@@ -83,6 +83,9 @@ type TokenResponse struct {
 type TokenErrorResponse struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
+	// Interval is an optional server-supplied minimum polling interval in
+	// seconds returned alongside device-flow slow_down errors.
+	Interval int `json:"interval,omitempty"`
 	// Claims contains a base64url-encoded JSON claims challenge returned by
 	// Azure AD when Conditional Access policies require step-up authentication.
 	Claims string `json:"claims,omitempty"`
@@ -470,7 +473,7 @@ func (p *Plugin) sweepOrphanedRefreshRevisions(ctx context.Context, hostClient *
 		return 0, err
 	}
 	prefix := p.secretKey(ctx, secretSuffixRefreshToken) + "."
-	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	keys, err := hostClient.ListSecretsByPrefix(ctx, prefix)
 	if err != nil {
 		if cErr := contextErr(ctx, err); cErr != nil {
 			return 0, cErr

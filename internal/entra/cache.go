@@ -6,9 +6,11 @@ package entra
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -94,7 +96,7 @@ func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.Host
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	keys, err := hostClient.ListSecretsByPrefix(ctx, prefix)
 	if err != nil {
 		if cErr := contextErr(ctx, err); cErr != nil {
 			return cErr
@@ -121,7 +123,7 @@ func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClie
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	keys, err := hostClient.ListSecretsByPrefix(ctx, prefix)
 	if err != nil {
 		if cErr := contextErr(ctx, err); cErr != nil {
 			return nil, cErr
@@ -178,7 +180,7 @@ func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceCli
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	keys, err := hostClient.ListSecretsByPrefix(ctx, prefix)
 	if err != nil {
 		if cErr := contextErr(ctx, err); cErr != nil {
 			return 0, cErr
@@ -222,6 +224,29 @@ func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceCli
 	}
 
 	return count, nil
+}
+
+// normalizeScope canonicalizes whitespace-delimited OAuth scopes by splitting
+// on whitespace, sorting, and removing duplicates.
+func normalizeScope(scope string) string {
+	parts := strings.Fields(scope)
+	if len(parts) <= 1 {
+		if len(parts) == 1 {
+			return parts[0]
+		}
+		return ""
+	}
+	slices.Sort(parts)
+	parts = slices.Compact(parts)
+	return strings.Join(parts, " ")
+}
+
+// buildTokenCacheKey returns a deterministic secret-store key for a cached
+// access token by hashing sessionFingerprint and normalized qualifiedScope with
+// SHA-256 and encoding the digest using unpadded base64url.
+func buildTokenCacheKey(prefix, sessionFingerprint, qualifiedScope string) string {
+	h := sha256.Sum256([]byte(sessionFingerprint + "\x00" + normalizeScope(qualifiedScope)))
+	return prefix + base64.RawURLEncoding.EncodeToString(h[:])
 }
 
 // fingerprintHash returns a SHA-256 hash of the input, used for cache keys.

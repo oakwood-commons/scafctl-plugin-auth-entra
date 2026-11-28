@@ -325,7 +325,6 @@ func TestGetToken(t *testing.T) {
 
 		// Pre-populate cache
 		fp := p.userSessionFingerprint(nil)
-		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "cached-access-token",
 			TokenType:   "Bearer",
@@ -334,7 +333,7 @@ func TestGetToken(t *testing.T) {
 			CachedAt:    time.Now(),
 		}
 		entryBytes, _ := json.Marshal(entry)
-		fake.secrets[SecretKeyTokenPrefix+cacheKey] = string(entryBytes)
+		fake.secrets[buildTokenCacheKey(SecretKeyTokenPrefix, fp, "https://graph.microsoft.com/.default")] = string(entryBytes)
 
 		resp, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{
 			Scope: "https://graph.microsoft.com/.default",
@@ -950,7 +949,6 @@ func TestGetGroups(t *testing.T) {
 
 		// Pre-populate cache with a Graph token
 		fp := p.userSessionFingerprint(nil)
-		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "graph-token",
 			TokenType:   "Bearer",
@@ -959,7 +957,7 @@ func TestGetGroups(t *testing.T) {
 			CachedAt:    time.Now(),
 		}
 		entryBytes, _ := json.Marshal(entry)
-		fake.secrets[SecretKeyTokenPrefix+cacheKey] = string(entryBytes)
+		fake.secrets[buildTokenCacheKey(SecretKeyTokenPrefix, fp, "https://graph.microsoft.com/.default")] = string(entryBytes)
 
 		groups, err := p.GetGroups(ctx, HandlerName)
 		require.NoError(t, err)
@@ -998,7 +996,6 @@ func TestGetGroups(t *testing.T) {
 
 		// Pre-populate cache
 		fp := p.userSessionFingerprint(nil)
-		cacheKey := fp + ":https://graph.microsoft.com/.default"
 		entry := tokenCacheEntry{
 			AccessToken: "graph-token",
 			TokenType:   "Bearer",
@@ -1006,7 +1003,7 @@ func TestGetGroups(t *testing.T) {
 			CachedAt:    time.Now(),
 		}
 		entryBytes, _ := json.Marshal(entry)
-		fake.secrets[SecretKeyTokenPrefix+cacheKey] = string(entryBytes)
+		fake.secrets[buildTokenCacheKey(SecretKeyTokenPrefix, fp, "https://graph.microsoft.com/.default")] = string(entryBytes)
 
 		_, err := p.GetGroups(ctx, HandlerName)
 		assert.Error(t, err)
@@ -1382,7 +1379,7 @@ func TestProfileScopedTokenCache(t *testing.T) {
 		scope := "https://graph.microsoft.com/.default"
 
 		// Cache token under work profile
-		workKey := p.tokenCachePrefix(ctxWork) + fp + ":" + scope
+		workKey := buildTokenCacheKey(p.tokenCachePrefix(ctxWork), fp, scope)
 		workEntry := tokenCacheEntry{
 			AccessToken: "work-token",
 			TokenType:   "Bearer",
@@ -1394,7 +1391,7 @@ func TestProfileScopedTokenCache(t *testing.T) {
 		fake.secrets[workKey] = string(workBytes)
 
 		// Cache token under personal profile
-		personalKey := p.tokenCachePrefix(ctxPersonal) + fp + ":" + scope
+		personalKey := buildTokenCacheKey(p.tokenCachePrefix(ctxPersonal), fp, scope)
 		personalEntry := tokenCacheEntry{
 			AccessToken: "personal-token",
 			TokenType:   "Bearer",

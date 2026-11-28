@@ -333,8 +333,8 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, req sdkplugin.Tok
 
 	hostClient := p.hostClient(ctx)
 	prefix := p.tokenCachePrefix(ctx)
-	fp := fingerprintHash(creds.ClientID + ":" + creds.TenantID + ":" + creds.Authority)
-	fullKey := prefix + fp + ":" + qualifiedScope
+	fp := fingerprintHash("workload_identity:" + creds.ClientID + ":" + creds.TenantID + ":" + creds.Authority)
+	fullKey := buildTokenCacheKey(prefix, fp, qualifiedScope)
 
 	// Check cache first
 	if !req.ForceRefresh && hostClient != nil {

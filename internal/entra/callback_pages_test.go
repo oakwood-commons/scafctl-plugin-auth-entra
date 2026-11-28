@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2325,7 +2326,7 @@ func TestMidOperationCancellation_PropagatesContextError(t *testing.T) {
 			var hitRefreshList bool
 			fake.mu.Lock()
 			fake.listSecretsFunc = func(_ context.Context, pattern string) error {
-				if strings.HasPrefix(pattern, SecretKeyRefreshToken+".") {
+				if pattern == "^"+regexp.QuoteMeta(SecretKeyRefreshToken+".") {
 					hitRefreshList = true
 					cancel()
 					return status.Error(codes.DeadlineExceeded, "deadline exceeded listing refresh revisions")

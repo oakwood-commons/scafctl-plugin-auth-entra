@@ -357,7 +357,7 @@ func TestGetGroups_GRPCRoundTripAndPrecedence(t *testing.T) {
 			ClientID:  "work-cid",
 		}
 		workMeta.SetMeta(MetaKeyTenantID, "work-tid")
-		fake.secrets[p.tokenCachePrefix(ctxWork)+p.userSessionFingerprintWithConfig(workCfg, workMeta)+":"+graphScopeForAuthority(workCfg.GetAuthority())] = cacheEntryJSON(t, "tok-work")
+		fake.secrets[buildTokenCacheKey(p.tokenCachePrefix(ctxWork), p.userSessionFingerprintWithConfig(workCfg, workMeta), graphScopeForAuthority(workCfg.GetAuthority()))] = cacheEntryJSON(t, "tok-work")
 
 		personalMeta := &auth.HandlerMetadata{
 			Claims:    &auth.Claims{ObjectID: "oid-personal"},
@@ -365,7 +365,7 @@ func TestGetGroups_GRPCRoundTripAndPrecedence(t *testing.T) {
 			ClientID:  "personal-cid",
 		}
 		personalMeta.SetMeta(MetaKeyTenantID, "personal-tid")
-		fake.secrets[p.tokenCachePrefix(ctxPersonal)+p.userSessionFingerprintWithConfig(personalCfg, personalMeta)+":"+graphGroupsScope] = cacheEntryJSON(t, "tok-personal")
+		fake.secrets[buildTokenCacheKey(p.tokenCachePrefix(ctxPersonal), p.userSessionFingerprintWithConfig(personalCfg, personalMeta), graphGroupsScope)] = cacheEntryJSON(t, "tok-personal")
 
 		// Graph mock dispatches deterministically by bearer token for concurrent calls.
 		p.graphClient = &tokenRoutingGraphClient{

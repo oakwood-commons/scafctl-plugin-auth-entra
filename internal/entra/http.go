@@ -81,6 +81,18 @@ type effectiveHTTPConfigKey struct {
 	trustProxyResolution              bool
 	allowedCIDRs                      string
 	maxResponseBodySize               int64
+	noRetry                           bool
+}
+
+// withoutRetries marks k for callers whose higher-level polling loop schedules
+// every retry (such as OAuth device-code token exchanges) and must not run
+// transport-level HTTP retries.
+func (k effectiveHTTPConfigKey) withoutRetries() effectiveHTTPConfigKey {
+	k.noRetry = true
+	k.retryMax = 0
+	k.retryWaitMin = 0
+	k.retryWaitMax = 0
+	return k
 }
 
 // withoutHTTPCache zeroes response-cache fields on k for DefaultGraphClient,
@@ -531,13 +543,43 @@ func (c *DefaultGraphClient) Get(ctx context.Context, reqURL, bearerToken string
 type DefaultHTTPClient struct {
 	client    *httpc.Client
 	transport *http.Transport
+	baseCfg   *httpc.ClientConfig
+	baseKey   effectiveHTTPConfigKey
 }
 
 func newDefaultHTTPClientFromResolved(baseCfg *httpc.ClientConfig, logger logr.Logger) *DefaultHTTPClient {
 	tr := newIsolatedTransport()
+	resolvedCopy := cloneResolvedClientConfig(baseCfg, logger, nil)
 	return &DefaultHTTPClient{
 		client:    httpc.NewClient(cloneResolvedClientConfig(baseCfg, logger, tr)),
 		transport: tr,
+		baseCfg:   resolvedCopy,
+		baseKey:   effectiveHTTPConfigKeyFromClientConfig(resolvedCopy),
+	}
+}
+
+func newDefaultNoRetryHTTPClientFromResolved(baseCfg *httpc.ClientConfig, logger logr.Logger) *DefaultHTTPClient {
+	tr := newIsolatedTransport()
+	cfg := cloneResolvedClientConfig(baseCfg, logger, tr)
+	cfg.RetryMax = 0
+	cfg.RetryWaitMin = 0
+	cfg.RetryWaitMax = 0
+	cfg.CheckRetry = func(_ context.Context, _ *http.Response, _ error) (bool, error) {
+		return false, nil
+	}
+	cfg.ErrorHandler = func(resp *http.Response, err error, _ int) (*http.Response, error) {
+		if err != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
+		return resp, err
+	}
+	resolvedCopy := cloneResolvedClientConfig(cfg, logger, nil)
+	return &DefaultHTTPClient{
+		client:    httpc.NewClient(cfg),
+		transport: tr,
+		baseCfg:   resolvedCopy,
+		baseKey:   effectiveHTTPConfigKeyFromClientConfig(resolvedCopy).withoutRetries(),
 	}
 }
 

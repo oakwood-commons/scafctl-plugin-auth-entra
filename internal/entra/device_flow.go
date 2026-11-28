@@ -6,6 +6,7 @@ package entra
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	oauth "github.com/oakwood-commons/oauth-helpers"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
@@ -159,9 +161,26 @@ func (p *Plugin) requestDeviceCode(ctx context.Context, cfg *Config, tenantID st
 	return &deviceCode, nil
 }
 
+// maxDeviceTokenResponseBytes bounds a single device-code token response body (1 MiB).
+const maxDeviceTokenResponseBytes = 1 << 20
+
+// sanitizeDeviceErrorText normalizes CR/LF/TAB/space runs to single spaces,
+// strips remaining terminal control characters, and caps length to maxRunes.
+func sanitizeDeviceErrorText(s string, maxRunes int) string {
+	replaced := strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(s)
+	cleaned := sanitizeControlChars(strings.Join(strings.Fields(replaced), " "))
+	return truncateRunes(cleaned, maxRunes)
+}
+
+func isRetryableDevicePollStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == 0 ||
+		(statusCode >= http.StatusInternalServerError && statusCode != http.StatusNotImplemented)
+}
+
 func (p *Plugin) pollForToken(ctx context.Context, cfg *Config, tenantID string, deviceCode *DeviceCodeResponse) (*TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
-	httpClient, releaseHTTP, err := p.httpClientForConfig(ctx, cfg)
+	httpClient, releaseHTTP, err := p.devicePollHTTPClientForConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -174,71 +193,116 @@ func (p *Plugin) pollForToken(ctx context.Context, cfg *Config, tenantID string,
 		minPollInterval = DefaultMinPollInterval
 	}
 
-	interval := time.Duration(deviceCode.Interval) * time.Second
-	if interval < minPollInterval {
-		interval = minPollInterval
+	var sleepFn func(context.Context, time.Duration) error
+	if p.clock != nil {
+		sleepFn = p.clock.Sleep
 	}
 
-	ticker := p.clock.NewTicker(interval)
-	defer ticker.Stop()
+	pollCfg := oauth.DevicePollConfig{
+		Interval:             time.Duration(deviceCode.Interval) * time.Second,
+		MinInterval:          minPollInterval,
+		SlowDownIncrement:    cfg.SlowDownIncrement,
+		RetryTransientErrors: true,
+		Sleep:                sleepFn,
+		OnSlowDown: func(newInterval time.Duration) {
+			lgr.V(1).Info("slow_down received, increasing poll interval", "newInterval", newInterval)
+		},
+		OnTransientError: func(err error) {
+			lgr.V(1).Info("transient network error during token poll, continuing", "error", err)
+		},
+	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("authentication timed out")
-		case <-ticker.C():
-			data := makeFormData(map[string]string{
-				"grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
-				"client_id":   cfg.ClientID,
-				"device_code": deviceCode.DeviceCode,
-			})
+	tokenResp, err := oauth.PollDeviceToken(ctx, pollCfg, func(ctx context.Context) (*TokenResponse, *oauth.DevicePollError, error) {
+		data := makeFormData(map[string]string{
+			"grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
+			"client_id":   cfg.ClientID,
+			"device_code": deviceCode.DeviceCode,
+		})
 
-			resp, err := httpClient.PostForm(ctx, endpoint, data)
-			if err != nil {
-				// Network error, log and continue polling
-				lgr.V(1).Info("transient network error during token poll, continuing", "error", err)
-				continue
+		resp, err := httpClient.PostForm(ctx, endpoint, data)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxDeviceTokenResponseBytes+1))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		if len(body) > maxDeviceTokenResponseBytes {
+			if isRetryableDevicePollStatus(resp.StatusCode) {
+				return nil, nil, fmt.Errorf("transient token endpoint HTTP %d", resp.StatusCode)
 			}
+			return nil, &oauth.DevicePollError{
+				Cause: fmt.Errorf("token response exceeded maximum size (%d bytes)", maxDeviceTokenResponseBytes),
+			}, nil
+		}
 
-			if resp.StatusCode == http.StatusOK {
-				var tokenResp TokenResponse
-				if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-					_ = resp.Body.Close()
-					return nil, fmt.Errorf("failed to parse token response: %w", err)
-				}
-				_ = resp.Body.Close()
-				return &tokenResp, nil
+		if resp.StatusCode == http.StatusOK {
+			var parsed TokenResponse
+			if decErr := json.Unmarshal(body, &parsed); decErr != nil {
+				return nil, &oauth.DevicePollError{
+					Cause: fmt.Errorf("failed to parse token response: %w", decErr),
+				}, nil
 			}
+			return &parsed, nil, nil
+		}
 
-			var errResp TokenErrorResponse
-			if decErr := json.NewDecoder(resp.Body).Decode(&errResp); decErr != nil {
-				_ = resp.Body.Close()
-				return nil, fmt.Errorf("token request failed with HTTP %d (could not parse error response: %w)", resp.StatusCode, decErr)
+		var errResp TokenErrorResponse
+		if decErr := json.Unmarshal(body, &errResp); decErr != nil {
+			if isRetryableDevicePollStatus(resp.StatusCode) {
+				return nil, nil, fmt.Errorf("transient token endpoint HTTP %d", resp.StatusCode)
 			}
-			_ = resp.Body.Close()
+			return nil, &oauth.DevicePollError{
+				Cause: fmt.Errorf("token request failed with HTTP %d (could not parse error response: %w)", resp.StatusCode, decErr),
+			}, nil
+		}
 
-			switch errResp.Error {
-			case "authorization_pending":
-				continue
-			case "slow_down":
-				slowDownIncr := cfg.SlowDownIncrement
-				if slowDownIncr == 0 {
-					slowDownIncr = 5 * time.Second
-				}
-				interval += slowDownIncr
-				ticker.Reset(interval)
-				lgr.V(1).Info("slow_down received, increasing poll interval", "newInterval", interval)
-				continue
-			case "expired_token":
-				return nil, fmt.Errorf("authentication timed out")
-			case "authorization_declined":
-				return nil, fmt.Errorf("authentication cancelled by user")
+		errCode := strings.TrimSpace(errResp.Error)
+		if isRetryableDevicePollStatus(resp.StatusCode) {
+			switch errCode {
+			case "authorization_pending", "slow_down", "expired_token", "authorization_declined", "access_denied":
 			default:
-				if strings.Contains(errResp.ErrorDescription, "AADSTS") {
-					return nil, formatAADSTSError("token request failed", errResp)
+				if cleanCode := sanitizeDeviceErrorText(errCode, 128); cleanCode != "" {
+					return nil, nil, fmt.Errorf("transient token endpoint HTTP %d (%s)", resp.StatusCode, cleanCode)
 				}
-				return nil, fmt.Errorf("token request failed: %s - %s", errResp.Error, errResp.ErrorDescription)
+				return nil, nil, fmt.Errorf("transient token endpoint HTTP %d", resp.StatusCode)
 			}
 		}
+
+		pollErr := &oauth.DevicePollError{
+			Code:        errResp.Error,
+			Description: errResp.ErrorDescription,
+			Interval:    errResp.Interval,
+		}
+		switch errCode {
+		case "authorization_pending", "slow_down", "expired_token", "authorization_declined", "access_denied":
+		default:
+			sanitized := TokenErrorResponse{
+				Error:            sanitizeDeviceErrorText(errResp.Error, 128),
+				ErrorDescription: sanitizeDeviceErrorText(errResp.ErrorDescription, 512),
+				Interval:         errResp.Interval,
+				Claims:           errResp.Claims,
+			}
+			if strings.Contains(sanitized.ErrorDescription, "AADSTS") {
+				pollErr.Cause = formatAADSTSError("token request failed", sanitized)
+			} else {
+				pollErr.Cause = fmt.Errorf("token request failed: %s - %s", sanitized.Error, sanitized.ErrorDescription)
+			}
+		}
+		return nil, pollErr, nil
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, oauth.ErrDeviceAccessDenied):
+			return nil, fmt.Errorf("authentication cancelled by user: %w", err)
+		case errors.Is(err, oauth.ErrDeviceCodeExpired):
+			return nil, fmt.Errorf("authentication timed out: %w", err)
+		case ctx.Err() != nil && isContextErr(err):
+			return nil, fmt.Errorf("authentication timed out: %w", err)
+		default:
+			return nil, err
+		}
 	}
+	return tokenResp, nil
 }

@@ -83,7 +83,7 @@ func storeUserSessionWithID(t *testing.T, fake *fakeHostService, flow auth.Flow,
 func userTokenCacheKey(p *Plugin, sessionID, scope string) string {
 	metadata := auth.HandlerMetadata{ClientID: "stored-client", SessionID: sessionID}
 	metadata.SetMeta(MetaKeyTenantID, "user-tenant")
-	return SecretKeyTokenPrefix + p.userSessionFingerprint(&metadata) + ":" + scope
+	return buildTokenCacheKey(SecretKeyTokenPrefix, p.userSessionFingerprint(&metadata), scope)
 }
 
 func TestCLICredentialPrecedenceStatus(t *testing.T) {
@@ -383,17 +383,27 @@ func TestCLIUserSessionIsolation(t *testing.T) {
 		p, fake := newTestPlugin(t, httpClient, nil)
 		storeUserSession(t, fake, auth.FlowInteractive, time.Now().Add(24*time.Hour))
 
-		// SP/WI-style key: same client/tenant/authority, no user discriminator.
-		fp := fingerprintHash(p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
-		entryBytes, _ := json.Marshal(tokenCacheEntry{
-			AccessToken: "machine-access-token",
+		// Machine-flow keys: same client/tenant/authority, flow-prefixed discriminators.
+		spFP := fingerprintHash("service_principal:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		wiFP := fingerprintHash("workload_identity:" + p.config.ClientID + ":" + p.config.TenantID + ":" + p.config.GetAuthority())
+		spBytes, _ := json.Marshal(tokenCacheEntry{
+			AccessToken: "machine-sp-access-token",
 			TokenType:   "Bearer",
 			ExpiresAt:   time.Now().Add(time.Hour),
 			Scope:       graphScope,
 			CachedAt:    time.Now(),
 			Flow:        auth.FlowServicePrincipal,
 		})
-		fake.secrets[SecretKeyTokenPrefix+fp+":"+graphScope] = string(entryBytes)
+		wiBytes, _ := json.Marshal(tokenCacheEntry{
+			AccessToken: "machine-wi-access-token",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(time.Hour),
+			Scope:       graphScope,
+			CachedAt:    time.Now(),
+			Flow:        auth.FlowWorkloadIdentity,
+		})
+		fake.secrets[buildTokenCacheKey(SecretKeyTokenPrefix, spFP, graphScope)] = string(spBytes)
+		fake.secrets[buildTokenCacheKey(SecretKeyTokenPrefix, wiFP, graphScope)] = string(wiBytes)
 
 		resp, err := p.GetToken(ctx, HandlerName, sdkplugin.TokenRequest{Scope: graphScope})
 		require.NoError(t, err)

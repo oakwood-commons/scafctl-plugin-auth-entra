@@ -289,7 +289,7 @@ func (m *cliMode) userSessionToken(ctx context.Context, req sdkplugin.TokenReque
 	)
 
 	hostClient := m.p.hostClient(ctx)
-	fullKey := m.p.tokenCachePrefix(ctx) + m.p.userSessionFingerprintWithConfig(cfg, metadata) + ":" + qualifiedScope
+	fullKey := buildTokenCacheKey(m.p.tokenCachePrefix(ctx), m.p.userSessionFingerprintWithConfig(cfg, metadata), qualifiedScope)
 
 	// Check cache first (unless force refresh)
 	if !req.ForceRefresh && hostClient != nil {

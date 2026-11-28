@@ -254,8 +254,8 @@ func (p *Plugin) getServicePrincipalToken(ctx context.Context, req sdkplugin.Tok
 
 	hostClient := p.hostClient(ctx)
 	prefix := p.tokenCachePrefix(ctx)
-	fp := fingerprintHash(creds.ClientID + ":" + creds.TenantID + ":" + cfg.GetAuthority())
-	fullKey := prefix + fp + ":" + qualifiedScope
+	fp := fingerprintHash("service_principal:" + creds.ClientID + ":" + creds.TenantID + ":" + cfg.GetAuthority())
+	fullKey := buildTokenCacheKey(prefix, fp, qualifiedScope)
 
 	// Check cache first
 	if !req.ForceRefresh && hostClient != nil {
